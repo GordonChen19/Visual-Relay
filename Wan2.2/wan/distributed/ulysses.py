@@ -2,7 +2,7 @@
 import torch
 import torch.distributed as dist
 
-from ..modules.attention import flash_attention, segmented_flash_attention
+from ..modules.attention import flash_attention, paired_anchor_attention
 from .util import all_to_all
 
 
@@ -13,12 +13,9 @@ def distributed_attention(
         seq_lens,
         window_size=(-1, -1),
         grid_sizes=None,
-        conditioned_frame_indices=None,
-        sacrificial_frame_indices=None,
-        frame_attention_mode=None,
-        local_anchor_indices=None,
-        anchor_block_radius=0,
         freqs=None,
+        paired_anchor_index=None,
+        paired_stream_weight=0.25,
 ):
     """
     Performs distributed attention based on DeepSpeed Ulysses attention mechanism.
@@ -41,8 +38,7 @@ def distributed_attention(
     v = all_to_all(v, scatter_dim=2, gather_dim=1)
 
     # apply attention
-    if (conditioned_frame_indices is None
-            and frame_attention_mode is None):
+    if paired_anchor_index is None:
         x = flash_attention(
             q,
             k,
@@ -51,22 +47,18 @@ def distributed_attention(
             window_size=window_size,
         )
     else:
-        if freqs is None:
+        if grid_sizes is None:
             raise ValueError(
-                "conditioned distributed attention requires RoPE frequencies"
-            )
-        x = segmented_flash_attention(
+                "paired distributed attention requires grid sizes")
+        x = paired_anchor_attention(
             q=q,
             k=k,
             v=v,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            conditioned_frame_indices=conditioned_frame_indices,
-            sacrificial_frame_indices=sacrificial_frame_indices,
             freqs=freqs,
-            frame_attention_mode=frame_attention_mode,
-            local_anchor_indices=local_anchor_indices,
-            anchor_block_radius=anchor_block_radius,
+            anchor_index=paired_anchor_index,
+            stream_weight=paired_stream_weight,
             window_size=window_size,
         )
 

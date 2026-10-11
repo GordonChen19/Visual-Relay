@@ -3,7 +3,6 @@ import torch
 import torch.cuda.amp as amp
 
 from ..modules.model import sinusoidal_embedding_1d
-from ..utils.frame_conditioning import layer_anchor_block_radius
 from .ulysses import distributed_attention
 from .util import gather_forward, get_rank, get_world_size
 
@@ -69,13 +68,8 @@ def sp_dit_forward(
     context,
     seq_len,
     y=None,
-    conditioned_frame_indices=None,
-    sacrificial_frame_indices=None,
-    frame_attention_mode=None,
-    local_anchor_indices=None,
-    anchor_block_radius=0,
-    anchor_block_start_layer=0,
-    attention_probe=None,
+    paired_anchor_index=None,
+    paired_stream_weight=0.25,
 ):
     """
     x:              A list of videos each with shape [C, T, H, W].
@@ -84,9 +78,6 @@ def sp_dit_forward(
     """
     if self.model_type == 'i2v':
         assert y is not None
-    if attention_probe is not None:
-        raise ValueError(
-            "attention probing currently supports single-GPU inference only")
     # params
     device = self.patch_embedding.weight.device
     if self.freqs.device != device:
@@ -109,7 +100,11 @@ def sp_dit_forward(
 
     # time embeddings
     if t.dim() == 1:
-        t = t.expand(t.size(0), seq_len)
+        # Insert the token axis explicitly. ``Tensor.expand(B, L)`` only
+        # happened to work for upstream's B=1 timestep tensor; it cannot
+        # expand a paired tensor shaped [2] because that existing dimension
+        # is aligned with L. This form is valid for both paths.
+        t = t[:, None].expand(-1, seq_len)
     with torch.amp.autocast('cuda', dtype=torch.float32):
         bt = t.size(0)
         t = t.flatten()
@@ -140,18 +135,11 @@ def sp_dit_forward(
         freqs=self.freqs,
         context=context,
         context_lens=context_lens,
-        conditioned_frame_indices=conditioned_frame_indices,
-        sacrificial_frame_indices=sacrificial_frame_indices,
-        frame_attention_mode=frame_attention_mode,
-        local_anchor_indices=local_anchor_indices)
+        paired_anchor_index=paired_anchor_index,
+        paired_stream_weight=paired_stream_weight)
 
-    for layer, block in enumerate(self.blocks):
-        active_anchor_block_radius = layer_anchor_block_radius(
-            anchor_block_radius, anchor_block_start_layer, layer)
-        x = block(
-            x,
-            anchor_block_radius=active_anchor_block_radius,
-            **kwargs)
+    for block in self.blocks:
+        x = block(x, **kwargs)
 
     # head
     x = self.head(x, e)
@@ -169,16 +157,9 @@ def sp_attn_forward(self,
                     seq_lens,
                     grid_sizes,
                     freqs,
-                    conditioned_frame_indices=None,
-                    sacrificial_frame_indices=None,
-                    frame_attention_mode=None,
-                    local_anchor_indices=None,
-                    anchor_block_radius=0,
-                    attention_probe=None,
+                    paired_anchor_index=None,
+                    paired_stream_weight=0.25,
                     dtype=torch.bfloat16):
-    if attention_probe is not None:
-        raise ValueError(
-            "attention probing currently supports single-GPU inference only")
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
 
@@ -193,10 +174,8 @@ def sp_attn_forward(self,
         return q, k, v
 
     q, k, v = qkv_fn(x)
-    if (conditioned_frame_indices is None
-            and frame_attention_mode is None):
-        q = rope_apply(q, grid_sizes, freqs)
-        k = rope_apply(k, grid_sizes, freqs)
+    q = rope_apply(q, grid_sizes, freqs)
+    k = rope_apply(k, grid_sizes, freqs)
 
     x = distributed_attention(
         half(q),
@@ -205,12 +184,9 @@ def sp_attn_forward(self,
         seq_lens,
         window_size=self.window_size,
         grid_sizes=grid_sizes,
-        conditioned_frame_indices=conditioned_frame_indices,
-        sacrificial_frame_indices=sacrificial_frame_indices,
-        frame_attention_mode=frame_attention_mode,
-        local_anchor_indices=local_anchor_indices,
-        anchor_block_radius=anchor_block_radius,
         freqs=freqs,
+        paired_anchor_index=paired_anchor_index,
+        paired_stream_weight=paired_stream_weight,
     )
 
     # output

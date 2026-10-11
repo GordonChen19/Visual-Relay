@@ -59,34 +59,6 @@ EXAMPLE_PROMPT = {
 }
 
 
-def _load_refinement_video(path, frame_num):
-    """Load ``frame_num`` RGB frames as a normalized [C, T, H, W] tensor."""
-    try:
-        from decord import VideoReader, cpu
-    except ImportError as exc:
-        raise ImportError(
-            "--init_video requires decord, which is included in the Wan "
-            "runtime dependencies") from exc
-
-    reader = VideoReader(path, ctx=cpu(0))
-    total_frames = len(reader)
-    if total_frames < frame_num:
-        raise ValueError(
-            f"--init_video has {total_frames} frames, but --frame_num "
-            f"requires at least {frame_num}")
-    if frame_num == 1:
-        indices = [0]
-    else:
-        indices = [
-            round(index * (total_frames - 1) / (frame_num - 1))
-            for index in range(frame_num)
-        ]
-    frames = reader.get_batch(indices).asnumpy()
-    video = torch.from_numpy(frames).permute(3, 0, 1, 2).contiguous()
-    video = video.float().div_(127.5).sub_(1.0)
-    return video, Image.fromarray(frames[0]).convert("RGB"), indices
-
-
 def _validate_args(args):
     # Basic check
     assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
@@ -95,11 +67,8 @@ def _validate_args(args):
 
     if args.prompt is None:
         args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
-    if (args.image is None and args.init_video is None
-            and "image" in EXAMPLE_PROMPT[args.task]):
+    if args.image is None and "image" in EXAMPLE_PROMPT[args.task]:
         args.image = [EXAMPLE_PROMPT[args.task]["image"]]
-    elif isinstance(args.image, str):
-        args.image = [args.image]
     if args.audio is None and args.enable_tts is False and "audio" in EXAMPLE_PROMPT[args.task]:
         args.audio = EXAMPLE_PROMPT[args.task]["audio"]
     if (args.tts_prompt_audio is None or args.tts_text is None) and args.enable_tts is True and "audio" in EXAMPLE_PROMPT[args.task]:
@@ -108,117 +77,38 @@ def _validate_args(args):
         args.tts_text = EXAMPLE_PROMPT[args.task]["tts_text"]
 
     if args.task == "i2v-A14B":
-        assert args.image is not None or args.init_video is not None, (
-            "Please specify --image or --init_video for i2v.")
-        image_count = len(args.image) if args.image is not None else 1
-        if args.image_latent_index is None:
-            assert image_count == 1, (
-                "Please provide one --image_latent_index for each --image.")
-            args.image_latent_index = [0]
-        assert image_count == len(args.image_latent_index), (
-            "The number of --image and --image_latent_index arguments must "
-            "match.")
-        if args.init_video is not None:
-            assert args.init_video_noise_step is not None, (
-                "--init_video requires --init_video_noise_step.")
-            assert image_count == 1 and args.image_latent_index == [0], (
-                "Video refinement supports exactly one first-frame image "
-                "condition at latent index 0.")
-            assert args.image_condition_switch_step is None, (
-                "Video refinement cannot be combined with "
-                "--image_condition_switch_step.")
-            assert args.sacrificial_image_latent_index is None, (
-                "Video refinement cannot use a sacrificial image anchor.")
+        assert args.image is not None, "Please specify the image path for i2v."
+        assert 0.0 <= args.image_condition_paired_stream_weight <= 1.0, (
+            "--image_condition_paired_stream_weight must be in [0, 1].")
+        if args.image_condition_paired_anchor_attention:
+            assert len(args.image) == 2, (
+                "Paired anchor attention requires exactly two images.")
+            assert (args.image_latent_index is not None
+                    and len(args.image_latent_index) == 2
+                    and args.image_latent_index[0] == 0
+                    and args.image_latent_index[1] > 0), (
+                        "Paired anchor attention requires image latent "
+                        "indices [0, positive].")
         else:
-            assert args.init_video_noise_step is None, (
-                "--init_video_noise_step requires --init_video.")
-        if args.image_condition_switch_step is not None:
-            assert len(args.image) >= 2, (
-                "--image_condition_switch_step requires multiple images.")
-            assert 0 in args.image_latent_index, (
-                "--image_condition_switch_step requires an image at latent "
-                "frame 0 for the default-I2V stage.")
-        if args.sacrificial_image_latent_index is not None:
-            assert args.image_condition_switch_step is not None, (
-                "--sacrificial_image_latent_index requires "
-                "--image_condition_switch_step.")
-            assert args.sacrificial_image_latent_index > 0, (
-                "--sacrificial_image_latent_index must be positive.")
-            assert (args.sacrificial_image_latent_index
-                    in args.image_latent_index), (
-                        "--sacrificial_image_latent_index must match a "
-                        "nonzero --image_latent_index.")
+            assert len(args.image) == 1, (
+                "Multiple images require "
+                "--image_condition_paired_anchor_attention.")
+            assert (args.image_latent_index is None
+                    or args.image_latent_index == [0]), (
+                        "Standard I2V only supports image latent index 0.")
     else:
-        assert args.image is None or len(args.image) == 1, (
-            "Multiple images are currently supported only by i2v-A14B.")
+        assert not args.image_condition_paired_anchor_attention, (
+            "Paired anchor attention is supported only by i2v-A14B.")
         assert args.image_latent_index is None, (
-            "--image_latent_index is supported only by i2v-A14B.")
-        assert args.image_condition_switch_step is None, (
-            "--image_condition_switch_step is supported only by i2v-A14B.")
-        assert args.sacrificial_image_latent_index is None, (
-            "--sacrificial_image_latent_index is supported only by i2v-A14B.")
-        assert args.init_video is None, (
-            "--init_video is supported only by i2v-A14B.")
-        assert args.init_video_noise_step is None, (
-            "--init_video_noise_step is supported only by i2v-A14B.")
+            "--image_latent_index is supported only by paired I2V.")
+        assert args.image is None or len(args.image) == 1, (
+            "Only paired I2V accepts multiple --image arguments.")
 
     cfg = WAN_CONFIGS[args.task]
 
     if args.sample_steps is None:
         args.sample_steps = cfg.sample_steps
-    if args.image_condition_switch_step is not None:
-        assert 0 <= args.image_condition_switch_step < args.sample_steps, (
-            "--image_condition_switch_step must be in "
-            f"[0, {args.sample_steps}).")
-    if args.image_condition_rope_blend_start_step is not None:
-        assert args.image_condition_switch_step is not None, (
-            "--image_condition_rope_blend_start_step requires "
-            "--image_condition_switch_step.")
-        assert (0 <= args.image_condition_rope_blend_start_step <
-                args.image_condition_switch_step), (
-                    "--image_condition_rope_blend_start_step must be in "
-                    "[0, image_condition_switch_step).")
-    assert 0.0 <= args.image_condition_rope_blend_weight <= 1.0, (
-        "--image_condition_rope_blend_weight must be in [0, 1].")
-    if args.image_condition_dual_guidance:
-        assert args.task == "i2v-A14B", (
-            "--image_condition_dual_guidance is supported only by i2v-A14B.")
-        assert args.image is not None and len(args.image) == 2, (
-            "--image_condition_dual_guidance currently requires exactly two "
-            "images.")
-        assert args.image_latent_index is not None, (
-            "--image_condition_dual_guidance requires explicit image latent "
-            "indices.")
-        assert args.image_condition_prefix_multi_guidance_scale >= 0, (
-            "--image_condition_prefix_multi_guidance_scale must be "
-            "non-negative.")
-        assert args.image_condition_suffix_multi_guidance_scale >= 0, (
-            "--image_condition_suffix_multi_guidance_scale must be "
-            "non-negative.")
-    if args.image_condition_multi_stop_step is not None:
-        assert args.image_condition_dual_guidance, (
-            "--image_condition_multi_stop_step requires "
-            "--image_condition_dual_guidance.")
-        assert 0 <= args.image_condition_multi_stop_step < args.sample_steps, (
-            "--image_condition_multi_stop_step must be in "
-            f"[0, {args.sample_steps}).")
-    assert 0.0 <= args.image_condition_late_suffix_img2_weight <= 1.0, (
-        "--image_condition_late_suffix_img2_weight must be in [0, 1].")
-    assert args.image_condition_anchor_block_radius >= 0, (
-        "--image_condition_anchor_block_radius must be non-negative.")
-    assert (0 <= args.image_condition_anchor_block_start_layer <=
-            cfg.num_layers), (
-                "--image_condition_anchor_block_start_layer must be in "
-                f"[0, {cfg.num_layers}].")
-    if args.image_condition_anchor_block_start_step is not None:
-        assert (0 <= args.image_condition_anchor_block_start_step <
-                args.sample_steps), (
-                    "--image_condition_anchor_block_start_step must be in "
-                    f"[0, {args.sample_steps}).")
-    if args.init_video_noise_step is not None:
-        assert 0 <= args.init_video_noise_step < args.sample_steps, (
-            "--init_video_noise_step must be in "
-            f"[0, {args.sample_steps}).")
+
     if args.sample_shift is None:
         args.sample_shift = cfg.sample_shift
 
@@ -228,59 +118,11 @@ def _validate_args(args):
     if args.frame_num is None:
         args.frame_num = cfg.frame_num
 
-    probe_option_used = any([
-        args.attention_probe_query_frame is not None,
-        args.attention_probe_layer is not None,
-        args.attention_probe_step is not None,
-        args.attention_probe_query_row is not None,
-        args.attention_probe_query_col is not None,
-        args.attention_probe_output is not None,
-    ])
-    if probe_option_used:
-        assert args.task == "i2v-A14B", (
-            "The attention probe currently supports only i2v-A14B.")
-        assert args.ulysses_size == 1, (
-            "The attention probe currently supports single-GPU inference only."
-        )
-        assert args.image_condition_switch_step is None, (
-            "The attention probe is not supported while temporary image "
-            "anchors are active.")
-        assert args.attention_probe_query_frame is not None, (
-            "--attention_probe_query_frame is required when using probe options."
-        )
+    if args.image_condition_paired_anchor_attention:
         latent_frame_num = ((args.frame_num - 1) // cfg.vae_stride[0] + 1)
-        assert 0 <= args.attention_probe_query_frame < latent_frame_num, (
-            "--attention_probe_query_frame must refer to a generated latent "
-            f"frame in [0, {latent_frame_num}).")
-        assert ((args.attention_probe_query_row is None)
-                == (args.attention_probe_query_col is None)), (
-                    "Specify both --attention_probe_query_row and "
-                    "--attention_probe_query_col, or neither for the center "
-                    "patch.")
-        if args.attention_probe_query_row is not None:
-            assert args.attention_probe_query_row >= 0
-            assert args.attention_probe_query_col >= 0
-
-        if args.attention_probe_layer is None:
-            args.attention_probe_layer = sorted(
-                {0, cfg.num_layers // 2, cfg.num_layers - 1})
-        else:
-            args.attention_probe_layer = sorted(
-                set(args.attention_probe_layer))
-        assert all(0 <= layer < cfg.num_layers
-                   for layer in args.attention_probe_layer), (
-                       "--attention_probe_layer must be in "
-                       f"[0, {cfg.num_layers}).")
-
-        if args.attention_probe_step is None:
-            args.attention_probe_step = sorted(
-                {0, args.sample_steps // 2, args.sample_steps - 1})
-        else:
-            args.attention_probe_step = sorted(set(args.attention_probe_step))
-        assert all(0 <= step < args.sample_steps
-                   for step in args.attention_probe_step), (
-                       "--attention_probe_step must be in "
-                       f"[0, {args.sample_steps}).")
+        assert args.image_latent_index[1] < latent_frame_num - 1, (
+            "Img2 must leave at least one latent frame on its right; use an "
+            f"index below {latent_frame_num - 1}.")
 
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
         0, sys.maxsize)
@@ -387,163 +229,27 @@ def _parse_args():
         type=str,
         action="append",
         default=None,
-        help=("An image to condition on. Repeat for multiple i2v images; "
-              "single-image usage remains unchanged."))
+        help=("An input image. Repeat exactly twice when using paired anchor "
+              "attention."))
     parser.add_argument(
         "--image_latent_index",
         type=int,
         action="append",
         default=None,
-        help=("Latent-frame index for the corresponding --image. Repeat in "
-              "the same order as --image."))
+        help=("Latent index corresponding to each --image in paired anchor "
+              "attention; use 0 for Img1 and a positive index for Img2."))
     parser.add_argument(
-        "--image_condition_switch_step",
-        type=int,
-        default=None,
-        help=("Zero-based denoising step at which isolated local image "
-              "branches are disabled. The final-length first-image global "
-              "branch continues while the scheduler retains disposable "
-              "placeholder anchors until VAE decoding. If omitted, expanded "
-              "multi-image conditioning remains active for every step."))
+        "--image_condition_paired_anchor_attention",
+        action="store_true",
+        help=("Use a full Img1 I2V stream and an aligned Img2-first suffix. "
+              "Suffix attention outputs from the two streams are fused with "
+              "a fixed user-controlled weight."))
     parser.add_argument(
-        "--image_condition_rope_blend_weight",
+        "--image_condition_paired_stream_weight",
         type=float,
         default=0.25,
-        help=("Expanded multi-image compressed-RoPE prediction weight before "
-              "the conditioning switch. 0 uses only compact Img1 regular "
-              "I2V, 1 uses only the expanded compressed view, and values "
-              "between them blend the two predictions. Defaults to 0.25."))
-    parser.add_argument(
-        "--image_condition_rope_blend_start_step",
-        type=int,
-        default=None,
-        help=("Optional zero-based step at which a cosine transition begins "
-              "from fully compressed multi-image prediction toward compact "
-              "Img1-only regular I2V. The transition reaches fully regular "
-              "at --image_condition_switch_step. When set, it overrides the "
-              "fixed --image_condition_rope_blend_weight before the switch."))
-    parser.add_argument(
-        "--image_condition_dual_guidance",
-        action="store_true",
-        help=("Before the conditioning switch, route prefix predictions from "
-              "an Img1-only regular-I2V base and suffix predictions from an "
-              "Img2-only local-I2V base, guiding both toward the expanded "
-              "multi-image prediction. Currently supports exactly two "
-              "images."))
-    parser.add_argument(
-        "--image_condition_prefix_multi_guidance_scale",
-        type=float,
-        default=0.6,
-        help=("Multi-image delta scale for retained frames before Img2 in "
-              "dual-guidance mode. 0 uses Img1-only, 1 uses multi-image, and "
-              "values above 1 extrapolate. Defaults to 0.6."))
-    parser.add_argument(
-        "--image_condition_suffix_multi_guidance_scale",
-        type=float,
-        default=0.35,
-        help=("Multi-image delta scale for Img2 and its suffix in dual-"
-              "guidance mode. 0 uses Img2-local I2V, 1 uses multi-image, and "
-              "values above 1 extrapolate. Defaults to 0.35."))
-    parser.add_argument(
-        "--image_condition_multi_stop_step",
-        type=int,
-        default=None,
-        help=("Optional zero-based denoising step at which dual guidance "
-              "stops evaluating the expanded multi-image guide. The prefix "
-              "then uses Img1-only I2V, the anchor uses Img2-local I2V, and "
-              "the suffix blends the aligned Img1 and Img2-local predictions."))
-    parser.add_argument(
-        "--image_condition_late_suffix_img2_weight",
-        type=float,
-        default=0.5,
-        help=("Img2-local weight for the suffix after "
-              "--image_condition_multi_stop_step; the complementary weight "
-              "uses the aligned Img1-only prediction. Defaults to 0.5."))
-    parser.add_argument(
-        "--image_condition_anchor_block_radius",
-        "--image_condition_pre_anchor_block_frames",
-        dest="image_condition_anchor_block_radius",
-        type=int,
-        default=0,
-        help=("Symmetric exclusion radius around every non-first image "
-              "anchor. The nearest N ordinary query frames on each side "
-              "cannot attend to that anchor; ordinary-frame visibility is "
-              "unchanged. The old --image_condition_pre_anchor_block_frames "
-              "name remains accepted as an alias. Defaults to 0."))
-    parser.add_argument(
-        "--image_condition_anchor_block_start_layer",
-        type=int,
-        default=0,
-        help=("Zero-based transformer layer at which the symmetric "
-              "anchor-block radius becomes active. Earlier layers use "
-              "radius 0 at every denoising step. Set this to the number of "
-              "layers (40 for A14B) to disable layer-based blocking before "
-              "an optional step override. Defaults to 0."))
-    parser.add_argument(
-        "--image_condition_anchor_block_start_step",
-        type=int,
-        default=None,
-        help=("Optional zero-based denoising step at which the configured "
-              "anchor-block radius becomes active in every transformer "
-              "layer. Before this step, --image_condition_anchor_block_"
-              "start_layer still controls the layer threshold."))
-    parser.add_argument(
-        "--init_video",
-        type=str,
-        default=None,
-        help=("Existing video to VAE-encode, noise at "
-              "--init_video_noise_step, and refine with standard first-frame "
-              "I2V conditioning."))
-    parser.add_argument(
-        "--init_video_noise_step",
-        type=int,
-        default=None,
-        help=("Zero-based index in the configured sampling schedule at which "
-              "to noise --init_video. Denoising runs from this step through "
-              "the end; lower values apply more noise."))
-    parser.add_argument(
-        "--sacrificial_image_latent_index",
-        type=int,
-        default=None,
-        help=("Deprecated compatibility option. Every nonzero "
-              "--image_latent_index is now treated as temporary and removed "
-              "automatically after denoising."))
-    parser.add_argument(
-        "--attention_probe_query_frame",
-        type=int,
-        default=None,
-        help=("Latent frame containing the query patch to diagnose. The "
-              "probe does not change model attention output."))
-    parser.add_argument(
-        "--attention_probe_layer",
-        type=int,
-        action="append",
-        default=None,
-        help=("Transformer layer to probe; repeat for multiple layers. "
-              "Defaults to the first, middle, and last layers."))
-    parser.add_argument(
-        "--attention_probe_step",
-        type=int,
-        action="append",
-        default=None,
-        help=("Zero-based denoising step to probe; repeat for multiple steps. "
-              "Defaults to the first, middle, and last steps."))
-    parser.add_argument(
-        "--attention_probe_query_row",
-        type=int,
-        default=None,
-        help="Spatial patch row to probe; defaults to the center row.")
-    parser.add_argument(
-        "--attention_probe_query_col",
-        type=int,
-        default=None,
-        help="Spatial patch column to probe; defaults to the center column.")
-    parser.add_argument(
-        "--attention_probe_output",
-        type=str,
-        default=None,
-        help=("Optional JSONL output path. Probe results are always logged to "
-              "stdout."))
+        help=("Fixed Img2-stream attention-output weight used by paired "
+              "anchor attention; must be in [0, 1] (default: 0.25)."))
     parser.add_argument(
         "--sample_solver",
         type=str,
@@ -665,11 +371,6 @@ def generate(args):
     device = local_rank
     _init_logging(rank)
 
-    if args.attention_probe_query_frame is not None:
-        assert world_size == 1, (
-            "The attention probe currently supports single-GPU inference only."
-        )
-
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
         logging.info(
@@ -722,27 +423,15 @@ def generate(args):
         args.base_seed = base_seed[0]
 
     logging.info(f"Input prompt: {args.prompt}")
-    imgs = None
     img = None
-    init_video = None
-    init_video_first_frame = None
-    if args.init_video is not None:
-        init_video, init_video_first_frame, sampled_indices = (
-            _load_refinement_video(args.init_video, args.frame_num))
-        logging.info(
-            "Input refinement video: %s (%d sampled frames; source indices "
-            "%d..%d)", args.init_video, init_video.size(1),
-            sampled_indices[0], sampled_indices[-1])
-    if args.image is not None:
-        imgs = [Image.open(path).convert("RGB") for path in args.image]
-        img = imgs[0]
-        logging.info(f"Input images: {args.image}")
-    elif init_video_first_frame is not None:
-        imgs = [init_video_first_frame]
-        img = imgs[0]
-        logging.info(
-            "No --image supplied; using the first sampled video frame as "
-            "the I2V condition")
+    image_paths = args.image or []
+    if image_paths:
+        opened_images = [
+            Image.open(path).convert("RGB") for path in image_paths
+        ]
+        img = (opened_images if args.image_condition_paired_anchor_attention
+               else opened_images[0])
+        logging.info("Input image(s): %s", image_paths)
 
     # prompt extend
     if args.use_prompt_extend:
@@ -750,7 +439,7 @@ def generate(args):
         if rank == 0:
             prompt_output = prompt_expander(
                 args.prompt,
-                image=img,
+                image=img[0] if isinstance(img, list) else img,
                 tar_lang=args.prompt_extend_target_lang,
                 seed=args.base_seed)
             if prompt_output.status == False:
@@ -863,7 +552,7 @@ def generate(args):
         logging.info(f"Generating video ...")
         video = wan_s2v.generate(
             input_prompt=args.prompt,
-            ref_image_path=args.image[0],
+            ref_image_path=image_paths[0] if image_paths else None,
             audio_path=args.audio,
             enable_tts=args.enable_tts,
             tts_prompt_audio=args.tts_prompt_audio,
@@ -895,47 +584,9 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
         )
         logging.info("Generating video ...")
-        attention_probe = None
-        if args.attention_probe_query_frame is not None:
-            attention_probe = {
-                'query_frame': args.attention_probe_query_frame,
-                'query_row': args.attention_probe_query_row,
-                'query_col': args.attention_probe_query_col,
-                'layers': args.attention_probe_layer,
-                'sampling_steps': args.attention_probe_step,
-                'output_path': args.attention_probe_output,
-            }
         video = wan_i2v.generate(
             args.prompt,
-            imgs,
-            size=SIZE_CONFIGS[args.size],
-            image_latent_indices=args.image_latent_index,
-            image_condition_switch_step=args.image_condition_switch_step,
-            image_condition_rope_blend_weight=(
-                args.image_condition_rope_blend_weight),
-            image_condition_rope_blend_start_step=(
-                args.image_condition_rope_blend_start_step),
-            image_condition_dual_guidance=(
-                args.image_condition_dual_guidance),
-            image_condition_prefix_multi_guidance_scale=(
-                args.image_condition_prefix_multi_guidance_scale),
-            image_condition_suffix_multi_guidance_scale=(
-                args.image_condition_suffix_multi_guidance_scale),
-            image_condition_multi_stop_step=(
-                args.image_condition_multi_stop_step),
-            image_condition_late_suffix_img2_weight=(
-                args.image_condition_late_suffix_img2_weight),
-            image_condition_anchor_block_radius=(
-                args.image_condition_anchor_block_radius),
-            image_condition_anchor_block_start_layer=(
-                args.image_condition_anchor_block_start_layer),
-            image_condition_anchor_block_start_step=(
-                args.image_condition_anchor_block_start_step),
-            sacrificial_image_latent_index=(
-                args.sacrificial_image_latent_index),
-            init_video=init_video,
-            init_video_noise_step=args.init_video_noise_step,
-            attention_probe=attention_probe,
+            img,
             max_area=MAX_AREA_CONFIGS[args.size],
             frame_num=args.frame_num,
             shift=args.sample_shift,
@@ -943,7 +594,12 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model)
+            offload_model=args.offload_model,
+            image_latent_indices=args.image_latent_index,
+            image_condition_paired_anchor_attention=(
+                args.image_condition_paired_anchor_attention),
+            image_condition_paired_stream_weight=(
+                args.image_condition_paired_stream_weight))
 
     if rank == 0:
         if args.save_file is None:

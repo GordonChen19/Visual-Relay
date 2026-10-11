@@ -6,9 +6,7 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import (flash_attention, log_frame_attention_probe,
-                        segmented_flash_attention)
-from ..utils.frame_conditioning import layer_anchor_block_radius
+from .attention import flash_attention, paired_anchor_attention
 
 __all__ = ['WanModel']
 
@@ -130,12 +128,8 @@ class WanSelfAttention(nn.Module):
                 seq_lens,
                 grid_sizes,
                 freqs,
-                conditioned_frame_indices=None,
-                sacrificial_frame_indices=None,
-                frame_attention_mode=None,
-                local_anchor_indices=None,
-                anchor_block_radius=0,
-                attention_probe=None):
+                paired_anchor_index=None,
+                paired_stream_weight=0.25):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -154,16 +148,9 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        if (conditioned_frame_indices is None
-                and frame_attention_mode is None):
-            q = rope_apply(q, grid_sizes, freqs)
-            k = rope_apply(k, grid_sizes, freqs)
-            if attention_probe is not None:
-                log_frame_attention_probe(q, k, v, seq_lens, grid_sizes,
-                                          conditioned_frame_indices,
-                                          attention_probe,
-                                          anchor_block_radius=
-                                          anchor_block_radius)
+        q = rope_apply(q, grid_sizes, freqs)
+        k = rope_apply(k, grid_sizes, freqs)
+        if paired_anchor_index is None:
             x = flash_attention(
                 q=q,
                 k=k,
@@ -171,19 +158,15 @@ class WanSelfAttention(nn.Module):
                 k_lens=seq_lens,
                 window_size=self.window_size)
         else:
-            x = segmented_flash_attention(
+            x = paired_anchor_attention(
                 q=q,
                 k=k,
                 v=v,
                 seq_lens=seq_lens,
                 grid_sizes=grid_sizes,
-                conditioned_frame_indices=conditioned_frame_indices,
-                sacrificial_frame_indices=sacrificial_frame_indices,
                 freqs=freqs,
-                frame_attention_mode=frame_attention_mode,
-                local_anchor_indices=local_anchor_indices,
-                anchor_block_radius=anchor_block_radius,
-                attention_probe=attention_probe,
+                anchor_index=paired_anchor_index,
+                stream_weight=paired_stream_weight,
                 window_size=self.window_size)
 
         # output
@@ -262,12 +245,8 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
-        conditioned_frame_indices=None,
-        sacrificial_frame_indices=None,
-        frame_attention_mode=None,
-        local_anchor_indices=None,
-        anchor_block_radius=0,
-        attention_probe=None,
+        paired_anchor_index=None,
+        paired_stream_weight=0.25,
     ):
         r"""
         Args:
@@ -285,9 +264,8 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs, conditioned_frame_indices,
-            sacrificial_frame_indices, frame_attention_mode,
-            local_anchor_indices, anchor_block_radius, attention_probe)
+            seq_lens, grid_sizes, freqs, paired_anchor_index,
+            paired_stream_weight)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -459,13 +437,8 @@ class WanModel(ModelMixin, ConfigMixin):
         context,
         seq_len,
         y=None,
-        conditioned_frame_indices=None,
-        sacrificial_frame_indices=None,
-        frame_attention_mode=None,
-        local_anchor_indices=None,
-        anchor_block_radius=0,
-        anchor_block_start_layer=0,
-        attention_probe=None,
+        paired_anchor_index=None,
+        paired_stream_weight=0.25,
     ):
         r"""
         Forward pass through the diffusion model
@@ -481,26 +454,6 @@ class WanModel(ModelMixin, ConfigMixin):
                 Maximum sequence length for positional encoding
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
-            conditioned_frame_indices (List[List[int]], *optional*):
-                Latent-frame indices containing image conditions for each
-                sample. Each anchor owns queries up to the next anchor.
-                Standard temporal RoPE is used for every query
-                interval.
-            sacrificial_frame_indices (List[List[int]], *optional*):
-                Removable image anchors placed at fractional positions in the
-                compact post-removal Q/K temporal timeline.
-            frame_attention_mode (str, *optional*):
-                Special global-compressed or isolated-local attention mode.
-            local_anchor_indices (List[List[int]], *optional*):
-                One local first-frame anchor per sample for isolated attention.
-            anchor_block_radius (int, *optional*):
-                Symmetric number of ordinary query frames on either side of a
-                non-first image anchor that hide that anchor.
-            anchor_block_start_layer (int, *optional*):
-                Zero-based transformer layer at which ``anchor_block_radius``
-                becomes active. Earlier layers use radius zero.
-            attention_probe (dict, *optional*):
-                Configuration for a diagnostic measurement of one query patch.
 
         Returns:
             List[Tensor]:
@@ -530,7 +483,9 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # time embeddings
         if t.dim() == 1:
-            t = t.expand(t.size(0), seq_len)
+            # Add the token axis before expansion so this supports both the
+            # standard B=1 path and paired streams with B=2.
+            t = t[:, None].expand(-1, seq_len)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             bt = t.size(0)
             t = t.flatten()
@@ -557,23 +512,11 @@ class WanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            conditioned_frame_indices=conditioned_frame_indices,
-            sacrificial_frame_indices=sacrificial_frame_indices,
-            frame_attention_mode=frame_attention_mode,
-            local_anchor_indices=local_anchor_indices)
+            paired_anchor_index=paired_anchor_index,
+            paired_stream_weight=paired_stream_weight)
 
-        for layer, block in enumerate(self.blocks):
-            layer_probe = None
-            if (attention_probe is not None
-                    and layer in attention_probe["layers"]):
-                layer_probe = dict(attention_probe, layer=layer)
-            active_anchor_block_radius = layer_anchor_block_radius(
-                anchor_block_radius, anchor_block_start_layer, layer)
-            x = block(
-                x,
-                anchor_block_radius=active_anchor_block_radius,
-                attention_probe=layer_probe,
-                **kwargs)
+        for block in self.blocks:
+            x = block(x, **kwargs)
 
         # head
         x = self.head(x, e)

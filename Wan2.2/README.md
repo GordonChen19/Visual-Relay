@@ -198,261 +198,40 @@ This repository supports the `Wan2.2-I2V-A14B` Image-to-Video model and can simu
 python generate.py --task i2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-I2V-A14B --offload_model True --convert_model_dtype --image examples/i2v_input.JPG --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
 ```
 
-Multiple images can be placed at explicit latent-frame indices by repeating
-`--image` and `--image_latent_index` in matching order:
-
-```bash
-python generate.py --task i2v-A14B --size 1280*720 \
-    --ckpt_dir ./Wan2.2-I2V-A14B \
-    --image path/to/A.png --image_latent_index 0 \
-    --image path/to/B.png --image_latent_index 10 \
-    --image_condition_switch_step 20 \
-    --prompt "A scene transitioning from A to B."
-```
-
-For I2V, `--size` is an exact output size. Every conditioning image uses a
-deterministic center crop to that size. Images already large enough in both
-dimensions are cropped without resizing; smaller images are isotropically
-resized just enough to cover the target and are then center-cropped. All
-anchors therefore use the same centered framing rule without aspect-ratio
-stretching. For example, a 1374x1145 image with `--size '1280*720'` uses crop
-coordinates `(left=47, top=212, right=1327, bottom=932)`.
-
-All image anchors are inserted into one full pixel-space conditioning video.
-For anchors at latent indices 0 and 10 in an 81-frame video, Img1 occupies the
-special pixel-frame prefix 0, while Img2 is repeated across pixel frames
-37--40, the complete four-frame group packed into latent 10. Every other pixel
-frame is zero. This full video is causally VAE-encoded so latents after Img2
-retain the joint Img1/Img2 history. The expanded multi-image branch keeps the
-ordinary cached Img2x4 latent at the anchor; it is not replaced by an
-independently encoded prefix. In dual-guidance mode only, a separate
-`[Img2, zeros...]` VAE encoding supplies the Img2-local base branch. Both
-latent 0 and latent 10 use the `[1, 1, 1, 1]` mask; ordinary latent frames
-remain unmasked.
-
-Ordinary-frame queries directly attend to all ordinary noisy latent frames,
-including future ones. They also attend to the first image anchor and to the
-image anchor that owns their interval. Prefix queries additionally see the
-next image anchor as an endpoint. All query intervals use the model's standard
-forward temporal RoPE. For anchors at latent frames 0 and 10, queries 0--9 and
-ordinary queries from 11 onward therefore see both anchors 0 and 10. Other
-unassigned intermediate image anchors are hidden. A query on a non-first
-conditioned anchor attends to itself and ordinary future frames, but not to
-past frames. Future image anchors are also visible. The first conditioned query retains
-default global I2V visibility.
-With a single image at latent frame 0, the intervals collapse to one standard
-global-attention call, preserving default I2V behavior.
-
-`--image_condition_switch_step` is optional and uses a zero-based denoising
-sampling-step index. With an 81-frame output and a temporary image at expanded
-latent 10, the scheduler keeps a 22-latent tensor. Before the switch, the
-expanded global view uses the continuous
-`[Img1, zeros..., Img2 x4, zeros...]` VAE encoding. The local view receives
-expanded latents 10--21 and independently encodes `[Img2, zeros...]` as a
-12-latent first-frame I2V sequence. After the switch, the global DiT view
-physically removes latent 10 and receives a normal 21-latent
-`[Img1, zeros...]` I2V conditioning sequence.
-
-Before the switch, each retained latent receives a blended prediction. By
-default, that prediction blends 75% compact
-Img1-only regular I2V and 25% expanded multi-image compressed RoPE; set
-`--image_condition_rope_blend_weight 0` for only the compact Img1 view or `1`
-for the previous fully compressed multi-image behavior. The compact branch
-physically omits temporary anchors, uses final-length `[Img1, zeros...]` VAE
-conditioning, and scatters its retained predictions back into the expanded
-scheduler tensor. Both predictions are evaluated at the same timestep and are
-blended before the scheduler advances once. Only disposable expanded latent 10
-uses the Img2-first local prediction; no retained latent blends global and
-local predictions. With a nontrivial blend, each pre-switch step requires three
-conditional/unconditional DiT pairs: compact Img1 global, expanded compressed
-multi-image global, and Img2-local.
-
-To keep the compressed multi-image trajectory early and introduce regular I2V
-gradually, set `--image_condition_rope_blend_start_step`. The compressed weight
-stays at 1 through that step, then follows a cosine decay to 0 at
-`--image_condition_switch_step`, where the model becomes fully compact
-Img1-only regular I2V. For example, start the transition at step 20 and finish
-at step 30 with:
-
-```bash
---image_condition_rope_blend_start_step 20 \
---image_condition_switch_step 30
-```
-
-When the start step is supplied, this schedule overrides the fixed
-`--image_condition_rope_blend_weight` value.
-
-For an opt-in two-image region-routed ablation, add
-`--image_condition_dual_guidance`. At each active expanded step, the sampler
-computes three CFG predictions at the same noisy latent and timestep: compact
-Img1-only regular I2V, local Img2-first I2V over the anchor and suffix, and the
-expanded compressed multi-image view. Prefix and suffix predictions are
-formed as
-
-```text
-prefix = Img1 + prefix_scale * (multi - Img1)
-anchor = Img2
-ordinary suffix = Img2 + suffix_scale * (multi - Img2)
-```
-
-using `--image_condition_prefix_multi_guidance_scale` (default `0.6`) and
-`--image_condition_suffix_multi_guidance_scale` (default `0.35`). Values in
-`[0, 1]` interpolate; values above `1` extrapolate. The temporary anchor uses
-the pure Img2-local prediction and is not mixed with the multi-image guide.
-All branches are aligned before subtraction, combined into one prediction,
-and passed to the scheduler once. The existing cosine schedule, when
-configured, transitions retained-frame predictions toward compact Img1-only
-I2V; the active temporary anchor remains purely Img2-local until the switch.
-This mode currently requires exactly two images and costs three
-CFG pairs (six DiT forwards) per fully active sampling step.
-
-For compressed attention, retained queries and keys use the post-removal RoPE
-timeline while each isolated temporary anchor occupies the midpoint between
-its retained neighbors. With a temporary anchor at expanded latent 10, latent
-9 uses temporal position 9, anchor 10 normally uses 9.5, and ordinary latent
-11 uses 10. The retained neighbors therefore remain one step apart while
-ordinary queries see the anchor at distance 0.5. RoPE is query-asymmetric for
-the temporary anchor itself: when anchor 10 is the query, its Q and self-K use
-integer position 9 while future retained keys keep positions 10, 11, 12, ... .
-The anchor therefore sees ordinary future frames at standard offsets 1, 2, 3,
-... rather than fractional offsets. The compact Img1 component physically
-omits temporary anchors and uses the same integer retained-frame timeline.
-
-To create a symmetric exclusion radius around every non-first image anchor,
-set `--image_condition_anchor_block_radius`. For example, with an anchor at
-latent 10, `--image_condition_anchor_block_radius 2` hides anchor 10 from
-queries 8--9 and 11--12. Those queries retain their existing access to every
-ordinary frame; only the anchor's spatial K/V tokens are removed. The anchor
-query itself remains unchanged. The default value is 0, which preserves full
-visibility on both sides. The deprecated
-`--image_condition_pre_anchor_block_frames` spelling remains accepted as an
-alias.
-
-Use `--image_condition_anchor_block_start_layer` to apply this exclusion only
-in later transformer layers. For example,
-`--image_condition_anchor_block_radius 1` together with
-`--image_condition_anchor_block_start_layer 16` keeps full anchor visibility
-in layers 0--15, then hides the anchor from its immediately adjacent ordinary
-query on each side in layers 16--39. This layer routing is repeated at every
-pre-switch denoising step. The default start layer is 0.
-
-Optionally, `--image_condition_anchor_block_start_step` can override the layer
-threshold later in sampling. Before that sampling step, the configured start
-layer applies normally; from that step onward, the radius is enforced in all
-transformer layers. For example, start at layer 16 initially and enable every
-layer from denoising step 25 with:
-
-```bash
---image_condition_anchor_block_radius 1 \
---image_condition_anchor_block_start_layer 16 \
---image_condition_anchor_block_start_step 25
-```
-
-To apply no radius before step 25 and the radius in every layer afterward, use
-the layer count as the pre-step sentinel:
-
-```bash
---image_condition_anchor_block_radius 1 \
---image_condition_anchor_block_start_layer 40 \
---image_condition_anchor_block_start_step 25
-```
-
-When the switch is set to 20 for a 40-step run, steps 0--19 use one hard-routed
-expanded multi-image global prediction. From step 20 onward, only the final-length
-Img1-global branch predicts retained frames. The expanded scheduler tensor
-keeps temporary anchor slots with zero disposable predictions so its shape and
-latent indexing never changes. Temporary anchors are removed together
-immediately before VAE decoding. Omitting both switch options keeps the
-expanded multi-image conditioning and compressed RoPE active for every
-sampling step; temporary anchors are still removed before decoding.
-
-With the default UniPC solver, an abrupt fixed-weight conditioning switch
-clears UniPC's recent model-output, timestep, and corrector-sample history. Its
-current step index, remaining timesteps, and sigma schedule are preserved. When
-`--image_condition_rope_blend_start_step` enables the cosine transition, UniPC
-history is instead preserved at the switch because the retained-frame
-prediction has already transitioned smoothly toward regular Img1-only I2V.
-
-When a conditioning switch is requested, every image anchor except the first
-image at latent 0 is temporary. Multiple temporary anchors are supported:
-
-```bash
-python generate.py --task i2v-A14B --size 1280*720 \
-    --frame_num 81 \
-    --ckpt_dir ./Wan2.2-I2V-A14B \
-    --image path/to/A.png --image_latent_index 0 \
-    --image path/to/B.png --image_latent_index 10 \
-    --image path/to/C.png --image_latent_index 20 \
-    --image_condition_switch_step 15 \
-    --prompt "A single continuous shot transitioning from A through B to C."
-```
-
-The example keeps two extra scheduler latents: 23 expanded latents for a
-requested 21-latent result. Before the switch, the global DiT operates on all
-23 expanded latents with continuous multi-image conditioning. Each disposable
-anchor is predicted by that same global pass. Its query attends to itself and
-every future frame while excluding all earlier frames. The anchor is denoised
-normally and is not clamped to a separately encoded latent.
-
-At the selected switch step, the expanded multi-image branch is turned off. The global
-branch continues on the 21 retained latents using Img1-only conditioning while
-the scheduler preserves its 23-latent external shape. After denoising,
-temporary latents 10 and 20 are removed simultaneously and the remaining 21
-latents decode to the requested 81 frames. Temporary indices are inferred from
-all nonzero
-`--image_latent_index` values. The deprecated singular
-`--sacrificial_image_latent_index` option remains accepted but is unnecessary.
-
-### Video refinement from an intermediate noise level
-
-An existing video can be VAE-encoded, forward-noised at a selected point in
-the configured sampling schedule, and denoised through the remaining steps
-with ordinary first-frame I2V conditioning:
-
-```bash
-python generate.py --task i2v-A14B --size '1280*720' \
-    --frame_num 81 \
-    --ckpt_dir ./Wan2.2-I2V-A14B \
-    --init_video path/to/existing.mp4 \
-    --init_video_noise_step 25 \
-    --prompt "Preserve the shot while repairing visual artifacts." \
-    --offload_model True --convert_model_dtype
-```
-
-If `--image` is omitted, the first sampled frame of `--init_video` is used as
-the clean I2V condition. An explicit `--image path/to/first_frame.png` may be
-provided instead. The input video must contain at least `--frame_num` frames;
-longer videos are sampled uniformly, then center-cropped and resized to the
-I2V output dimensions before VAE encoding.
-
-The noise step is zero-based relative to `--sample_steps`. Smaller values add
-more noise and run more denoising steps, allowing larger changes; larger values
-preserve more of the video but mainly repair fine detail. This mode supports
-exactly one image condition at latent index 0 and cannot be combined with
-`--image_condition_switch_step`.
-
-To diagnose temporal self-attention without changing the generated result,
-select a query latent frame and optionally write the measurements to JSONL:
-
-```bash
---attention_probe_query_frame 9 \
---attention_probe_output attention_probe.jsonl
-```
-
-By default, the center spatial patch is measured at the first, middle, and last
-transformer layers and denoising steps. Repeat `--attention_probe_layer` or
-`--attention_probe_step` to select explicit zero-based indices. The diagnostic
-recomputes logits only for the selected query patch, averages the resulting
-probabilities across attention heads, and reports a percentage for every latent
-frame plus previous/current/future totals. Masked frames report zero. The
-normal FlashAttention output remains unchanged. Attention probing currently
-supports single-GPU I2V inference only.
-
 > This command can run on a GPU with at least 80GB VRAM.
 
-> 💡For the Image-to-Video task, `size` selects the exact output dimensions;
-> conditioning images are resized only when necessary and center-cropped to
-> match them.
+> 💡For the Image-to-Video task, the `size` parameter represents the area of the generated video, with the aspect ratio following that of the original input image.
+
+Experimental paired-anchor attention keeps the upstream single-image path as
+the default. To condition an internal latent on a second image, repeat
+`--image` and `--image_latent_index`, then enable the paired mode:
+
+```bash
+python generate.py --task i2v-A14B --size '832*480' \
+  --ckpt_dir ./Wan2.2-I2V-A14B \
+  --image /path/to/Img1.png --image_latent_index 0 \
+  --image /path/to/Img2.png --image_latent_index 12 \
+  --image_condition_paired_anchor_attention \
+  --image_condition_paired_stream_weight 0.25 \
+  --prompt "A continuous shot connecting the two image anchors."
+```
+
+This creates a full Img1-only stream and an aligned, fresh-cache Img2-first
+suffix. At every DiT self-attention layer, queries before the anchor attend the
+complete ordinary main stream while excluding the anchor. Suffix queries blend
+two complete attention results: Stream A attends all ordinary Img1-stream
+frames except the anchor, and Stream B attends the full aligned Img2-first
+suffix. The fixed blend is `(1-g) * O_A + g * O_B`, where `g` is set by
+`--image_condition_paired_stream_weight`. The temporary anchor prediction comes
+entirely from the Img2-first suffix. Main-stream RoPE compresses out the anchor:
+with an anchor at 12, working frame 13 is moved to temporal coordinate 12, while
+suffix queries see keys 11 and 12 at the same relative offset. All prefix
+queries before the anchor are prevented from attending key 12, but retain
+access to compressed ordinary future frames 13 onward. Before decoding, the
+temporary anchor is removed, returning the working sequence from 22 to 21
+latents for an 81-frame output. The Img2-first suffix retains ordinary local
+I2V RoPE. Img2 must be an internal latent with at least one retained latent on
+its right.
 
 
 - Multi-GPU inference using FSDP + DeepSpeed Ulysses
@@ -757,3 +536,4 @@ We would like to thank the contributors to the [SD3](https://huggingface.co/stab
 
 ## Contact Us
 If you would like to leave a message to our research or product teams, feel free to join our [Discord](https://discord.gg/AKNgpMK4Yj) or [WeChat groups](https://gw.alicdn.com/imgextra/i2/O1CN01tqjWFi1ByuyehkTSB_!!6000000000015-0-tps-611-1279.jpg)!
+
