@@ -251,7 +251,12 @@ class WanI2V:
                  offload_model=True,
                  image_latent_indices=None,
                  image_condition_paired_anchor_attention=False,
-                 image_condition_paired_stream_weight=0.25):
+                 image_condition_paired_stream_weight=0.25,
+                 image_condition_paired_fade_start_step=None,
+                 image_condition_paired_fade_end_step=None,
+                 image_condition_paired_suffix_fade_start_step=None,
+                 image_condition_paired_suffix_fade_end_step=None,
+                 image_condition_paired_prefix_route_switch_step=None):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -290,6 +295,23 @@ class WanI2V:
             image_condition_paired_stream_weight (`float`, *optional*):
                 Fixed weight assigned to the full Img2 suffix-attention output
                 when paired mode fuses suffix tokens at every DiT layer.
+            image_condition_paired_fade_start_step (`int`, *optional*):
+                Sampling-step index at which the Stream-B suffix fusion weight
+                begins a cosine fade.
+            image_condition_paired_fade_end_step (`int`, *optional*):
+                Sampling-step index at which the suffix fusion weight reaches
+                zero.
+            image_condition_paired_suffix_fade_start_step (`int`, *optional*):
+                Stream-B-suffix-only fade start. Overrides the shared fade for
+                the suffix when supplied with its matching end step.
+            image_condition_paired_suffix_fade_end_step (`int`, *optional*):
+                Stream-B-suffix-only fade end.
+            image_condition_paired_prefix_route_switch_step (`int`, *optional*):
+                Hard prefix-routing handoff. Before this sampling step, prefix
+                queries attend their Stream-A prefix plus a hybrid anchor using
+                the history-aware Stream-A key and fresh-cache Img2 value, but
+                not ordinary post-anchor frames. At and after it, they exclude
+                that anchor and expose ordinary post-anchor Stream-A frames.
 
         Returns:
             torch.Tensor:
@@ -306,6 +328,38 @@ class WanI2V:
             if not 0.0 <= image_condition_paired_stream_weight <= 1.0:
                 raise ValueError(
                     "paired stream weight must be between zero and one")
+            fade_pairs = {
+                "shared": (image_condition_paired_fade_start_step,
+                           image_condition_paired_fade_end_step),
+                "suffix": (image_condition_paired_suffix_fade_start_step,
+                           image_condition_paired_suffix_fade_end_step),
+            }
+            for fade_name, fade_steps in fade_pairs.items():
+                if ((fade_steps[0] is None) != (fade_steps[1] is None)):
+                    raise ValueError(
+                        f"paired {fade_name} fade start and end steps must be "
+                        "supplied together")
+                if (fade_steps[0] is not None
+                        and not (0 <= fade_steps[0] < fade_steps[1]
+                                 < sampling_steps)):
+                    raise ValueError(
+                        f"paired {fade_name} fade steps must satisfy "
+                        "0 <= start < end < sampling_steps")
+            if (image_condition_paired_prefix_route_switch_step is not None
+                    and not (0 <=
+                             image_condition_paired_prefix_route_switch_step
+                             < sampling_steps)):
+                raise ValueError(
+                    "paired prefix route switch step must be in "
+                    "[0, sampling_steps)")
+            suffix_fade_start_step = (
+                image_condition_paired_suffix_fade_start_step
+                if image_condition_paired_suffix_fade_start_step is not None
+                else image_condition_paired_fade_start_step)
+            suffix_fade_end_step = (
+                image_condition_paired_suffix_fade_end_step
+                if image_condition_paired_suffix_fade_end_step is not None
+                else image_condition_paired_fade_end_step)
             if not isinstance(img, (list, tuple)) or len(img) != 2:
                 raise ValueError(
                     "paired anchor attention requires exactly two images")
@@ -412,35 +466,88 @@ class WanI2V:
                 torch.zeros(3, pixel_frames - 1, h, w)
             ], dim=1).to(self.device)
 
+        def joint_anchor_conditioning_video(first_image, anchor_image,
+                                            pixel_frames, latent_index):
+            """Build Img1 ... Img2x4 ... for one causal joint VAE encode."""
+            first = torch.nn.functional.interpolate(
+                first_image[None].cpu(), size=(h, w),
+                mode='bicubic').to(self.device)[0]
+            anchor = torch.nn.functional.interpolate(
+                anchor_image[None].cpu(), size=(h, w),
+                mode='bicubic').to(self.device)[0]
+            video = torch.zeros(
+                3, pixel_frames, h, w, device=self.device)
+            video[:, 0].copy_(first)
+            anchor_pixel_start = (1 + (latent_index - 1)
+                                  * self.vae_stride[0])
+            anchor_pixel_end = anchor_pixel_start + self.vae_stride[0]
+            if anchor_pixel_end > pixel_frames:
+                raise ValueError("joint Img2 anchor exceeds conditioning video")
+            video[:, anchor_pixel_start:anchor_pixel_end].copy_(
+                anchor[:, None].expand(-1, self.vae_stride[0], -1, -1))
+            return video
+
         if image_condition_paired_anchor_attention:
             suffix_latent_frame_num = model_latent_frame_num - anchor_index
             suffix_frame_num = (1 + self.vae_stride[0]
                                 * (suffix_latent_frame_num - 1))
+            expanded_frame_num = (1 + self.vae_stride[0]
+                                  * (model_latent_frame_num - 1))
             encoded = self.vae.encode([
                 conditioning_video(imgs[0], F),
                 conditioning_video(imgs[1], suffix_frame_num),
+                joint_anchor_conditioning_video(
+                    imgs[0], imgs[1], expanded_frame_num, anchor_index),
             ])
             if (encoded[0].size(1) != latent_frame_num
-                    or encoded[1].size(1) != suffix_latent_frame_num):
+                    or encoded[1].size(1) != suffix_latent_frame_num
+                    or encoded[2].size(1) != model_latent_frame_num):
                 raise RuntimeError(
                     "paired conditioning VAE lengths do not align")
-            # Duplicate the aligned Img1-only conditioning slot solely as a
-            # shape placeholder. The temporary anchor is excluded from Stream
-            # A K/V, and its final prediction is copied entirely from Stream B.
+            # Ordinary Stream-A slots retain the compact Img1-only encoding.
+            # Only its temporary anchor slot uses the joint causal encoding;
+            # Stream B independently uses a fresh-cache Img2-first suffix.
             expanded_msk = insert_latent_slot(msk, anchor_index)
             expanded_main = insert_latent_slot(encoded[0], anchor_index)
+            expanded_msk[:, anchor_index:anchor_index + 1].fill_(1)
+            expanded_main[:, anchor_index:anchor_index + 1].copy_(
+                encoded[2][:, anchor_index:anchor_index + 1])
             y = torch.concat([expanded_msk, expanded_main])
             suffix_y = torch.concat([
                 first_frame_mask(suffix_frame_num), encoded[1]
             ])
+            del encoded, expanded_msk, expanded_main
             logging.info(
                 "Paired anchor attention: %d retained latents plus temporary "
                 "Img2 anchor at %d (%d working latents), with a %d-latent "
                 "fresh-cache Img2 suffix; fixed full-suffix fusion weight "
-                "%.3f. The temporary anchor is removed before decoding",
+                "%.3f. While its anchor route is active, every prefix query "
+                "uses one softmax over the Stream-A prefix plus a hybrid "
+                "anchor with the history-aware Stream-A key and fresh-cache "
+                "Stream-B Img2 value; ordinary post-anchor frames are hidden. "
+                "Stream B independently "
+                "evolves a fresh-cache Img2 "
+                "anchor; its final prediction replaces the temporary main "
+                "anchor before that anchor is removed prior to decoding",
                 latent_frame_num, anchor_index, model_latent_frame_num,
                 suffix_latent_frame_num,
                 image_condition_paired_stream_weight)
+            if suffix_fade_start_step is not None:
+                logging.info(
+                    "Paired Stream-B suffix cosine fade: sampling steps %d "
+                    "through %d; weight %.3f -> 0; scheduler state is not reset",
+                    suffix_fade_start_step,
+                    suffix_fade_end_step,
+                    image_condition_paired_stream_weight)
+            if image_condition_paired_prefix_route_switch_step is not None:
+                logging.info(
+                    "Paired prefix routing handoff at sampling step %d: before "
+                    "the step, prefix queries see only their Stream-A prefix "
+                    "plus a history-aware Stream-A anchor key paired with the "
+                    "fresh-cache Stream-B Img2 value; at and after the step, "
+                    "they exclude Img2 and expose the compressed-RoPE ordinary "
+                    "post-anchor Stream-A frames",
+                    image_condition_paired_prefix_route_switch_step)
         else:
             y = self.vae.encode([conditioning_video(imgs[0], F)])[0]
             y = torch.concat([msk, y])
@@ -495,6 +602,7 @@ class WanI2V:
                     'y': [y, suffix_y],
                     'paired_anchor_index': anchor_index,
                     'paired_stream_weight': image_condition_paired_stream_weight,
+                    'paired_prefix_anchor_active': True,
                 }
                 arg_null = {
                     'context': [context_null[0], context_null[0]],
@@ -502,6 +610,7 @@ class WanI2V:
                     'y': [y, suffix_y],
                     'paired_anchor_index': anchor_index,
                     'paired_stream_weight': image_condition_paired_stream_weight,
+                    'paired_prefix_anchor_active': True,
                 }
             else:
                 arg_c = {
@@ -518,8 +627,35 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
+            def paired_fade_factor(sampling_step, fade_start_step,
+                                   fade_end_step):
+                if fade_start_step is None:
+                    return 1.0
+                if sampling_step <= fade_start_step:
+                    return 1.0
+                if sampling_step >= fade_end_step:
+                    return 0.0
+                fade_progress = (
+                    (sampling_step - fade_start_step)
+                    / (fade_end_step - fade_start_step))
+                return 0.5 * (1.0 + math.cos(math.pi * fade_progress))
+
+            for sampling_step, t in enumerate(tqdm(timesteps)):
                 if image_condition_paired_anchor_attention:
+                    suffix_fade_factor = paired_fade_factor(
+                        sampling_step, suffix_fade_start_step,
+                        suffix_fade_end_step)
+                    anchor_is_enabled = (
+                        image_condition_paired_prefix_route_switch_step is None
+                        or sampling_step <
+                        image_condition_paired_prefix_route_switch_step)
+                    current_stream_weight = (
+                        image_condition_paired_stream_weight
+                        * suffix_fade_factor)
+                    arg_c['paired_stream_weight'] = current_stream_weight
+                    arg_c['paired_prefix_anchor_active'] = anchor_is_enabled
+                    arg_null['paired_stream_weight'] = current_stream_weight
+                    arg_null['paired_prefix_anchor_active'] = anchor_is_enabled
                     latent_model_input = [
                         latent.to(self.device),
                         latent[:, anchor_index:].to(self.device),

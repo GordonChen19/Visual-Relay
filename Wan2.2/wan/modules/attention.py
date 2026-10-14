@@ -173,6 +173,7 @@ def paired_anchor_attention(
     freqs,
     anchor_index,
     stream_weight=0.25,
+    prefix_anchor_active=True,
     window_size=(-1, -1),
     dtype=torch.bfloat16,
 ):
@@ -181,11 +182,16 @@ def paired_anchor_attention(
     ``q`` and ``k`` must already have ordinary per-stream RoPE applied. The
     batch contains exactly two samples: a full main sequence followed by a
     suffix whose local frame zero aligns with ``anchor_index`` in the main
-    sequence. Main prefix queries use every ordinary Img1-stream key but exclude
-    the aligned anchor position. Main suffix queries use main-stream Q/K/V for
-    every ordinary key. A second full attention uses the aligned suffix-stream
-    Q/K/V, including Img2 and all later suffix frames. Their attention outputs
-    are combined using the fixed scalar ``stream_weight``.
+    sequence. While the prefix anchor route is active, prefix queries use one
+    ordinary softmax over the main-stream prefix and a hybrid anchor using the
+    history-aware Stream-A anchor key with the fresh-cache Stream-B anchor
+    value; ordinary post-anchor frames are deliberately hidden.
+    After that route is disabled, prefix queries use all ordinary main-stream
+    K/V on both sides of the removed temporary anchor.
+    Main suffix queries exclude the anchor and use main-stream Q/K/V for every
+    ordinary key. A second full attention uses the aligned suffix-stream Q/K/V,
+    including Img2 and all later suffix frames. Their outputs use
+    ``stream_weight``.
     """
     if window_size != (-1, -1):
         raise ValueError("paired anchor attention requires global attention")
@@ -225,10 +231,12 @@ def paired_anchor_attention(
 
     # Compress the anchor out of the main stream's ordinary timeline. Frames
     # after the anchor move one RoPE unit to the left, while the anchor key
-    # itself stays at its original position but is hidden from every prefix
-    # query. A suffix query sees the retained left neighbour through main
-    # attention and sees the Img2 anchor through the local suffix stream at the
-    # same relative offset: q=13 gives k={11, 12} offset -1.
+    # itself stays at its original position for the temporary messenger route
+    # itself supplies the history-aware key for prefix attention, paired with
+    # the fresh-cache B0 value. A suffix query
+    # sees the retained left neighbour through main attention and sees the Img2
+    # anchor through the local suffix stream at the same relative offset:
+    # q=13 gives k={11, 12} offset -1.
     # Shift one frame at a time to bound the temporary complex tensor size.
     for frame_index in range(anchor_index + 1, main_frames):
         frame_start = frame_index * tokens_per_frame
@@ -257,13 +265,38 @@ def paired_anchor_attention(
     ordinary_v = torch.cat(
         [main_v[:, :anchor_start], main_v[:, anchor_end:]], dim=1)
 
-    # Every prefix query excludes the anchor K/V but retains access to all
-    # ordinary future frames. With anchor 12, queries 0--11 cannot see k=12;
-    # compressed k=13 occupies temporal position 12 and provides the bridge.
+    # Before the route switch, prefix queries plan only against their own
+    # Stream-A prefix plus a hybrid anchor: history-aware A12 supplies K while
+    # fresh-cache B0 supplies V. Post-anchor ordinary frames are hidden so that
+    # they cannot compete with the Img2 endpoint. After the switch, remove the
+    # hybrid anchor and expose all ordinary Stream-A frames on both sides of
+    # the discarded temporary anchor.
+    if prefix_anchor_active:
+        prefix_k = torch.cat([
+            main_k[:, :anchor_start],
+            main_k[:, anchor_start:anchor_end],
+        ], dim=1)
+        prefix_v = torch.cat([
+            main_v[:, :anchor_start],
+            suffix_v[:, :tokens_per_frame],
+        ], dim=1)
+    else:
+        prefix_k = ordinary_k
+        prefix_v = ordinary_v
     prefix_output = flash_attention(
         q=main_q[:, :anchor_start],
-        k=ordinary_k,
-        v=ordinary_v,
+        k=prefix_k,
+        v=prefix_v,
+        window_size=window_size,
+        dtype=dtype)
+
+    # Evolve the joint-conditioned Stream-A anchor with the prefix and itself,
+    # but never with the post-anchor suffix. Stream B evolves its independent
+    # fresh-cache Img2 anchor through the Img2-first suffix branch.
+    messenger_output = flash_attention(
+        q=main_q[:, anchor_start:anchor_end],
+        k=main_k[:, :anchor_end],
+        v=main_v[:, :anchor_end],
         window_size=window_size,
         dtype=dtype)
 
@@ -283,7 +316,7 @@ def paired_anchor_attention(
 
     main_output = torch.cat([
         prefix_output,
-        suffix_output[:, :tokens_per_frame],
+        messenger_output,
         main_suffix_output,
     ], dim=1)
     padded_len = q.size(1)

@@ -213,25 +213,53 @@ python generate.py --task i2v-A14B --size '832*480' \
   --image /path/to/Img2.png --image_latent_index 12 \
   --image_condition_paired_anchor_attention \
   --image_condition_paired_stream_weight 0.25 \
+  --image_condition_paired_suffix_fade_start_step 25 \
+  --image_condition_paired_suffix_fade_end_step 34 \
   --prompt "A continuous shot connecting the two image anchors."
 ```
 
 This creates a full Img1-only stream and an aligned, fresh-cache Img2-first
-suffix. At every DiT self-attention layer, queries before the anchor attend the
-complete ordinary main stream while excluding the anchor. Suffix queries blend
-two complete attention results: Stream A attends all ordinary Img1-stream
-frames except the anchor, and Stream B attends the full aligned Img2-first
-suffix. The fixed blend is `(1-g) * O_A + g * O_B`, where `g` is set by
+suffix. While the prefix anchor route is active, prefix queries use one softmax
+over their Stream-A prefix plus one hybrid anchor: its key is the history-aware
+Stream-A temporary-anchor key and its value is the aligned fresh-cache Stream-B
+Img2 value. Ordinary post-anchor frames are hidden. No prefix logit bias,
+output interpolation, or RMS matching is applied. Ordinary Stream-A slots
+remain Img1-only. Stream B
+independently evolves a fresh-cache Img2-first anchor and suffix.
+Suffix queries blend two complete attention results: Stream A attends all
+ordinary Img1-stream frames except the anchor, and Stream B attends the full
+aligned Img2-first suffix. The fixed blend is
+`(1-g) * O_A + g * O_B`, where `g` is set by
 `--image_condition_paired_stream_weight`. The temporary anchor prediction comes
 entirely from the Img2-first suffix. Main-stream RoPE compresses out the anchor:
 with an anchor at 12, working frame 13 is moved to temporal coordinate 12, while
-suffix queries see keys 11 and 12 at the same relative offset. All prefix
-queries before the anchor are prevented from attending key 12, but retain
-access to compressed ordinary future frames 13 onward. Before decoding, the
-temporary anchor is removed, returning the working sequence from 22 to 21
+suffix queries see keys 11 and 12 at the same relative offset. Before decoding,
+the temporary anchor is removed, returning the working sequence from 22 to 21
 latents for an 81-frame output. The Img2-first suffix retains ordinary local
 I2V RoPE. Img2 must be an internal latent with at least one retained latent on
 its right.
+
+The Stream-B suffix weight can use a cosine fade interval. Its value remains
+unchanged through the start step, fades on the intervening steps, and becomes
+zero at its end step. The older
+`--image_condition_paired_fade_start_step` and
+`--image_condition_paired_fade_end_step` remain aliases for the suffix fade.
+The suffix-specific pair overrides the shared pair. The diffusion scheduler
+and its multistep history are
+not reset. Omit a component's applicable fade arguments to keep its value
+constant throughout sampling.
+
+Alternatively, use a hard prefix routing handoff:
+
+```bash
+--image_condition_paired_prefix_route_switch_step 20
+```
+
+Before step 20, prefix queries attend only their ordinary Img1-only Stream-A
+prefix plus the hybrid A-key/B-value anchor; post-anchor ordinary frames are
+hidden. At and after step 20, the hybrid anchor is completely excluded and all
+ordinary post-anchor Stream-A frames become visible using the compressed
+temporal RoPE coordinates described above.
 
 
 - Multi-GPU inference using FSDP + DeepSpeed Ulysses

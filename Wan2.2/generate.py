@@ -80,6 +80,18 @@ def _validate_args(args):
         assert args.image is not None, "Please specify the image path for i2v."
         assert 0.0 <= args.image_condition_paired_stream_weight <= 1.0, (
             "--image_condition_paired_stream_weight must be in [0, 1].")
+        paired_fade_pairs = {
+            "shared": (
+                args.image_condition_paired_fade_start_step,
+                args.image_condition_paired_fade_end_step),
+            "suffix": (
+                args.image_condition_paired_suffix_fade_start_step,
+                args.image_condition_paired_suffix_fade_end_step),
+        }
+        for fade_name, fade_steps in paired_fade_pairs.items():
+            assert ((fade_steps[0] is None) == (fade_steps[1] is None)), (
+                f"Paired {fade_name} fade start and end steps must be "
+                "supplied together.")
         if args.image_condition_paired_anchor_attention:
             assert len(args.image) == 2, (
                 "Paired anchor attention requires exactly two images.")
@@ -90,6 +102,13 @@ def _validate_args(args):
                         "Paired anchor attention requires image latent "
                         "indices [0, positive].")
         else:
+            assert all(steps == (None, None)
+                       for steps in paired_fade_pairs.values()), (
+                "Paired-attention fading requires "
+                "--image_condition_paired_anchor_attention.")
+            assert args.image_condition_paired_prefix_route_switch_step is None, (
+                "Prefix routing requires "
+                "--image_condition_paired_anchor_attention.")
             assert len(args.image) == 1, (
                 "Multiple images require "
                 "--image_condition_paired_anchor_attention.")
@@ -108,6 +127,19 @@ def _validate_args(args):
 
     if args.sample_steps is None:
         args.sample_steps = cfg.sample_steps
+
+    if args.task == "i2v-A14B":
+        for fade_name, fade_steps in paired_fade_pairs.items():
+            if fade_steps[0] is not None:
+                assert (0 <= fade_steps[0] < fade_steps[1]
+                        < args.sample_steps), (
+                            f"Paired {fade_name} fade steps must satisfy "
+                            "0 <= start < end < sample_steps.")
+        if args.image_condition_paired_prefix_route_switch_step is not None:
+            assert (0 <= args.image_condition_paired_prefix_route_switch_step
+                    < args.sample_steps), (
+                        "--image_condition_paired_prefix_route_switch_step "
+                        "must be in [0, sample_steps).")
 
     if args.sample_shift is None:
         args.sample_shift = cfg.sample_shift
@@ -250,6 +282,42 @@ def _parse_args():
         default=0.25,
         help=("Fixed Img2-stream attention-output weight used by paired "
               "anchor attention; must be in [0, 1] (default: 0.25)."))
+    parser.add_argument(
+        "--image_condition_paired_fade_start_step",
+        type=int,
+        default=None,
+        help=("Optional sampling-step index at which a cosine fade of the "
+              "suffix fusion weight begins. Must be "
+              "supplied with "
+              "--image_condition_paired_fade_end_step."))
+    parser.add_argument(
+        "--image_condition_paired_fade_end_step",
+        type=int,
+        default=None,
+        help=("Sampling-step index at which the suffix fusion weight reaches "
+              "zero."))
+    parser.add_argument(
+        "--image_condition_paired_suffix_fade_start_step",
+        type=int,
+        default=None,
+        help=("Optional Stream-B-suffix-only cosine-fade start step. "
+              "Overrides the shared paired fade for the suffix when supplied "
+              "with its matching end step."))
+    parser.add_argument(
+        "--image_condition_paired_suffix_fade_end_step",
+        type=int,
+        default=None,
+        help=("Stream-B-suffix-only cosine-fade end step; must be supplied "
+              "with --image_condition_paired_suffix_fade_start_step."))
+    parser.add_argument(
+        "--image_condition_paired_prefix_route_switch_step",
+        type=int,
+        default=None,
+        help=("Optional hard Img2-anchor removal step. Prefix queries always "
+              "attend their Stream-A prefix. Before this step they additionally "
+              "attend only the Img2 anchor; post-anchor ordinary frames are "
+              "hidden. At and after this step, Img2 is removed and the "
+              "compressed-RoPE post-anchor Stream-A frames become visible."))
     parser.add_argument(
         "--sample_solver",
         type=str,
@@ -599,7 +667,17 @@ def generate(args):
             image_condition_paired_anchor_attention=(
                 args.image_condition_paired_anchor_attention),
             image_condition_paired_stream_weight=(
-                args.image_condition_paired_stream_weight))
+                args.image_condition_paired_stream_weight),
+            image_condition_paired_fade_start_step=(
+                args.image_condition_paired_fade_start_step),
+            image_condition_paired_fade_end_step=(
+                args.image_condition_paired_fade_end_step),
+            image_condition_paired_suffix_fade_start_step=(
+                args.image_condition_paired_suffix_fade_start_step),
+            image_condition_paired_suffix_fade_end_step=(
+                args.image_condition_paired_suffix_fade_end_step),
+            image_condition_paired_prefix_route_switch_step=(
+                args.image_condition_paired_prefix_route_switch_step))
 
     if rank == 0:
         if args.save_file is None:

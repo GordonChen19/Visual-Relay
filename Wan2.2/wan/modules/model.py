@@ -129,7 +129,8 @@ class WanSelfAttention(nn.Module):
                 grid_sizes,
                 freqs,
                 paired_anchor_index=None,
-                paired_stream_weight=0.25):
+                paired_stream_weight=0.25,
+                paired_prefix_anchor_active=True):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -167,6 +168,7 @@ class WanSelfAttention(nn.Module):
                 freqs=freqs,
                 anchor_index=paired_anchor_index,
                 stream_weight=paired_stream_weight,
+                prefix_anchor_active=paired_prefix_anchor_active,
                 window_size=self.window_size)
 
         # output
@@ -247,6 +249,7 @@ class WanAttentionBlock(nn.Module):
         context_lens,
         paired_anchor_index=None,
         paired_stream_weight=0.25,
+        paired_prefix_anchor_active=True,
     ):
         r"""
         Args:
@@ -265,7 +268,7 @@ class WanAttentionBlock(nn.Module):
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
             seq_lens, grid_sizes, freqs, paired_anchor_index,
-            paired_stream_weight)
+            paired_stream_weight, paired_prefix_anchor_active)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -439,6 +442,7 @@ class WanModel(ModelMixin, ConfigMixin):
         y=None,
         paired_anchor_index=None,
         paired_stream_weight=0.25,
+        paired_prefix_anchor_active=True,
     ):
         r"""
         Forward pass through the diffusion model
@@ -513,7 +517,8 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens,
             paired_anchor_index=paired_anchor_index,
-            paired_stream_weight=paired_stream_weight)
+            paired_stream_weight=paired_stream_weight,
+            paired_prefix_anchor_active=paired_prefix_anchor_active)
 
         for block in self.blocks:
             x = block(x, **kwargs)

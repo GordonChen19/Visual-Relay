@@ -70,6 +70,7 @@ def sp_dit_forward(
     y=None,
     paired_anchor_index=None,
     paired_stream_weight=0.25,
+    paired_prefix_anchor_active=True,
 ):
     """
     x:              A list of videos each with shape [C, T, H, W].
@@ -136,7 +137,8 @@ def sp_dit_forward(
         context=context,
         context_lens=context_lens,
         paired_anchor_index=paired_anchor_index,
-        paired_stream_weight=paired_stream_weight)
+        paired_stream_weight=paired_stream_weight,
+        paired_prefix_anchor_active=paired_prefix_anchor_active)
 
     for block in self.blocks:
         x = block(x, **kwargs)
@@ -159,6 +161,7 @@ def sp_attn_forward(self,
                     freqs,
                     paired_anchor_index=None,
                     paired_stream_weight=0.25,
+                    paired_prefix_anchor_active=True,
                     dtype=torch.bfloat16):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
@@ -187,6 +190,7 @@ def sp_attn_forward(self,
         freqs=freqs,
         paired_anchor_index=paired_anchor_index,
         paired_stream_weight=paired_stream_weight,
+        paired_prefix_anchor_active=paired_prefix_anchor_active,
     )
 
     # output

@@ -16,6 +16,7 @@ def distributed_attention(
         freqs=None,
         paired_anchor_index=None,
         paired_stream_weight=0.25,
+        paired_prefix_anchor_active=True,
 ):
     """
     Performs distributed attention based on DeepSpeed Ulysses attention mechanism.
@@ -59,6 +60,7 @@ def distributed_attention(
             freqs=freqs,
             anchor_index=paired_anchor_index,
             stream_weight=paired_stream_weight,
+            prefix_anchor_active=paired_prefix_anchor_active,
             window_size=window_size,
         )
 

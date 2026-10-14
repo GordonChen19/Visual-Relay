@@ -62,6 +62,12 @@ class PairedAnchorCliTest(unittest.TestCase):
         self.assertEqual(args.image_latent_index, [0, 12])
         self.assertTrue(args.image_condition_paired_anchor_attention)
         self.assertEqual(args.image_condition_paired_stream_weight, 0.25)
+        self.assertIsNone(args.image_condition_paired_fade_start_step)
+        self.assertIsNone(args.image_condition_paired_fade_end_step)
+        self.assertIsNone(args.image_condition_paired_suffix_fade_start_step)
+        self.assertIsNone(args.image_condition_paired_suffix_fade_end_step)
+        self.assertIsNone(
+            args.image_condition_paired_prefix_route_switch_step)
 
     def test_paired_stream_weight_is_configurable(self):
         args = self.parse(
@@ -78,6 +84,61 @@ class PairedAnchorCliTest(unittest.TestCase):
                 '--image', 'img2.png', '--image_latent_index', '12',
                 '--image_condition_paired_anchor_attention',
                 '--image_condition_paired_stream_weight', '1.1')
+
+    def test_paired_suffix_weight_can_cosine_fade_to_img1_only(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image', 'img2.png', '--image_latent_index', '12',
+            '--image_condition_paired_anchor_attention',
+            '--image_condition_paired_fade_start_step', '25',
+            '--image_condition_paired_fade_end_step', '34')
+        self.assertEqual(args.image_condition_paired_fade_start_step, 25)
+        self.assertEqual(args.image_condition_paired_fade_end_step, 34)
+
+    def test_paired_fade_requires_both_steps(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image', 'img2.png', '--image_latent_index', '12',
+                '--image_condition_paired_anchor_attention',
+                '--image_condition_paired_fade_start_step', '25')
+
+    def test_suffix_specific_fade_is_configurable(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image', 'img2.png', '--image_latent_index', '12',
+            '--image_condition_paired_anchor_attention',
+            '--image_condition_paired_suffix_fade_start_step', '25',
+            '--image_condition_paired_suffix_fade_end_step', '30')
+        self.assertEqual(
+            args.image_condition_paired_suffix_fade_start_step, 25)
+        self.assertEqual(args.image_condition_paired_suffix_fade_end_step, 30)
+
+    def test_suffix_fade_requires_matching_end(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image', 'img2.png', '--image_latent_index', '12',
+                '--image_condition_paired_anchor_attention',
+                '--image_condition_paired_suffix_fade_start_step', '15')
+
+    def test_prefix_route_switch_is_configurable(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image', 'img2.png', '--image_latent_index', '12',
+            '--image_condition_paired_anchor_attention',
+            '--image_condition_paired_prefix_route_switch_step', '20')
+        self.assertEqual(
+            args.image_condition_paired_prefix_route_switch_step, 20)
+
+    def test_paired_fade_end_must_precede_last_sampling_index(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image', 'img2.png', '--image_latent_index', '12',
+                '--image_condition_paired_anchor_attention',
+                '--image_condition_paired_fade_start_step', '25',
+                '--image_condition_paired_fade_end_step', '40')
 
     def test_multiple_images_require_paired_mode(self):
         with self.assertRaises(AssertionError):
