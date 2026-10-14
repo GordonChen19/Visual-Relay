@@ -183,11 +183,11 @@ def paired_anchor_attention(
     batch contains exactly two samples: a full main sequence followed by a
     suffix whose local frame zero aligns with ``anchor_index`` in the main
     sequence. While the prefix anchor route is active, prefix queries use one
-    ordinary softmax over the main-stream prefix and a hybrid anchor using the
-    history-aware Stream-A anchor key with the fresh-cache Stream-B anchor
-    value; ordinary post-anchor frames are deliberately hidden.
-    After that route is disabled, prefix queries use all ordinary main-stream
-    K/V on both sides of the removed temporary anchor.
+    ordinary softmax over all ordinary main-stream K/V on both sides of the
+    temporary anchor plus a hybrid anchor using the history-aware Stream-A
+    anchor key with the fresh-cache Stream-B anchor value. After that route is
+    disabled, only the hybrid anchor is removed; ordinary post-anchor K/V
+    remain visible.
     Main suffix queries exclude the anchor and use main-stream Q/K/V for every
     ordinary key. A second full attention uses the aligned suffix-stream Q/K/V,
     including Img2 and all later suffix frames. Their outputs use
@@ -265,20 +265,20 @@ def paired_anchor_attention(
     ordinary_v = torch.cat(
         [main_v[:, :anchor_start], main_v[:, anchor_end:]], dim=1)
 
-    # Before the route switch, prefix queries plan only against their own
-    # Stream-A prefix plus a hybrid anchor: history-aware A12 supplies K while
-    # fresh-cache B0 supplies V. Post-anchor ordinary frames are hidden so that
-    # they cannot compete with the Img2 endpoint. After the switch, remove the
-    # hybrid anchor and expose all ordinary Stream-A frames on both sides of
-    # the discarded temporary anchor.
+    # Prefix queries always retain all ordinary Stream-A context on both sides
+    # of the temporary anchor. Before the route switch, also include one hybrid
+    # anchor: history-aware A12 supplies K while fresh-cache B0 supplies V.
+    # After the switch, remove only that hybrid anchor.
     if prefix_anchor_active:
         prefix_k = torch.cat([
             main_k[:, :anchor_start],
             main_k[:, anchor_start:anchor_end],
+            main_k[:, anchor_end:],
         ], dim=1)
         prefix_v = torch.cat([
             main_v[:, :anchor_start],
             suffix_v[:, :tokens_per_frame],
+            main_v[:, anchor_end:],
         ], dim=1)
     else:
         prefix_k = ordinary_k

@@ -220,11 +220,11 @@ python generate.py --task i2v-A14B --size '832*480' \
 
 This creates a full Img1-only stream and an aligned, fresh-cache Img2-first
 suffix. While the prefix anchor route is active, prefix queries use one softmax
-over their Stream-A prefix plus one hybrid anchor: its key is the history-aware
-Stream-A temporary-anchor key and its value is the aligned fresh-cache Stream-B
-Img2 value. Ordinary post-anchor frames are hidden. No prefix logit bias,
-output interpolation, or RMS matching is applied. Ordinary Stream-A slots
-remain Img1-only. Stream B
+over all ordinary Stream-A frames on both sides of the temporary anchor plus
+one hybrid anchor: its key is the history-aware Stream-A temporary-anchor key
+and its value is the aligned fresh-cache Stream-B Img2 value. No prefix logit
+bias, output interpolation, or RMS matching is applied. Ordinary Stream-A
+slots remain Img1-only. Stream B
 independently evolves a fresh-cache Img2-first anchor and suffix.
 Suffix queries blend two complete attention results: Stream A attends all
 ordinary Img1-stream frames except the anchor, and Stream B attends the full
@@ -255,11 +255,11 @@ Alternatively, use a hard prefix routing handoff:
 --image_condition_paired_prefix_route_switch_step 20
 ```
 
-Before step 20, prefix queries attend only their ordinary Img1-only Stream-A
-prefix plus the hybrid A-key/B-value anchor; post-anchor ordinary frames are
-hidden. At and after step 20, the hybrid anchor is completely excluded and all
-ordinary post-anchor Stream-A frames become visible using the compressed
-temporal RoPE coordinates described above.
+Prefix queries always attend ordinary Img1-only Stream-A frames on both sides
+of the temporary anchor; post-anchor keys use the compressed temporal RoPE
+coordinates described above. Before step 20, they additionally attend the
+hybrid A-key/B-value anchor. At and after step 20, only that hybrid anchor is
+excluded.
 
 
 - Multi-GPU inference using FSDP + DeepSpeed Ulysses

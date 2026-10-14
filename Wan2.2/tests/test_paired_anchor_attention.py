@@ -13,7 +13,7 @@ if torch is not None:
 class PairedAnchorAttentionRoutingTest(unittest.TestCase):
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
-    def test_active_prefix_uses_stream_a_anchor_key_and_stream_b_value(self):
+    def test_active_prefix_uses_all_ordinary_frames_and_hybrid_anchor(self):
         # Four main frames with anchor 2, plus the aligned two-frame suffix.
         # One token per frame keeps the routing visible in the tensor values.
         q = torch.zeros(2, 4, 1, 2)
@@ -52,14 +52,13 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
                 dtype=torch.bfloat16)
 
         # Calls: suffix, one prefix softmax, anchor messenger, main suffix.
-        # The active prefix sees A0, A1, and one hybrid anchor only: its key is
-        # history-aware A2 while its value is fresh-cache B0. A3 is still
-        # RoPE-compressed for the main suffix routes, but is absent here.
+        # The active prefix sees A0, A1, one hybrid anchor, and compressed A3.
+        # The hybrid key is history-aware A2 while its value is fresh-cache B0.
         _, prefix_key, prefix_value = calls[1]
         self.assertEqual(
-            prefix_key[0, :, 0, 0].tolist(), [10.0, 11.0, 12.0])
+            prefix_key[0, :, 0, 0].tolist(), [10.0, 11.0, 12.0, -87.0])
         self.assertEqual(
-            prefix_value[0, :, 0, 0].tolist(), [20.0, 21.0, 40.0])
+            prefix_value[0, :, 0, 0].tolist(), [20.0, 21.0, 40.0, 23.0])
         self.assertEqual(rope_shifts, [-1, -1])
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")

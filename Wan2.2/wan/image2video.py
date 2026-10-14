@@ -307,11 +307,11 @@ class WanI2V:
             image_condition_paired_suffix_fade_end_step (`int`, *optional*):
                 Stream-B-suffix-only fade end.
             image_condition_paired_prefix_route_switch_step (`int`, *optional*):
-                Hard prefix-routing handoff. Before this sampling step, prefix
-                queries attend their Stream-A prefix plus a hybrid anchor using
-                the history-aware Stream-A key and fresh-cache Img2 value, but
-                not ordinary post-anchor frames. At and after it, they exclude
-                that anchor and expose ordinary post-anchor Stream-A frames.
+                Hard anchor-removal step. Prefix queries always attend ordinary
+                Stream-A frames on both sides of the anchor. Before this step,
+                they additionally attend a hybrid anchor using the
+                history-aware Stream-A key and fresh-cache Img2 value; at and
+                after it, only that hybrid anchor is removed.
 
         Returns:
             torch.Tensor:
@@ -522,9 +522,9 @@ class WanI2V:
                 "Img2 anchor at %d (%d working latents), with a %d-latent "
                 "fresh-cache Img2 suffix; fixed full-suffix fusion weight "
                 "%.3f. While its anchor route is active, every prefix query "
-                "uses one softmax over the Stream-A prefix plus a hybrid "
-                "anchor with the history-aware Stream-A key and fresh-cache "
-                "Stream-B Img2 value; ordinary post-anchor frames are hidden. "
+                "uses one softmax over all ordinary Stream-A frames plus a "
+                "hybrid anchor with the history-aware Stream-A key and "
+                "fresh-cache Stream-B Img2 value. "
                 "Stream B independently "
                 "evolves a fresh-cache Img2 "
                 "anchor; its final prediction replaces the temporary main "
@@ -542,11 +542,10 @@ class WanI2V:
             if image_condition_paired_prefix_route_switch_step is not None:
                 logging.info(
                     "Paired prefix routing handoff at sampling step %d: before "
-                    "the step, prefix queries see only their Stream-A prefix "
+                    "the step, prefix queries see all ordinary Stream-A frames "
                     "plus a history-aware Stream-A anchor key paired with the "
                     "fresh-cache Stream-B Img2 value; at and after the step, "
-                    "they exclude Img2 and expose the compressed-RoPE ordinary "
-                    "post-anchor Stream-A frames",
+                    "only that hybrid anchor is removed",
                     image_condition_paired_prefix_route_switch_step)
         else:
             y = self.vae.encode([conditioning_video(imgs[0], F)])[0]
