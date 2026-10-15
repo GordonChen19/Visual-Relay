@@ -569,7 +569,7 @@ class MotionerTransformers(nn.Module, PeftAdapterMixin):
             torch.tensor(
                 [1 if not self.trainable_token_pos_emb else -1, seq_h,
                  seq_w]).unsqueeze(0).repeat(batch_size, 1),
-        ]  # 第三行代表rope emb的想要覆盖到的范围
+        ]  # The third row specifies the range covered by the RoPE embeddings.
                            ]
 
         grid_sizes = grid_sizes + token_grid_sizes

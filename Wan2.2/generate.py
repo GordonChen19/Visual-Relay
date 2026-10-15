@@ -38,7 +38,7 @@ EXAMPLE_PROMPT = {
             "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
     },
     "animate-14B": {
-        "prompt": "视频中的人在做动作",
+        "prompt": "The person in the video is performing actions.",
         "video": "",
         "pose": "",
         "mask": "",
@@ -53,9 +53,9 @@ EXAMPLE_PROMPT = {
         "tts_prompt_audio":
             "examples/zero_shot_prompt.wav",
         "tts_prompt_text":
-            "希望你以后能够做的比我还好呦。",
+            "I hope that one day you will do even better than I have.",
         "tts_text":
-            "收到好友从远方寄来的生日礼物，那份意外的惊喜与深深的祝福让我心中充满了甜蜜的快乐，笑容如花儿般绽放。"
+            "Receiving a birthday gift from a friend far away fills my heart with joy. The unexpected surprise and heartfelt wishes bring a bright smile to my face."
     },
 }
 
@@ -269,7 +269,7 @@ def _parse_args():
     parser.add_argument(
         "--prompt_extend_target_lang",
         type=str,
-        default="zh",
+        default="en",
         choices=["zh", "en"],
         help="The target language of prompt extend.")
     parser.add_argument(

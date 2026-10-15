@@ -81,7 +81,7 @@ class PromptExpander:
     def extend(self, prompt, system_prompt, seed=-1, *args, **kwargs):
         pass
 
-    def decide_system_prompt(self, tar_lang="zh", prompt=None):
+    def decide_system_prompt(self, tar_lang="en", prompt=None):
         assert self.task is not None
         if "ti2v" in self.task:
             if self.is_vl:
@@ -95,7 +95,7 @@ class PromptExpander:
     def __call__(self,
                  prompt,
                  system_prompt=None,
-                 tar_lang="zh",
+                 tar_lang="en",
                  image=None,
                  seed=-1,
                  *args,
@@ -434,8 +434,7 @@ if __name__ == "__main__":
         handlers=[logging.StreamHandler(stream=sys.stdout)])
 
     seed = 100
-    prompt = "夏日海滩度假风格，一只戴着墨镜的白色猫咪坐在冲浪板上。猫咪毛发蓬松，表情悠闲，直视镜头。背景是模糊的海滩景色，海水清澈，远处有绿色的山丘和蓝天白云。猫咪的姿态自然放松，仿佛在享受海风和阳光。近景特写，强调猫咪的细节和海滩的清新氛围。"
-    en_prompt = "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
+    prompt = "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
     image = "./examples/i2v_input.JPG"
 
     def test(method,
@@ -443,19 +442,11 @@ if __name__ == "__main__":
              model_name,
              task,
              image=None,
-             en_prompt=None,
-             seed=None):
+             seed=-1):
         prompt_expander = method(
             model_name=model_name, task=task, is_vl=image is not None)
-        result = prompt_expander(prompt, image=image, tar_lang="zh")
-        logging.info(f"zh prompt -> zh: {result.prompt}")
-        result = prompt_expander(prompt, image=image, tar_lang="en")
-        logging.info(f"zh prompt -> en: {result.prompt}")
-        if en_prompt is not None:
-            result = prompt_expander(en_prompt, image=image, tar_lang="zh")
-            logging.info(f"en prompt -> zh: {result.prompt}")
-            result = prompt_expander(en_prompt, image=image, tar_lang="en")
-            logging.info(f"en prompt -> en: {result.prompt}")
+        result = prompt_expander(prompt, image=image, tar_lang="en", seed=seed)
+        logging.info(f"English prompt expansion: {result.prompt}")
 
     ds_model_name = None
     ds_vl_model_name = None
@@ -474,7 +465,6 @@ if __name__ == "__main__":
                 ds_model_name,
                 task,
                 image=None,
-                en_prompt=en_prompt,
                 seed=seed)
 
             # test qwen api
@@ -486,7 +476,6 @@ if __name__ == "__main__":
                 qwen_model_name,
                 task,
                 image=None,
-                en_prompt=en_prompt,
                 seed=seed)
 
         # test prompt-image extend
@@ -500,7 +489,6 @@ if __name__ == "__main__":
                 ds_vl_model_name,
                 task,
                 image=image,
-                en_prompt=en_prompt,
                 seed=seed)
 
             # test qwen api
@@ -512,7 +500,6 @@ if __name__ == "__main__":
                 qwen_vl_model_name,
                 task,
                 image=image,
-                en_prompt=en_prompt,
                 seed=seed)
 
         # test empty prompt extend
@@ -526,7 +513,6 @@ if __name__ == "__main__":
                 ds_vl_model_name,
                 task,
                 image=image,
-                en_prompt=None,
                 seed=seed)
 
             # test qwen api
@@ -538,5 +524,4 @@ if __name__ == "__main__":
                 qwen_vl_model_name,
                 task,
                 image=image,
-                en_prompt=None,
                 seed=seed)

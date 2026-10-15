@@ -37,4 +37,4 @@ animate_14B.sample_steps = 20
 animate_14B.sample_guide_scale = 1.0
 animate_14B.frame_num = 77
 animate_14B.sample_fps = 30
-animate_14B.prompt = '视频中的人在做动作'
+animate_14B.prompt = 'The person in the video is performing actions.'

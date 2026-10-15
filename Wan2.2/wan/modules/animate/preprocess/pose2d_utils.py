@@ -1142,7 +1142,7 @@ def load_pose_metas_from_kp2ds_seq(kp2ds_seq, width, height):
         kps[:, 1] /= height
         kp2ds_body, kp2ds_lhand, kp2ds_rhand, kp2ds_face = split_kp2ds_for_aa(kps, ret_face=True)
 
-        # 排除全部小于0的情况
+        # Exclude cases in which all values are negative.
         if kp2ds_body[:, :2].min(axis=1).max() < 0:
             kp2ds_body = last_kp2ds_body
         last_kp2ds_body = kp2ds_body

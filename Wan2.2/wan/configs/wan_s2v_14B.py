@@ -52,7 +52,12 @@ s2v_14B.transformer.motion_frames = 73
 s2v_14B.transformer.cond_dim = 16
 
 # inference
-s2v_14B.sample_neg_prompt = "画面模糊，最差质量，画面模糊，细节模糊不清，情绪激动剧烈，手快速抖动，字幕，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+s2v_14B.sample_neg_prompt = (
+    "Blurry image, worst quality, blurry image, unclear details, intense emotional "
+    "agitation, rapidly shaking hands, subtitles, ugly, incomplete, extra fingers, "
+    "poorly drawn hands, poorly drawn faces, deformed, disfigured, malformed "
+    "limbs, fused fingers, motionless frames, cluttered background, three legs, "
+    "crowds in the background, walking backwards")
 s2v_14B.drop_first_motion = True
 s2v_14B.sample_shift = 3
 s2v_14B.sample_steps = 40

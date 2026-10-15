@@ -1,61 +1,61 @@
-# Visual-Relay：双图参考预算实验
+# Visual-Relay: Paired Reference Budget Experiment
 
-本分支在现有 `i2v-A14B` 双流锚点机制上，新增**按视频时间分配的左右参考预算**。它针对 Img1 与 Img2 之间的片段，让左参考权重逐渐下降、右参考权重逐渐上升，同时保留普通视频上下文参与运动生成。
+This branch adds **time-dependent left/right reference budgets** to the existing `i2v-A14B` paired-anchor mechanism. For the segment between Img1 and Img2, the left reference coefficient decreases while the right reference coefficient increases, with a separate share reserved for ordinary video context.
 
-分支：`codex/paired-reference-budget`。基线：[`2affd871`](https://github.com/GordonChen19/Visual-Relay/commit/2affd871f23b01026fb5118bed7b43f91e332ae7)。新功能默认关闭，继续使用现有 Wan2.2-I2V-A14B checkpoint，无需新增训练权重。模型下载、依赖安装和硬件要求见 [Wan2.2 原始说明](Wan2.2/README.md)。
+Branch: `codex/paired-reference-budget`. Original baseline: [`2affd871`](https://github.com/GordonChen19/Visual-Relay/commit/2affd871f23b01026fb5118bed7b43f91e332ae7). The feature is disabled by default and uses the existing Wan2.2-I2V-A14B checkpoint without additional training weights. See the [Wan2.2 documentation](Wan2.2/README.md) for model downloads, dependencies, and hardware requirements.
 
-这是推理机制实验：代码约束直接参考通道的份额，**尚不能据此宣称两张图对生成结果的控制能力已经对等**。
+This is an inference experiment. It constrains the direct reference coefficients; **it does not establish equal control over the generated video**.
 
-## 方法
+## Method
 
-原有 A 分支覆盖整段视频，B 分支从 Img2 锚点开始覆盖后缀。设 Img2 的临时锚点位于 latent 索引 `a`。对于锚点之前的 Query，本分支将参考分为三组，各自执行一次 attention、分别归一化：
+The existing A stream covers the full video; the B stream covers the suffix starting at Img2. Let `a` be the latent index of the temporary Img2 anchor. For queries before that anchor, attention is computed and normalized separately over three groups:
 
-| 组 | Key 来源 | Value 来源 |
+| Group | Key source | Value source |
 | --- | --- | --- |
-| 左参考 `L` | A 的首位置 | A 的首位置 |
-| 右参考 `R` | A 的临时锚点 `a` | B 的首位置 |
-| 视频上下文 `V` | A 的其余普通位置 | A 的其余普通位置 |
+| Left reference `L` | First position of A | First position of A |
+| Right reference `R` | Temporary anchor `a` in A | First position of B |
+| Video context `V` | Remaining ordinary positions in A | Remaining ordinary positions in A |
 
-视频上下文包含锚点两侧的普通视频位置，排除已经单独读取的两个参考位置，避免直接重复计入。保留现有普通后缀位置的 RoPE 对齐逻辑。**右参考仍是 `K_A(anchor) + V_B(0)`，没有改成 B/B。**
+Video context includes ordinary positions on both sides of the anchor, excluding the two separately read reference positions to avoid directly counting them twice. Existing RoPE alignment for ordinary suffix positions is preserved. **The right reference remains `K_A(anchor) + V_B(0)`; it is not changed to B/B.**
 
-分别计算 `O_L`、`O_R`、`O_V`，再融合：
+After computing `O_L`, `O_R`, and `O_V`, the outputs are combined as follows:
 
 ```text
-u = j / a                         # prefix latent 索引 j = 0, ..., a-1
+u = j / a                         # prefix latent index j = 0, ..., a-1
 w(u) = u                          # linear
-# 或 w(u) = 3*u*u - 2*u*u*u       # smoothstep
+# or w(u) = 3*u*u - 2*u*u*u       # smoothstep
 
 O(j) = (1-rho) * O_V(j)
      + rho * ((1-w(u)) * O_L(j) + w(u) * O_R(j))
 ```
 
-- `rho` 是图片参考的固定总预算，`1-rho` 留给普通视频上下文。
-- `w(u)` 是左右参考交接比例，满足 `w(1-u)=1-w(u)`。中点若落在 latent 网格上，左右直接参考系数相同。
-- `j` 是**视频 latent 时间位置**，不是去噪采样步数；同一时间位置的所有空间 token 使用相同交接系数。
-- 临时锚点不属于 prefix Query，所以实际计算范围没有 `u=1` 的 Query。VAE 时间压缩和临时位置删除也意味着这里不是逐像素、逐输出帧的精确时间约束。
+- `rho` is the fixed total image-reference budget; `1-rho` is reserved for ordinary video context.
+- `w(u)` controls the handoff between references and satisfies `w(1-u)=1-w(u)`. The direct coefficients are equal at the midpoint when it falls on the latent grid.
+- `j` is a **video latent time position**, not a denoising step. All spatial tokens at a given time position share the same handoff coefficient.
+- The temporary anchor is not a prefix query, so no query in this calculation has `u=1`. Temporal VAE compression and removal of the temporary position also mean this is not an exact constraint on individual decoded frames or pixels.
 
-该改动仅替换 prefix attention。临时锚点自身的更新、B 分支计算、主流残差、后缀融合、采样器和解码路径保持现有机制。后缀的 `image_condition_paired_stream_weight` 仍默认 `0.25`，与新增的 `rho` 作用于不同区域。
+Only prefix attention is replaced. The temporary anchor update, B stream, main-stream residuals, suffix blending, sampler, and decoder retain their existing mechanisms. The suffix parameter `image_condition_paired_stream_weight` still defaults to `0.25` and applies to a different region from the new `rho`.
 
-相比原先一次 prefix attention，新路径执行三次分组 attention，即每次调用增加两次 prefix attention 计算；继续使用现有 attention 内核，不构造完整 attention 分数矩阵。实际显存与耗时需要 GPU 测量。
+The new path uses three grouped prefix attention calls instead of one, adding two prefix attention calls per invocation. It uses the existing attention kernel without materializing the full attention score matrix. GPU memory and runtime costs still need measurement.
 
-## 参数
+## Parameters
 
-| 参数 | 默认值 | 含义 |
+| Parameter | Default | Meaning |
 | --- | --- | --- |
-| `--image_condition_paired_prefix_reference_budget` | 不设置，关闭新机制 | 有限数值 `[0,1]`，对应 `rho` |
-| `--image_condition_paired_prefix_reference_curve` | `linear` | `linear` 或 `smoothstep` |
+| `--image_condition_paired_prefix_reference_budget` | Unset; feature disabled | Finite value in `[0,1]`, corresponding to `rho` |
+| `--image_condition_paired_prefix_reference_curve` | `linear` | `linear` or `smoothstep` |
 
-注意：
+Usage notes:
 
-- 需同时开启 `--image_condition_paired_anchor_attention`，使用恰好两张图及 `[0,a]` 两个 latent 索引；Img2 必须处于内部，右侧仍要留出片段。
-- **省略 budget 参数才是原算法基线。`rho=0` 是仅使用排除两锚点后的普通上下文，并不等于关闭新机制。** `rho=1` 则不直接读取普通上下文组，但残差和其他网络路径仍存在。
-- budget 与 `--image_condition_paired_prefix_route_switch_step` 互斥，避免在某个去噪步骤关闭右图通路，破坏显式预算的含义。
-- 初次对照建议省略所有 `paired_*fade*` 参数，固定后缀权重，不启用提示词扩展，减少额外变化。
-- 本分支没有自适应 `rho`、回退系数 `eta`、去噪进度预算调度或 K/V 来源切换开关。
+- Enable `--image_condition_paired_anchor_attention` with exactly two images and latent indices `[0,a]`. Img2 must be internal, with a video segment remaining to its right.
+- **Omit the budget argument to obtain the original attention baseline. `rho=0` uses only ordinary context with both anchors excluded; it does not disable the new mechanism.** At `rho=1`, the ordinary context group is not read directly, but residuals and other network paths remain active.
+- The budget is mutually exclusive with `--image_condition_paired_prefix_route_switch_step`, which would otherwise disable the right reference route during denoising and invalidate the explicit budget interpretation.
+- For initial comparisons, omit all `paired_*fade*` parameters, keep the suffix weight fixed, and disable prompt expansion.
+- This branch does not add adaptive `rho`, a fallback coefficient `eta`, a denoising-step budget schedule, or a K/V source switch.
 
-## 运行示例
+## Example
 
-安装依赖并准备 checkpoint 后，从仓库根目录进入 `Wan2.2`。将两张输入图放在仓库根目录，替换 checkpoint 路径及 prompt。下面是 Bash 命令；PowerShell 可以将整条 Python 命令写成一行。
+After installing dependencies and obtaining the checkpoint, enter `Wan2.2` from the repository root. The root images `Img1.png` and `Img2.png` can be used directly; `fnr1.png` and `fnr2.png` provide another pair. Replace the checkpoint path and supply a prompt that describes the intended motion for your pair. Without an explicit prompt, the existing I2V example falls back to a white-cat beach description, which is unsuitable for these pairs. This is a Bash command; in PowerShell, put the Python command on one line.
 
 ```bash
 cd Wan2.2
@@ -75,37 +75,45 @@ python generate.py \
   --save_file paired-budget-0.3-linear.mp4
 ```
 
-`0.3` 仅为演示数值，未经生成实验验证，不代表推荐最优值。制作基线时，保持图片、顺序、索引、prompt、seed 和其他采样设置不变，删除两个 `paired_prefix_reference_*` 参数，并使用不同输出文件名。
+`0.3` is an illustrative value, not a validated optimum. To produce a baseline, keep the images, order, indices, prompt, seed, and other sampling settings fixed; remove both `paired_prefix_reference_*` arguments and use a different output filename.
 
-## 验证与实验
+## English text and defaults
 
-CPU 单元测试使用小张量和替代 attention 内核检查路由、公式和边界参数；不加载模型权重，不验证 CUDA 内核或完整视频效果。从 `Wan2.2` 目录运行：
+Documentation, comments, built-in prompts, negative prompts, and prompt-expansion instructions are written in English. Prompt expansion defaults to English in both the CLI and Python API; explicitly selecting the existing `zh` option still requests Chinese output for compatibility. Its instructions are also written in English.
+
+The TTS example uses an English transcript and a matching synthesized English reference recording at `Wan2.2/examples/zero_shot_prompt.wav`. The reference says: "I hope that one day you will do even better than I have." It was synthesized with Microsoft Zira Desktop as 24 kHz, 16-bit mono PCM. The generated-speech example text is also English. This sample is a functional input example, not a benchmark of TTS quality.
+
+**Translating the negative prompts changes model conditioning.** Results from the earlier Chinese-default revision may differ even when the attention budget is disabled. Run the original-attention baseline and budget experiments on the **same revision**, with identical positive and negative prompts, to isolate the attention change. Prompt-expansion results may also change after translation; keep expansion disabled for controlled comparisons.
+
+## Validation and experiments
+
+CPU unit tests use small tensors and a substitute attention kernel to check routing, the formula, and boundary arguments. They do not load model weights or validate CUDA kernels or full video quality. Run from `Wan2.2`:
 
 ```bash
 python -X utf8 -m unittest discover -s tests -p 'test_paired_anchor_*.py' -v
 ```
 
-本分支已完成本地 CPU 验证：**39 项测试通过，无跳过**。其中包含小尺寸随机初始化 DiT 的实际前向计算，验证标准路径和单进程模拟的 sequence-parallel 路径都将参数传到每一层；分布式集合通信使用恒等替代，不等于真实多 GPU / NCCL 验证。
+Local CPU validation completed with **39 tests passing and no skips**. This includes actual forward passes through a small, randomly initialized DiT, checking that the standard path and a single-process simulation of sequence parallelism deliver the arguments to every layer. Distributed collectives are replaced with identity operations; this does not validate real multi-GPU or NCCL execution.
 
-详细测试入口见 [tests/README.md](Wan2.2/tests/README.md)。CPU attention 测试需要 PyTorch；缺少 PyTorch 时跳过，不能将跳过视为已验证。
+See [tests/README.md](Wan2.2/tests/README.md) for details. CPU attention tests require PyTorch; a skip caused by missing PyTorch is not a successful validation.
 
-建议按以下顺序比较，并为多组图片使用多个固定 seed：
+Compare the following, using multiple fixed seeds for multiple image pairs:
 
-| 对照 | 改动 | 检验目标 |
+| Comparison | Change | What to evaluate |
 | --- | --- | --- |
-| 原算法基线 | 不设置 budget | 原有控制与运动表现 |
-| 固定预算 | 固定曲线，改变 `rho` | 参考增强与运动连续性的取舍 |
-| 交接曲线 | 固定 `rho`，比较 linear / smoothstep | 视频时间分配的效果 |
-| 后续独立实验，未实现 | 比较当前 A/B 与正确对齐 RoPE 的 B/B | 区分预算问题与参考表示问题 |
+| Original attention baseline | Omit the budget | Existing control and motion |
+| Fixed budget | Vary `rho` with the curve fixed | Reference strength versus motion continuity |
+| Handoff curve | Compare linear and smoothstep at fixed `rho` | Effect of temporal reference allocation |
+| Future independent experiment; not implemented | Compare A/B with B/B after correct RoPE alignment | Budget effects versus reference representation effects |
 
-除了记录参考份额，还应分别扰动 Img1、Img2，检查改动沿视频时间传播的强弱；交换两端并作时间镜像对照时，要处理动作描述、画布及噪声对应关系，相同 seed 本身不保证反转后的噪声匹配。同时检查临近两端的一致性、中间运动、身份保持、重影、静止和突然切换。系数相等是实现性质，不能作为视觉控制相等的实验结论。
+In addition to recording reference coefficients, perturb Img1 and Img2 separately and inspect how each change propagates over video time. When swapping the endpoints for a time-reversed comparison, account for motion descriptions, canvas geometry, and noise correspondence: using the same seed alone does not ensure time-reversed noise. Inspect consistency near both references, intermediate motion, identity preservation, ghosting, freezing, and abrupt switches. Equal coefficients are an implementation property, not evidence of equal visual control.
 
-## 已知边界
+## Limitations
 
-- 两张图的参考特征仍是网络演化后的隐藏表示；组内 attention 总量的预算不等于原始图片的因果贡献或像素贡献。
-- Img1 条件输入、主流 Query 和残差、两侧锚点的演化历史以及因果 VAE 仍然不对称。这个改动没有消除全链路的输入角色差异。
-- 普通上下文也可能已携带两张图的信息，分组只消除参考位置的直接重复计入。
-- Img2 仍对应解码前被删除的临时参考 latent，没有新增严格到达 Img2 的端点约束。
-- 增加或均衡直接参考可能改善控制，也可能损害自然运动。当前没有完整模型视频生成结果支持效果提升；需要上述生成实验验证。
+- Reference features are evolving network hidden states. Group budgets are not causal or pixel-level contributions from the original images.
+- Img1 conditioning, main-stream queries and residuals, anchor histories, and the causal VAE remain asymmetric. This change does not eliminate end-to-end differences between the input roles.
+- Ordinary context can already contain information from both images. Grouping only avoids directly counting the reference positions twice.
+- Img2 remains a temporary reference latent removed before decoding. No strict endpoint constraint has been added.
+- Stronger or more balanced direct references may improve control or impair natural motion. Full-model video generation has not established a quality improvement; the experiments above are still required.
 
-实现入口：[attention.py](Wan2.2/wan/modules/attention.py)、[model.py](Wan2.2/wan/modules/model.py)、[image2video.py](Wan2.2/wan/image2video.py)、[generate.py](Wan2.2/generate.py)。
+Implementation: [attention.py](Wan2.2/wan/modules/attention.py), [model.py](Wan2.2/wan/modules/model.py), [image2video.py](Wan2.2/wan/image2video.py), and [generate.py](Wan2.2/generate.py).
