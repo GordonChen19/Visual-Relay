@@ -71,6 +71,8 @@ def sp_dit_forward(
     paired_anchor_index=None,
     paired_stream_weight=0.25,
     paired_prefix_anchor_active=True,
+    paired_prefix_reference_budget=None,
+    paired_prefix_reference_curve='linear',
 ):
     """
     x:              A list of videos each with shape [C, T, H, W].
@@ -138,7 +140,9 @@ def sp_dit_forward(
         context_lens=context_lens,
         paired_anchor_index=paired_anchor_index,
         paired_stream_weight=paired_stream_weight,
-        paired_prefix_anchor_active=paired_prefix_anchor_active)
+        paired_prefix_anchor_active=paired_prefix_anchor_active,
+        paired_prefix_reference_budget=paired_prefix_reference_budget,
+        paired_prefix_reference_curve=paired_prefix_reference_curve)
 
     for block in self.blocks:
         x = block(x, **kwargs)
@@ -162,7 +166,9 @@ def sp_attn_forward(self,
                     paired_anchor_index=None,
                     paired_stream_weight=0.25,
                     paired_prefix_anchor_active=True,
-                    dtype=torch.bfloat16):
+                    dtype=torch.bfloat16,
+                    paired_prefix_reference_budget=None,
+                    paired_prefix_reference_curve='linear'):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
 
@@ -191,6 +197,8 @@ def sp_attn_forward(self,
         paired_anchor_index=paired_anchor_index,
         paired_stream_weight=paired_stream_weight,
         paired_prefix_anchor_active=paired_prefix_anchor_active,
+        paired_prefix_reference_budget=paired_prefix_reference_budget,
+        paired_prefix_reference_curve=paired_prefix_reference_curve,
     )
 
     # output

@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import math
+
 import torch
 
 try:
@@ -176,6 +178,8 @@ def paired_anchor_attention(
     prefix_anchor_active=True,
     window_size=(-1, -1),
     dtype=torch.bfloat16,
+    prefix_reference_budget=None,
+    prefix_reference_curve='linear',
 ):
     """Fuse an Img1 main stream with an aligned Img2-first suffix stream.
 
@@ -188,6 +192,19 @@ def paired_anchor_attention(
     anchor key with the fresh-cache Stream-B anchor value. After that route is
     disabled, only the hybrid anchor is removed; ordinary post-anchor K/V
     remain visible.
+
+    With ``prefix_reference_budget=rho`` in [0, 1], prefix queries instead
+    attend to three separately normalized groups: ordinary main context
+    excluding both anchors, A0 K/V, and the existing hybrid A-anchor K/B0 V.
+    The outputs are mixed as (1-rho)*context + rho*((1-w)*left + w*right),
+    where w is j/anchor_index (or its smoothstep) for latent frame j. Every
+    spatial token and attention head in that frame uses the same w. The
+    temporary anchor itself is not a prefix query, so the final prefix frame
+    has w < 1. ``None`` preserves the original joint softmax; 0 is context-only
+    and is not the legacy route. A budget requires the prefix anchor route to
+    remain active. These budgets constrain direct attention outputs, not the
+    final visual influence of either image.
+
     Main suffix queries exclude the anchor and use main-stream Q/K/V for every
     ordinary key. A second full attention uses the aligned suffix-stream Q/K/V,
     including Img2 and all later suffix frames. Their outputs use
@@ -202,6 +219,16 @@ def paired_anchor_attention(
             "paired anchor attention requires main and suffix streams")
     if not 0.0 <= stream_weight <= 1.0:
         raise ValueError("paired stream weight must be between zero and one")
+    if prefix_reference_curve not in ('linear', 'smoothstep'):
+        raise ValueError("prefix reference curve must be linear or smoothstep")
+    if prefix_reference_budget is not None:
+        if (not math.isfinite(prefix_reference_budget)
+                or not 0.0 <= prefix_reference_budget <= 1.0):
+            raise ValueError(
+                "prefix reference budget must be finite and between zero and one")
+        if not prefix_anchor_active:
+            raise ValueError(
+                "prefix reference budget requires an active prefix anchor route")
 
     main_frames, main_height, main_width = (
         int(value) for value in grid_sizes[0].tolist())
@@ -265,30 +292,72 @@ def paired_anchor_attention(
     ordinary_v = torch.cat(
         [main_v[:, :anchor_start], main_v[:, anchor_end:]], dim=1)
 
-    # Prefix queries always retain all ordinary Stream-A context on both sides
-    # of the temporary anchor. Before the route switch, also include one hybrid
-    # anchor: history-aware A12 supplies K while fresh-cache B0 supplies V.
-    # After the switch, remove only that hybrid anchor.
-    if prefix_anchor_active:
-        prefix_k = torch.cat([
-            main_k[:, :anchor_start],
-            main_k[:, anchor_start:anchor_end],
+    prefix_q = main_q[:, :anchor_start]
+    if prefix_reference_budget is not None:
+        # Keep both references out of the context group to avoid counting A0
+        # twice. Post-anchor context retains the temporal RoPE shift above.
+        context_k = torch.cat([
+            main_k[:, tokens_per_frame:anchor_start],
             main_k[:, anchor_end:],
         ], dim=1)
-        prefix_v = torch.cat([
-            main_v[:, :anchor_start],
-            suffix_v[:, :tokens_per_frame],
+        context_v = torch.cat([
+            main_v[:, tokens_per_frame:anchor_start],
             main_v[:, anchor_end:],
         ], dim=1)
+        context_output = flash_attention(
+            q=prefix_q,
+            k=context_k,
+            v=context_v,
+            window_size=window_size,
+            dtype=dtype)
+        left_output = flash_attention(
+            q=prefix_q,
+            k=main_k[:, :tokens_per_frame],
+            v=main_v[:, :tokens_per_frame],
+            window_size=window_size,
+            dtype=dtype)
+        right_output = flash_attention(
+            q=prefix_q,
+            k=main_k[:, anchor_start:anchor_end],
+            v=suffix_v[:, :tokens_per_frame],
+            window_size=window_size,
+            dtype=dtype)
+
+        right_weight = torch.arange(
+            anchor_index, device=prefix_q.device, dtype=torch.float32
+        ) / anchor_index
+        if prefix_reference_curve == 'smoothstep':
+            right_weight = right_weight.square() * (3.0 - 2.0 * right_weight)
+        right_weight = right_weight.repeat_interleave(tokens_per_frame).view(
+            1, anchor_start, 1, 1).to(left_output.dtype)
+        reference_output = ((1.0 - right_weight) * left_output
+                            + right_weight * right_output)
+        prefix_output = ((1.0 - prefix_reference_budget) * context_output
+                         + prefix_reference_budget * reference_output)
     else:
-        prefix_k = ordinary_k
-        prefix_v = ordinary_v
-    prefix_output = flash_attention(
-        q=main_q[:, :anchor_start],
-        k=prefix_k,
-        v=prefix_v,
-        window_size=window_size,
-        dtype=dtype)
+        # Legacy prefix: one ordinary softmax over all Stream-A context and,
+        # while active, the hybrid A-anchor K/B0 V. The route switch removes
+        # only this hybrid anchor; ordinary post-anchor context stays visible.
+        if prefix_anchor_active:
+            prefix_k = torch.cat([
+                main_k[:, :anchor_start],
+                main_k[:, anchor_start:anchor_end],
+                main_k[:, anchor_end:],
+            ], dim=1)
+            prefix_v = torch.cat([
+                main_v[:, :anchor_start],
+                suffix_v[:, :tokens_per_frame],
+                main_v[:, anchor_end:],
+            ], dim=1)
+        else:
+            prefix_k = ordinary_k
+            prefix_v = ordinary_v
+        prefix_output = flash_attention(
+            q=prefix_q,
+            k=prefix_k,
+            v=prefix_v,
+            window_size=window_size,
+            dtype=dtype)
 
     # Evolve the joint-conditioned Stream-A anchor with the prefix and itself,
     # but never with the post-anchor suffix. Stream B evolves its independent

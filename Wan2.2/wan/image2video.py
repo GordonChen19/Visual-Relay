@@ -256,7 +256,9 @@ class WanI2V:
                  image_condition_paired_fade_end_step=None,
                  image_condition_paired_suffix_fade_start_step=None,
                  image_condition_paired_suffix_fade_end_step=None,
-                 image_condition_paired_prefix_route_switch_step=None):
+                 image_condition_paired_prefix_route_switch_step=None,
+                 image_condition_paired_prefix_reference_budget=None,
+                 image_condition_paired_prefix_reference_curve="linear"):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -312,6 +314,17 @@ class WanI2V:
                 they additionally attend a hybrid anchor using the
                 history-aware Stream-A key and fresh-cache Img2 value; at and
                 after it, only that hybrid anchor is removed.
+            image_condition_paired_prefix_reference_budget (`float`, *optional*):
+                Fixed total reference budget rho in [0, 1]. None preserves
+                legacy prefix attention. When set, separately normalize video
+                context, Img1 (A key/value), and Img2 (A key/B value), then use
+                (1-rho)*context + rho*((1-w)*Img1 + w*Img2). Zero selects only
+                video context. Requires paired mode and no route switch.
+            image_condition_paired_prefix_reference_curve (`str`, *optional*):
+                "linear" uses w=u; "smoothstep" uses w=3*u^2-2*u^3, where
+                u is latent position divided by Img2 anchor index. Applied to
+                prefix queries, including position zero, at every sampling
+                step. Reference budgets do not guarantee equal visual control.
 
         Returns:
             torch.Tensor:
@@ -321,6 +334,30 @@ class WanI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
+        if image_condition_paired_prefix_reference_curve not in (
+                "linear", "smoothstep"):
+            raise ValueError(
+                "paired prefix reference curve must be linear or smoothstep")
+        if image_condition_paired_prefix_reference_budget is not None:
+            if (not math.isfinite(image_condition_paired_prefix_reference_budget)
+                    or not 0.0 <= image_condition_paired_prefix_reference_budget
+                    <= 1.0):
+                raise ValueError(
+                    "paired prefix reference budget must be finite and in [0, 1]")
+            if not image_condition_paired_anchor_attention:
+                raise ValueError(
+                    "paired prefix reference budgeting requires paired anchor "
+                    "attention")
+            if image_condition_paired_prefix_route_switch_step is not None:
+                raise ValueError(
+                    "paired prefix reference budgeting cannot be combined "
+                    "with a prefix route switch; both reference routes must "
+                    "remain active")
+        elif image_condition_paired_prefix_reference_curve != "linear":
+            raise ValueError(
+                "a nondefault paired prefix reference curve requires a "
+                "prefix reference budget")
+
         # preprocess
         guide_scale = (guide_scale, guide_scale) if isinstance(
             guide_scale, float) else guide_scale
@@ -521,10 +558,8 @@ class WanI2V:
                 "Paired anchor attention: %d retained latents plus temporary "
                 "Img2 anchor at %d (%d working latents), with a %d-latent "
                 "fresh-cache Img2 suffix; fixed full-suffix fusion weight "
-                "%.3f. While its anchor route is active, every prefix query "
-                "uses one softmax over all ordinary Stream-A frames plus a "
-                "hybrid anchor with the history-aware Stream-A key and "
-                "fresh-cache Stream-B Img2 value. "
+                "%.3f. Img2 prefix reference uses the history-aware "
+                "Stream-A key and fresh-cache Stream-B Img2 value. "
                 "Stream B independently "
                 "evolves a fresh-cache Img2 "
                 "anchor; its final prediction replaces the temporary main "
@@ -532,6 +567,22 @@ class WanI2V:
                 latent_frame_num, anchor_index, model_latent_frame_num,
                 suffix_latent_frame_num,
                 image_condition_paired_stream_weight)
+            if image_condition_paired_prefix_reference_budget is None:
+                logging.info(
+                    "Legacy prefix attention: while the anchor route is "
+                    "active, one softmax reads all ordinary Stream-A frames "
+                    "plus the hybrid Img2 reference")
+            else:
+                logging.info(
+                    "Grouped prefix attention: fixed reference budget "
+                    "rho=%.3f, curve=%s, u=latent_position/%d; separately "
+                    "normalized video context excludes both references. "
+                    "Output=(1-rho)*context+rho*((1-w)*Img1+w*Img2). "
+                    "The video-time handoff is fixed across sampling steps "
+                    "and does not guarantee equal visual control",
+                    image_condition_paired_prefix_reference_budget,
+                    image_condition_paired_prefix_reference_curve,
+                    anchor_index)
             if suffix_fade_start_step is not None:
                 logging.info(
                     "Paired Stream-B suffix cosine fade: sampling steps %d "
@@ -602,6 +653,10 @@ class WanI2V:
                     'paired_anchor_index': anchor_index,
                     'paired_stream_weight': image_condition_paired_stream_weight,
                     'paired_prefix_anchor_active': True,
+                    'paired_prefix_reference_budget':
+                        image_condition_paired_prefix_reference_budget,
+                    'paired_prefix_reference_curve':
+                        image_condition_paired_prefix_reference_curve,
                 }
                 arg_null = {
                     'context': [context_null[0], context_null[0]],
@@ -610,6 +665,10 @@ class WanI2V:
                     'paired_anchor_index': anchor_index,
                     'paired_stream_weight': image_condition_paired_stream_weight,
                     'paired_prefix_anchor_active': True,
+                    'paired_prefix_reference_budget':
+                        image_condition_paired_prefix_reference_budget,
+                    'paired_prefix_reference_curve':
+                        image_condition_paired_prefix_reference_curve,
                 }
             else:
                 arg_c = {

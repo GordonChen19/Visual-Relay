@@ -130,7 +130,9 @@ class WanSelfAttention(nn.Module):
                 freqs,
                 paired_anchor_index=None,
                 paired_stream_weight=0.25,
-                paired_prefix_anchor_active=True):
+                paired_prefix_anchor_active=True,
+                paired_prefix_reference_budget=None,
+                paired_prefix_reference_curve='linear'):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -169,6 +171,8 @@ class WanSelfAttention(nn.Module):
                 anchor_index=paired_anchor_index,
                 stream_weight=paired_stream_weight,
                 prefix_anchor_active=paired_prefix_anchor_active,
+                prefix_reference_budget=paired_prefix_reference_budget,
+                prefix_reference_curve=paired_prefix_reference_curve,
                 window_size=self.window_size)
 
         # output
@@ -250,6 +254,8 @@ class WanAttentionBlock(nn.Module):
         paired_anchor_index=None,
         paired_stream_weight=0.25,
         paired_prefix_anchor_active=True,
+        paired_prefix_reference_budget=None,
+        paired_prefix_reference_curve='linear',
     ):
         r"""
         Args:
@@ -268,7 +274,9 @@ class WanAttentionBlock(nn.Module):
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
             seq_lens, grid_sizes, freqs, paired_anchor_index,
-            paired_stream_weight, paired_prefix_anchor_active)
+            paired_stream_weight, paired_prefix_anchor_active,
+            paired_prefix_reference_budget=paired_prefix_reference_budget,
+            paired_prefix_reference_curve=paired_prefix_reference_curve)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -443,6 +451,8 @@ class WanModel(ModelMixin, ConfigMixin):
         paired_anchor_index=None,
         paired_stream_weight=0.25,
         paired_prefix_anchor_active=True,
+        paired_prefix_reference_budget=None,
+        paired_prefix_reference_curve='linear',
     ):
         r"""
         Forward pass through the diffusion model
@@ -518,7 +528,9 @@ class WanModel(ModelMixin, ConfigMixin):
             context_lens=context_lens,
             paired_anchor_index=paired_anchor_index,
             paired_stream_weight=paired_stream_weight,
-            paired_prefix_anchor_active=paired_prefix_anchor_active)
+            paired_prefix_anchor_active=paired_prefix_anchor_active,
+            paired_prefix_reference_budget=paired_prefix_reference_budget,
+            paired_prefix_reference_curve=paired_prefix_reference_curve)
 
         for block in self.blocks:
             x = block(x, **kwargs)

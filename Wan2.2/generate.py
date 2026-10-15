@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import argparse
 import logging
+import math
 import os
 import sys
 import warnings
@@ -64,6 +65,26 @@ def _validate_args(args):
     assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
     assert args.task in WAN_CONFIGS, f"Unsupport task: {args.task}"
     assert args.task in EXAMPLE_PROMPT, f"Unsupport task: {args.task}"
+
+    prefix_reference_budget = args.image_condition_paired_prefix_reference_budget
+    if prefix_reference_budget is not None:
+        assert (math.isfinite(prefix_reference_budget)
+                and 0.0 <= prefix_reference_budget <= 1.0), (
+                    "--image_condition_paired_prefix_reference_budget must "
+                    "be finite and in [0, 1].")
+        assert (args.task == "i2v-A14B"
+                and args.image_condition_paired_anchor_attention), (
+                    "Prefix reference budgeting requires paired i2v-A14B "
+                    "with --image_condition_paired_anchor_attention.")
+        assert args.image_condition_paired_prefix_route_switch_step is None, (
+            "Prefix reference budgeting cannot be combined with "
+            "--image_condition_paired_prefix_route_switch_step; both "
+            "reference routes must remain active.")
+    assert (args.image_condition_paired_prefix_reference_curve == "linear"
+            or prefix_reference_budget is not None), (
+                "--image_condition_paired_prefix_reference_curve requires "
+                "--image_condition_paired_prefix_reference_budget when "
+                "set to a nondefault curve.")
 
     if args.prompt is None:
         args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
@@ -317,6 +338,24 @@ def _parse_args():
               "attend ordinary Stream-A frames on both sides of the anchor. "
               "Before this step they additionally attend the hybrid Img2 "
               "anchor; at and after it only that anchor is removed."))
+    parser.add_argument(
+        "--image_condition_paired_prefix_reference_budget",
+        type=float,
+        default=None,
+        help=("Optional fixed total reference budget rho for paired prefix "
+              "attention, finite and in [0, 1]. None preserves legacy "
+              "attention; 0 uses only ordinary video context. Separately "
+              "normalized left/right references share rho by video position. "
+              "Incompatible with prefix route switching."))
+    parser.add_argument(
+        "--image_condition_paired_prefix_reference_curve",
+        type=str,
+        default="linear",
+        choices=["linear", "smoothstep"],
+        help=("Right-reference share w(u) for prefix budgeting, with "
+              "u=latent_position/Img2_anchor_index: linear uses u; smoothstep "
+              "uses 3*u^2-2*u^3. This is video time, not sampling progress. "
+              "A nondefault curve requires a reference budget."))
     parser.add_argument(
         "--sample_solver",
         type=str,
@@ -676,7 +715,11 @@ def generate(args):
             image_condition_paired_suffix_fade_end_step=(
                 args.image_condition_paired_suffix_fade_end_step),
             image_condition_paired_prefix_route_switch_step=(
-                args.image_condition_paired_prefix_route_switch_step))
+                args.image_condition_paired_prefix_route_switch_step),
+            image_condition_paired_prefix_reference_budget=(
+                args.image_condition_paired_prefix_reference_budget),
+            image_condition_paired_prefix_reference_curve=(
+                args.image_condition_paired_prefix_reference_curve))
 
     if rank == 0:
         if args.save_file is None:

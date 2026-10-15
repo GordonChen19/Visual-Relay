@@ -1,5 +1,7 @@
 # Wan2.2
 
+> Visual-Relay 双图参考预算实验：方法、参数、运行示例与验证边界见 [仓库 README](../README.md)。新增 prefix 分组 attention 默认关闭，原有安装与模型说明保留如下。
+
 <p align="center">
     <img src="assets/logo.png" width="400"/>
 <p>
