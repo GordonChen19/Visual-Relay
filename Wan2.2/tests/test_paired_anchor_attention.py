@@ -52,8 +52,8 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
                 dtype=torch.bfloat16)
 
         # Calls: suffix, one prefix softmax, anchor messenger, main suffix.
-        # The active prefix sees A0, A1, one hybrid anchor, and compressed A3.
-        # The hybrid key is history-aware A2 while its value is fresh-cache B0.
+        # The active prefix sees A0, A1, the history-aware A2 key paired with
+        # the fresh-cache B0 value, and compressed A3.
         _, prefix_key, prefix_value = calls[1]
         self.assertEqual(
             prefix_key[0, :, 0, 0].tolist(), [10.0, 11.0, 12.0, -87.0])

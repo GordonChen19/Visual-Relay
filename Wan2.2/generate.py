@@ -315,7 +315,8 @@ def _parse_args():
         default=None,
         help=("Optional hard Img2-anchor removal step. Prefix queries always "
               "attend ordinary Stream-A frames on both sides of the anchor. "
-              "Before this step they additionally attend the hybrid Img2 "
+              "Before this step they additionally attend the shifted "
+              "fresh-cache Stream-B Img2 "
               "anchor; at and after it only that anchor is removed."))
     parser.add_argument(
         "--sample_solver",

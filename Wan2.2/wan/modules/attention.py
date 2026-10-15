@@ -184,10 +184,11 @@ def paired_anchor_attention(
     suffix whose local frame zero aligns with ``anchor_index`` in the main
     sequence. While the prefix anchor route is active, prefix queries use one
     ordinary softmax over all ordinary main-stream K/V on both sides of the
-    temporary anchor plus a hybrid anchor using the history-aware Stream-A
-    anchor key with the fresh-cache Stream-B anchor value. After that route is
-    disabled, only the hybrid anchor is removed; ordinary post-anchor K/V
-    remain visible.
+    temporary anchor plus a hybrid anchor: the history-aware Stream-A anchor
+    key selects the target in its joint temporal context, while the
+    fresh-cache Stream-B anchor value supplies the image feature. After that
+    route is disabled, only the hybrid anchor is removed; ordinary post-anchor
+    K/V remain visible.
     Main suffix queries exclude the anchor and use main-stream Q/K/V for every
     ordinary key. A second full attention uses the aligned suffix-stream Q/K/V,
     including Img2 and all later suffix frames. Their outputs use
@@ -266,9 +267,11 @@ def paired_anchor_attention(
         [main_v[:, :anchor_start], main_v[:, anchor_end:]], dim=1)
 
     # Prefix queries always retain all ordinary Stream-A context on both sides
-    # of the temporary anchor. Before the route switch, also include one hybrid
-    # anchor: history-aware A12 supplies K while fresh-cache B0 supplies V.
-    # After the switch, remove only that hybrid anchor.
+    # of the temporary anchor. Before the route switch, also include a hybrid
+    # anchor: the joint-conditioned, history-aware Stream-A anchor supplies K,
+    # while the fresh-cache Stream-B anchor supplies V. Both are already
+    # aligned to the anchor for this prefix attention computation. After the
+    # switch, remove only this hybrid anchor route.
     if prefix_anchor_active:
         prefix_k = torch.cat([
             main_k[:, :anchor_start],

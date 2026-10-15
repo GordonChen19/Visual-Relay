@@ -310,8 +310,8 @@ class WanI2V:
                 Hard anchor-removal step. Prefix queries always attend ordinary
                 Stream-A frames on both sides of the anchor. Before this step,
                 they additionally attend a hybrid anchor using the
-                history-aware Stream-A key and fresh-cache Img2 value; at and
-                after it, only that hybrid anchor is removed.
+                history-aware Stream-A key and fresh-cache Stream-B Img2
+                value; at and after it, only that hybrid route is removed.
 
         Returns:
             torch.Tensor:
@@ -527,8 +527,8 @@ class WanI2V:
                 "fresh-cache Stream-B Img2 value. "
                 "Stream B independently "
                 "evolves a fresh-cache Img2 "
-                "anchor; its final prediction replaces the temporary main "
-                "anchor before that anchor is removed prior to decoding",
+                "anchor, while the joint-conditioned Stream-A anchor keeps "
+                "its own prediction and is removed prior to decoding",
                 latent_frame_num, anchor_index, model_latent_frame_num,
                 suffix_latent_frame_num,
                 image_condition_paired_stream_weight)
@@ -545,7 +545,7 @@ class WanI2V:
                     "the step, prefix queries see all ordinary Stream-A frames "
                     "plus a history-aware Stream-A anchor key paired with the "
                     "fresh-cache Stream-B Img2 value; at and after the step, "
-                    "only that hybrid anchor is removed",
+                    "only that hybrid anchor route is removed",
                     image_condition_paired_prefix_route_switch_step)
         else:
             y = self.vae.encode([conditioning_video(imgs[0], F)])[0]
@@ -677,19 +677,12 @@ class WanI2V:
 
                 predictions_cond = model(
                     latent_model_input, t=timestep, **arg_c)
-                if image_condition_paired_anchor_attention:
-                    predictions_cond[0][:, anchor_index:anchor_index + 1].copy_(
-                        predictions_cond[1][:, :1])
                 noise_pred_cond = predictions_cond[0]
                 del predictions_cond
                 if offload_model:
                     torch.cuda.empty_cache()
                 predictions_uncond = model(
                     latent_model_input, t=timestep, **arg_null)
-                if image_condition_paired_anchor_attention:
-                    predictions_uncond[0][:,
-                                          anchor_index:anchor_index + 1].copy_(
-                                              predictions_uncond[1][:, :1])
                 noise_pred_uncond = predictions_uncond[0]
                 del predictions_uncond
                 if offload_model:
