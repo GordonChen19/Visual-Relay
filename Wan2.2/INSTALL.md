@@ -4,7 +4,7 @@
 
 ```bash
 pip install .
-pip install .[dev]  # Installe aussi les outils de dev
+pip install .[dev]  # Also install development tools
 ```
 
 ## Install with Poetry

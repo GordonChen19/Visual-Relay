@@ -55,6 +55,8 @@ Usage notes:
 
 ## Example
 
+For the supplied warrior-orbit and falling-object experiments, see the [reproducible commands and exact prompts](experiments/README.md).
+
 After installing dependencies and obtaining the checkpoint, enter `Wan2.2` from the repository root. The root images `Img1.png` and `Img2.png` can be used directly; `fnr1.png` and `fnr2.png` provide another pair. Replace the checkpoint path and supply a prompt that describes the intended motion for your pair. Without an explicit prompt, the existing I2V example falls back to a white-cat beach description, which is unsuitable for these pairs. This is a Bash command; in PowerShell, put the Python command on one line.
 
 ```bash
