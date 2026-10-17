@@ -258,7 +258,12 @@ class WanI2V:
                  image_condition_paired_suffix_fade_end_step=None,
                  image_condition_paired_prefix_route_switch_step=None,
                  image_condition_paired_prefix_reference_budget=None,
-                 image_condition_paired_prefix_reference_curve="linear"):
+                 image_condition_paired_prefix_reference_curve="linear",
+                 image_condition_paired_prefix_reference_strength=None,
+                 image_condition_paired_prefix_preserve_first_frame=False,
+                 image_condition_paired_prefix_reference_fade_start_step=None,
+                 image_condition_paired_prefix_reference_fade_end_step=None,
+                 image_condition_paired_suffix_prompt=None):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -325,6 +330,23 @@ class WanI2V:
                 u is latent position divided by Img2 anchor index. Applied to
                 prefix queries, including position zero, at every sampling
                 step. Reference budgets do not guarantee equal visual control.
+            image_condition_paired_prefix_reference_strength (`float`, *optional*):
+                Native-reference-mass redistribution strength in [0, 1].
+                Preserve the joint-softmax context and reference totals while
+                moving the left/right split toward the temporal curve. Zero
+                uses the exact legacy path. Mutually exclusive with fixed rho.
+            image_condition_paired_prefix_preserve_first_frame (`bool`, *optional*):
+                Keep A0 queries on legacy attention in native-mass mode. This
+                preserves a direct computation, not final pixels or hidden states.
+            image_condition_paired_prefix_reference_fade_start_step (`int`, *optional*):
+                Start a cosine fade of redistribution strength, independently
+                of suffix fusion. Requires its matching end step.
+            image_condition_paired_prefix_reference_fade_end_step (`int`, *optional*):
+                Restore legacy prefix attention at this sampling step. The
+                right reference remains visible, unlike a route switch.
+            image_condition_paired_suffix_prompt (`str`, *optional*):
+                Continuation text for the Img2-first branch. None reuses the
+                main text exactly. Both branches keep the same negative prompt.
 
         Returns:
             torch.Tensor:
@@ -338,6 +360,34 @@ class WanI2V:
                 "linear", "smoothstep"):
             raise ValueError(
                 "paired prefix reference curve must be linear or smoothstep")
+        reference_strength = image_condition_paired_prefix_reference_strength
+        if (reference_strength is not None
+                and image_condition_paired_prefix_reference_budget is not None):
+            raise ValueError("fixed reference budget and native-mass strength are mutually exclusive")
+        if reference_strength is not None:
+            if not math.isfinite(reference_strength) or not 0.0 <= reference_strength <= 1.0:
+                raise ValueError("native-mass reference strength must be finite and in [0, 1]")
+            if not image_condition_paired_anchor_attention:
+                raise ValueError("native-mass redistribution requires paired anchor attention")
+            if image_condition_paired_prefix_route_switch_step is not None:
+                raise ValueError("native-mass redistribution cannot be combined with a prefix route switch")
+        if image_condition_paired_prefix_preserve_first_frame and reference_strength is None:
+            raise ValueError("preserving first-frame attention requires native-mass reference strength")
+        reference_fade = (image_condition_paired_prefix_reference_fade_start_step,
+                          image_condition_paired_prefix_reference_fade_end_step)
+        if (reference_fade[0] is None) != (reference_fade[1] is None):
+            raise ValueError("reference-strength fade start and end must be supplied together")
+        if reference_fade[0] is not None:
+            if reference_strength is None:
+                raise ValueError("reference-strength fading requires native-mass reference strength")
+            if not 0 <= reference_fade[0] < reference_fade[1] < sampling_steps:
+                raise ValueError("reference-strength fade must satisfy 0 <= start < end < sampling_steps")
+        if image_condition_paired_suffix_prompt is not None:
+            if not image_condition_paired_anchor_attention:
+                raise ValueError("a suffix prompt requires paired anchor attention")
+            if (not isinstance(image_condition_paired_suffix_prompt, str)
+                    or not image_condition_paired_suffix_prompt.strip()):
+                raise ValueError("the suffix prompt must be a nonempty string")
         if image_condition_paired_prefix_reference_budget is not None:
             if (not math.isfinite(image_condition_paired_prefix_reference_budget)
                     or not 0.0 <= image_condition_paired_prefix_reference_budget
@@ -353,10 +403,11 @@ class WanI2V:
                     "paired prefix reference budgeting cannot be combined "
                     "with a prefix route switch; both reference routes must "
                     "remain active")
-        elif image_condition_paired_prefix_reference_curve != "linear":
+        elif (image_condition_paired_prefix_reference_curve != "linear"
+              and reference_strength is None):
             raise ValueError(
                 "a nondefault paired prefix reference curve requires a "
-                "prefix reference budget")
+                "prefix reference budget or native-mass strength")
 
         # preprocess
         guide_scale = (guide_scale, guide_scale) if isinstance(
@@ -482,15 +533,19 @@ class WanI2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
-        # preprocess
+        # Keep the original single-prompt encoder call when no continuation is
+        # supplied. A separate suffix prompt is a conditioning ablation.
+        positive_prompts = [input_prompt]
+        if image_condition_paired_suffix_prompt is not None:
+            positive_prompts.append(image_condition_paired_suffix_prompt)
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
+            context = self.text_encoder(positive_prompts, self.device)
             context_null = self.text_encoder([n_prompt], self.device)
             if offload_model:
                 self.text_encoder.model.cpu()
         else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
+            context = self.text_encoder(positive_prompts, torch.device('cpu'))
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
@@ -555,6 +610,11 @@ class WanI2V:
             ])
             del encoded, expanded_msk, expanded_main
             logging.info(
+                "Native-mass prefix settings: strength=%s, preserve_first=%s, "
+                "fade=%s, separate_suffix_prompt=%s",
+                reference_strength, image_condition_paired_prefix_preserve_first_frame,
+                reference_fade, image_condition_paired_suffix_prompt is not None)
+            logging.info(
                 "Paired anchor attention: %d retained latents plus temporary "
                 "Img2 anchor at %d (%d working latents), with a %d-latent "
                 "fresh-cache Img2 suffix; fixed full-suffix fusion weight "
@@ -567,7 +627,13 @@ class WanI2V:
                 latent_frame_num, anchor_index, model_latent_frame_num,
                 suffix_latent_frame_num,
                 image_condition_paired_stream_weight)
-            if image_condition_paired_prefix_reference_budget is None:
+            if reference_strength is not None:
+                logging.info(
+                    "Native-mass prefix attention: strength=%.3f, curve=%s; "
+                    "preserve joint-softmax reference/context totals and "
+                    "redistribute only the left/right reference shares",
+                    reference_strength, image_condition_paired_prefix_reference_curve)
+            elif image_condition_paired_prefix_reference_budget is None:
                 logging.info(
                     "Legacy prefix attention: while the anchor route is "
                     "active, one softmax reads all ordinary Stream-A frames "
@@ -647,7 +713,7 @@ class WanI2V:
 
             if image_condition_paired_anchor_attention:
                 arg_c = {
-                    'context': [context[0], context[0]],
+                    'context': [context[0], context[-1]],
                     'seq_len': max_seq_len,
                     'y': [y, suffix_y],
                     'paired_anchor_index': anchor_index,
@@ -657,6 +723,9 @@ class WanI2V:
                         image_condition_paired_prefix_reference_budget,
                     'paired_prefix_reference_curve':
                         image_condition_paired_prefix_reference_curve,
+                    'paired_prefix_reference_strength': reference_strength,
+                    'paired_prefix_preserve_first_frame':
+                        image_condition_paired_prefix_preserve_first_frame,
                 }
                 arg_null = {
                     'context': [context_null[0], context_null[0]],
@@ -669,6 +738,9 @@ class WanI2V:
                         image_condition_paired_prefix_reference_budget,
                     'paired_prefix_reference_curve':
                         image_condition_paired_prefix_reference_curve,
+                    'paired_prefix_reference_strength': reference_strength,
+                    'paired_prefix_preserve_first_frame':
+                        image_condition_paired_prefix_preserve_first_frame,
                 }
             else:
                 arg_c = {
@@ -710,6 +782,18 @@ class WanI2V:
                     current_stream_weight = (
                         image_condition_paired_stream_weight
                         * suffix_fade_factor)
+                    current_reference_strength = (
+                        None if reference_strength is None else reference_strength
+                        * paired_fade_factor(sampling_step, *reference_fade))
+                    arg_c['paired_prefix_reference_strength'] = current_reference_strength
+                    arg_null['paired_prefix_reference_strength'] = current_reference_strength
+                    logging.info(
+                        "Paired sampling step=%d timestep=%.3f expert=%s "
+                        "reference_strength=%s suffix_weight=%.6f right_route=%s",
+                        sampling_step, t.item(),
+                        "high_noise" if t.item() >= boundary else "low_noise",
+                        current_reference_strength, current_stream_weight,
+                        anchor_is_enabled)
                     arg_c['paired_stream_weight'] = current_stream_weight
                     arg_c['paired_prefix_anchor_active'] = anchor_is_enabled
                     arg_null['paired_stream_weight'] = current_stream_weight

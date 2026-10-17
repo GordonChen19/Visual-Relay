@@ -19,6 +19,8 @@ def distributed_attention(
         paired_prefix_anchor_active=True,
         paired_prefix_reference_budget=None,
         paired_prefix_reference_curve='linear',
+        paired_prefix_reference_strength=None,
+        paired_prefix_preserve_first_frame=False,
 ):
     """
     Performs distributed attention based on DeepSpeed Ulysses attention mechanism.
@@ -65,6 +67,8 @@ def distributed_attention(
             prefix_anchor_active=paired_prefix_anchor_active,
             prefix_reference_budget=paired_prefix_reference_budget,
             prefix_reference_curve=paired_prefix_reference_curve,
+            prefix_reference_strength=paired_prefix_reference_strength,
+            prefix_preserve_first_frame=paired_prefix_preserve_first_frame,
             window_size=window_size,
         )
 

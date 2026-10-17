@@ -1,0 +1,8 @@
+# Generated experiment artifacts stay local or on the experiment server.
+/outputs/
+/results/
+/reports/
+/artifacts/
+/experiments/runs/
+**/__pycache__/
+*.py[cod]

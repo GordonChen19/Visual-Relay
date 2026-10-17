@@ -44,9 +44,13 @@ class PairedAnchorModelIntegrationTest(unittest.TestCase):
 
     @staticmethod
     def cpu_attention(q, k, v, **kwargs):
-        return torch.nn.functional.scaled_dot_product_attention(
+        output = torch.nn.functional.scaled_dot_product_attention(
             q.transpose(1, 2).float(), k.transpose(1, 2).float(),
             v.transpose(1, 2).float()).transpose(1, 2).to(q.dtype)
+        if kwargs.get('return_lse', False):
+            logits = torch.einsum('bqhd,bkhd->bhqk', q.float(), k.float()) / q.size(-1)**0.5
+            return output, logits.logsumexp(-1).transpose(1, 2)
+        return output
 
     def build_model(self, distributed=False):
         class ConfigMixin:
@@ -132,6 +136,23 @@ class PairedAnchorModelIntegrationTest(unittest.TestCase):
             # The independently evolved suffix stream is unchanged within this
             # model call; the shared latent may transmit effects on later steps.
             torch.testing.assert_close(original[1], modified[1])
+
+            self.core_spy.reset_mock()
+            adaptive = model(
+                **inputs, paired_prefix_reference_strength=0.5,
+                paired_prefix_preserve_first_frame=True)
+            self.assertEqual(self.core_spy.call_count, 2)
+            for call in self.core_spy.call_args_list:
+                self.assertEqual(call.kwargs['prefix_reference_strength'], 0.5)
+                self.assertTrue(call.kwargs['prefix_preserve_first_frame'])
+            self.assertTrue(all(torch.isfinite(value).all() for value in adaptive))
+            self.assertGreater(float((original[0] - adaptive[0]).abs().max()), 1e-6)
+            torch.testing.assert_close(original[1], adaptive[1])
+
+            restored = model(**inputs, paired_prefix_reference_strength=0.,
+                             paired_prefix_preserve_first_frame=True)
+            for expected, actual in zip(original, restored):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_budget_reaches_each_standard_dit_block(self):
         self.check_forward(distributed=False)

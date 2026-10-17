@@ -53,7 +53,8 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     return_lse:     bool. Also return per-query, per-head softmax log-sum-exp.
-                    This does not materialize the attention map.
+                    Requires zero dropout. FA2 2.8.3 returns LSE without
+                    materializing attention probabilities in this mode.
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
@@ -139,6 +140,8 @@ def flash_attention(
             causal=causal,
             window_size=window_size,
             deterministic=deterministic,
+            # FA2 2.8.3's Python wrapper requests the LSE tuple but disables
+            # the quadratic probability buffer when dropout_p == 0.
             return_attn_probs=return_lse)
         if return_lse:
             x, softmax_lse, _ = result
@@ -180,6 +183,8 @@ def paired_anchor_attention(
     dtype=torch.bfloat16,
     prefix_reference_budget=None,
     prefix_reference_curve='linear',
+    prefix_reference_strength=None,
+    prefix_preserve_first_frame=False,
 ):
     """Fuse an Img1 main stream with an aligned Img2-first suffix stream.
 
@@ -205,6 +210,22 @@ def paired_anchor_attention(
     remain active. These budgets constrain direct attention outputs, not the
     final visual influence of either image.
 
+    Alternatively, ``prefix_reference_strength=s`` in [0, 1] keeps the native
+    joint-softmax context mass p_C and reference mass m=p_L+p_R for each query
+    and head, then mixes the reference masses as
+    ``left=(1-s)*p_L+s*m*(1-w)``, ``right=(1-s)*p_R+s*m*w``.
+    Log-sum-exp values recover those masses without a dense attention map.
+    The equivalent residual form ``native+s*(m*w-p_R)*(right-left)`` preserves
+    the native output directly instead of reconstructing it from groups.
+    Strength zero uses the original joint-softmax path exactly. A
+    positive strength only redistributes existing reference mass; it does not
+    impose a minimum reference mass or remove conditioning asymmetry.
+    ``prefix_preserve_first_frame`` additionally uses the legacy joint
+    softmax for A0 queries. This protects that attention route, not the final
+    decoded frame, which can still change through later network computations.
+    Strength and fixed budget are mutually exclusive; both need an active
+    prefix anchor route. First-frame preservation requires a strength.
+
     Main suffix queries exclude the anchor and use main-stream Q/K/V for every
     ordinary key. A second full attention uses the aligned suffix-stream Q/K/V,
     including Img2 and all later suffix frames. Their outputs use
@@ -221,6 +242,19 @@ def paired_anchor_attention(
         raise ValueError("paired stream weight must be between zero and one")
     if prefix_reference_curve not in ('linear', 'smoothstep'):
         raise ValueError("prefix reference curve must be linear or smoothstep")
+    if (prefix_reference_budget is not None
+            and prefix_reference_strength is not None):
+        raise ValueError("prefix reference budget and strength are mutually exclusive")
+    if prefix_reference_strength is not None:
+        if (not math.isfinite(prefix_reference_strength)
+                or not 0.0 <= prefix_reference_strength <= 1.0):
+            raise ValueError(
+                "prefix reference strength must be finite and between zero and one")
+        if not prefix_anchor_active:
+            raise ValueError(
+                "prefix reference strength requires an active prefix anchor route")
+    if prefix_preserve_first_frame and prefix_reference_strength is None:
+        raise ValueError("prefix first-frame preservation requires a reference strength")
     if prefix_reference_budget is not None:
         if (not math.isfinite(prefix_reference_budget)
                 or not 0.0 <= prefix_reference_budget <= 1.0):
@@ -293,51 +327,9 @@ def paired_anchor_attention(
         [main_v[:, :anchor_start], main_v[:, anchor_end:]], dim=1)
 
     prefix_q = main_q[:, :anchor_start]
-    if prefix_reference_budget is not None:
-        # Keep both references out of the context group to avoid counting A0
-        # twice. Post-anchor context retains the temporal RoPE shift above.
-        context_k = torch.cat([
-            main_k[:, tokens_per_frame:anchor_start],
-            main_k[:, anchor_end:],
-        ], dim=1)
-        context_v = torch.cat([
-            main_v[:, tokens_per_frame:anchor_start],
-            main_v[:, anchor_end:],
-        ], dim=1)
-        context_output = flash_attention(
-            q=prefix_q,
-            k=context_k,
-            v=context_v,
-            window_size=window_size,
-            dtype=dtype)
-        left_output = flash_attention(
-            q=prefix_q,
-            k=main_k[:, :tokens_per_frame],
-            v=main_v[:, :tokens_per_frame],
-            window_size=window_size,
-            dtype=dtype)
-        right_output = flash_attention(
-            q=prefix_q,
-            k=main_k[:, anchor_start:anchor_end],
-            v=suffix_v[:, :tokens_per_frame],
-            window_size=window_size,
-            dtype=dtype)
 
-        right_weight = torch.arange(
-            anchor_index, device=prefix_q.device, dtype=torch.float32
-        ) / anchor_index
-        if prefix_reference_curve == 'smoothstep':
-            right_weight = right_weight.square() * (3.0 - 2.0 * right_weight)
-        right_weight = right_weight.repeat_interleave(tokens_per_frame).view(
-            1, anchor_start, 1, 1).to(left_output.dtype)
-        reference_output = ((1.0 - right_weight) * left_output
-                            + right_weight * right_output)
-        prefix_output = ((1.0 - prefix_reference_budget) * context_output
-                         + prefix_reference_budget * reference_output)
-    else:
-        # Legacy prefix: one ordinary softmax over all Stream-A context and,
-        # while active, the hybrid A-anchor K/B0 V. The route switch removes
-        # only this hybrid anchor; ordinary post-anchor context stays visible.
+    def legacy_prefix(query, return_lse=False):
+        # Keep the native joint softmax and hybrid source ordering intact.
         if prefix_anchor_active:
             prefix_k = torch.cat([
                 main_k[:, :anchor_start],
@@ -350,14 +342,89 @@ def paired_anchor_attention(
                 main_v[:, anchor_end:],
             ], dim=1)
         else:
-            prefix_k = ordinary_k
-            prefix_v = ordinary_v
-        prefix_output = flash_attention(
+            prefix_k, prefix_v = ordinary_k, ordinary_v
+        return flash_attention(
+            q=query, k=prefix_k, v=prefix_v,
+            window_size=window_size, dtype=dtype, return_lse=return_lse)
+
+    redistribute = (prefix_reference_strength is not None
+                    and prefix_reference_strength > 0.0)
+    if prefix_reference_budget is not None or redistribute:
+        if redistribute:
+            native_output, native_lse = legacy_prefix(prefix_q, return_lse=True)
+        else:
+            # Keep both references out of the fixed-budget context group to
+            # avoid counting A0 twice. Post-anchor K retain shifted RoPE.
+            context_k = torch.cat([
+                main_k[:, tokens_per_frame:anchor_start],
+                main_k[:, anchor_end:],
+            ], dim=1)
+            context_v = torch.cat([
+                main_v[:, tokens_per_frame:anchor_start],
+                main_v[:, anchor_end:],
+            ], dim=1)
+            context_output = flash_attention(
+                q=prefix_q,
+                k=context_k,
+                v=context_v,
+                window_size=window_size,
+                dtype=dtype)
+        left_result = flash_attention(
             q=prefix_q,
-            k=prefix_k,
-            v=prefix_v,
+            k=main_k[:, :tokens_per_frame],
+            v=main_v[:, :tokens_per_frame],
             window_size=window_size,
-            dtype=dtype)
+            dtype=dtype,
+            return_lse=redistribute)
+        right_result = flash_attention(
+            q=prefix_q,
+            k=main_k[:, anchor_start:anchor_end],
+            v=suffix_v[:, :tokens_per_frame],
+            window_size=window_size,
+            dtype=dtype,
+            return_lse=redistribute)
+
+        right_weight = torch.arange(
+            anchor_index, device=prefix_q.device, dtype=torch.float32
+        ) / anchor_index
+        if prefix_reference_curve == 'smoothstep':
+            right_weight = right_weight.square() * (3.0 - 2.0 * right_weight)
+        right_weight = right_weight.repeat_interleave(tokens_per_frame).view(
+            1, anchor_start, 1, 1)
+        if redistribute:
+            left_output, left_lse = left_result
+            right_output, right_lse = right_result
+            # Differences of log-partition functions avoid exp(QK) overflow.
+            # Each reference group is a subset of the native key set. A tiny
+            # positive difference can only result from floating-point error.
+            left_mass = (left_lse.float() - native_lse.float()).clamp_max(0).exp()
+            right_mass = (right_lse.float() - native_lse.float()).clamp_max(0).exp()
+            left_mass = left_mass.unsqueeze(-1)
+            right_mass = right_mass.unsqueeze(-1)
+            reference_mass = left_mass + right_mass
+            delta = prefix_reference_strength * (
+                reference_mass * right_weight - right_mass)
+            # The native context contribution cancels out of the correction.
+            # Accumulate in fp32 and cast only the completed output.
+            prefix_output = (native_output.float() + delta * (
+                right_output.float() - left_output.float())).to(native_output.dtype)
+            if prefix_preserve_first_frame:
+                prefix_output = torch.cat([
+                    native_output[:, :tokens_per_frame],
+                    prefix_output[:, tokens_per_frame:],
+                ], dim=1)
+        else:
+            left_output, right_output = left_result, right_result
+            right_weight = right_weight.to(left_output.dtype)
+            reference_output = ((1.0 - right_weight) * left_output
+                                + right_weight * right_output)
+            prefix_output = ((1.0 - prefix_reference_budget) * context_output
+                             + prefix_reference_budget * reference_output)
+    else:
+        # Legacy prefix: one ordinary softmax over all Stream-A context and,
+        # while active, the hybrid A-anchor K/B0 V. The route switch removes
+        # only this hybrid anchor; ordinary post-anchor context stays visible.
+        prefix_output = legacy_prefix(prefix_q)
 
     # Evolve the joint-conditioned Stream-A anchor with the prefix and itself,
     # but never with the post-anchor suffix. Stream B evolves its independent

@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "purpose": "Separate fixed-budget disturbance, prefix-route scheduling, suffix motion, and prompt timing. Results and reports stay outside the repository.",
+  "defaults": {
+    "seed": 4827316,
+    "confirmation_seeds": [4827317, 4827318],
+    "size": "832*480",
+    "frame_num": 81,
+    "fps": 16,
+    "sample_steps": 40,
+    "sample_shift": 3,
+    "suffix_fade_start_step": 25,
+    "suffix_fade_end_step": 30
+  },
+  "cases": {
+    "warriors": {
+      "images": ["Img1.png", "Img2.png"],
+      "anchor_index": 12,
+      "suffix_weight": 0.5,
+      "prompt": "prompts/warriors.txt",
+      "suffix_prompt": "prompts/warriors_continuation.txt",
+      "timing_prompt": "prompts/warriors_timing.txt",
+      "boundary_output_frames_zero_based": [45, 48]
+    },
+    "falling": {
+      "images": ["fnr1.png", "fnr2.png"],
+      "anchor_index": 10,
+      "suffix_weight": 1.0,
+      "prompt": "prompts/falling.txt",
+      "suffix_prompt": "prompts/falling_continuation.txt",
+      "timing_prompt": "prompts/falling_timing.txt",
+      "boundary_output_frames_zero_based": [37, 40]
+    }
+  },
+  "variants": {
+    "legacy_switch": {"stage": "primary", "prefix_switch_step": 25},
+    "legacy_open": {"stage": "primary"},
+    "fixed_budget": {"stage": "primary", "budget": 0.3},
+    "adaptive": {"stage": "primary", "strength": 0.5},
+    "adaptive_first": {"stage": "primary", "strength": 0.5, "preserve_first": true},
+    "adaptive_fade": {"stage": "diagnostic", "strength": 0.5, "preserve_first": true, "prefix_fade": [25, 30]},
+    "suffix_off": {"stage": "diagnostic", "strength": 0.5, "preserve_first": true, "suffix_weight": 0.0},
+    "continuation": {"stage": "diagnostic", "strength": 0.5, "preserve_first": true, "use_suffix_prompt": true},
+    "timing_prompt": {"stage": "diagnostic", "strength": 0.5, "preserve_first": true, "use_suffix_prompt": true, "use_timing_prompt": true}
+  },
+  "execution": {
+    "queue_lifecycle": "On Linux/POSIX, generation children inherit the queue lock so an abruptly killed parent cannot release it while its child survives. SIGTERM/SIGHUP stop the generation process group and record failure. Windows supports ordinary cleanup, but hard parent termination does not preserve the queue lock; check for surviving Python/torchrun processes before restarting there. Source, image and prompt hashes are frozen at queue start and checked before each job; changes stop the queue.",
+    "preflight": "Every --execute invocation first runs check_attention_cuda.py in the selected Python runtime. CUDA or FlashAttention failures stop the queue before generation. A fresh timestamped JSON and log are saved outside the repository; the check uses no model weights. Dry-run does not run the check.",
+    "primary": "Run five variants for each case at the original seed. Compare legacy_switch versus legacy_open for route scheduling; legacy_open versus fixed_budget versus adaptive for budget design; adaptive versus adaptive_first for first-frame protection.",
+    "diagnostic": "Run only after reviewing primary results. Each variant differs from adaptive_first by one intervention, except timing_prompt which changes both branch prompts and is a deliberately separate conditioning test. Do not interpret timing_prompt as an isolated attention effect.",
+    "confirmation": "Select one candidate explicitly with --variant; pair it with legacy_open at two additional seeds. This runner does not automatically select a winner or prove input-order symmetry.",
+    "resume": "Skip only a matching configuration with a completed, fully decoded 81-frame video and matching SHA-256. Interrupted diffusion runs restart from their initial noise; no denoising checkpoint resume is claimed."
+  },
+  "evaluation": {
+    "opening": "Inspect every frame in the first second. Compare first-frame fidelity, texture stability and blur. Sharpness scores alone can reward noise and are insufficient.",
+    "warriors": "Review full playback and dense frames 35-60. Require continuous camera parallax and changing occlusion around stationary identities; character swaps, cuts or appearance morphs do not count as a camera orbit.",
+    "falling": "Review full playback and dense frames 25-50. Track feather and rock height relative to a stable ground reference. Record first ground contact, reappearance in the air and abrupt upward jumps. Img2 still shows the feather airborne.",
+    "boundary": "The listed output frame blocks identify the nominal first post-anchor latent after removal. VAE temporal dependencies can spread artifacts beyond the block; association is not proof of causation.",
+    "reporting": "Keep videos, logs, measurements and reports in the external output directory. Record failures as failures; never silently lower resolution, frame count, steps or precision. Equal attention coefficients do not prove equal visual control."
+  }
+}

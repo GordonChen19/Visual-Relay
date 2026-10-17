@@ -67,6 +67,29 @@ def _validate_args(args):
     assert args.task in EXAMPLE_PROMPT, f"Unsupport task: {args.task}"
 
     prefix_reference_budget = args.image_condition_paired_prefix_reference_budget
+    reference_strength = args.image_condition_paired_prefix_reference_strength
+    assert prefix_reference_budget is None or reference_strength is None, (
+        "Fixed reference budget and native-mass reference strength are mutually exclusive.")
+    if reference_strength is not None:
+        assert math.isfinite(reference_strength) and 0.0 <= reference_strength <= 1.0, (
+            "--image_condition_paired_prefix_reference_strength must be finite and in [0, 1].")
+        assert args.task == "i2v-A14B" and args.image_condition_paired_anchor_attention, (
+            "Native-mass redistribution requires paired i2v-A14B.")
+        assert args.image_condition_paired_prefix_route_switch_step is None, (
+            "Native-mass redistribution cannot be combined with a prefix route switch.")
+    assert not args.image_condition_paired_prefix_preserve_first_frame or reference_strength is not None, (
+        "Preserving first-frame attention requires native-mass reference strength.")
+    reference_fade = (args.image_condition_paired_prefix_reference_fade_start_step,
+                      args.image_condition_paired_prefix_reference_fade_end_step)
+    assert (reference_fade[0] is None) == (reference_fade[1] is None), (
+        "Reference-strength fade start and end must be supplied together.")
+    assert reference_fade[0] is None or reference_strength is not None, (
+        "Reference-strength fading requires native-mass reference strength.")
+    if args.image_condition_paired_suffix_prompt is not None:
+        assert args.task == "i2v-A14B" and args.image_condition_paired_anchor_attention, (
+            "A suffix prompt requires paired i2v-A14B.")
+        assert args.image_condition_paired_suffix_prompt.strip(), (
+            "The suffix prompt must not be empty.")
     if prefix_reference_budget is not None:
         assert (math.isfinite(prefix_reference_budget)
                 and 0.0 <= prefix_reference_budget <= 1.0), (
@@ -81,9 +104,9 @@ def _validate_args(args):
             "--image_condition_paired_prefix_route_switch_step; both "
             "reference routes must remain active.")
     assert (args.image_condition_paired_prefix_reference_curve == "linear"
-            or prefix_reference_budget is not None), (
+            or prefix_reference_budget is not None or reference_strength is not None), (
                 "--image_condition_paired_prefix_reference_curve requires "
-                "--image_condition_paired_prefix_reference_budget when "
+                "a reference budget or native-mass reference strength when "
                 "set to a nondefault curve.")
 
     if args.prompt is None:
@@ -148,6 +171,10 @@ def _validate_args(args):
 
     if args.sample_steps is None:
         args.sample_steps = cfg.sample_steps
+
+    if reference_fade[0] is not None:
+        assert 0 <= reference_fade[0] < reference_fade[1] < args.sample_steps, (
+            "Reference-strength fade must satisfy 0 <= start < end < sample_steps.")
 
     if args.task == "i2v-A14B":
         for fade_name, fade_steps in paired_fade_pairs.items():
@@ -348,6 +375,34 @@ def _parse_args():
               "normalized left/right references share rho by video position. "
               "Incompatible with prefix route switching."))
     parser.add_argument(
+        "--image_condition_paired_prefix_reference_strength",
+        type=float,
+        default=None,
+        help=("Native-mass redistribution strength lambda in [0, 1]. Preserve "
+              "the joint-softmax context/reference totals and move only the "
+              "left/right allocation toward the temporal curve. Zero runs "
+              "legacy prefix attention. Mutually exclusive with fixed budget."))
+    parser.add_argument(
+        "--image_condition_paired_prefix_preserve_first_frame",
+        action="store_true",
+        help=("Keep the first latent's direct attention on the legacy route "
+              "during native-mass redistribution. Does not clamp output pixels."))
+    parser.add_argument(
+        "--image_condition_paired_prefix_reference_fade_start_step",
+        type=int, default=None,
+        help="Optional zero-based sampling step to start fading redistribution strength.")
+    parser.add_argument(
+        "--image_condition_paired_prefix_reference_fade_end_step",
+        type=int, default=None,
+        help=("Step where redistribution reaches zero and legacy attention resumes; "
+              "the right reference route remains enabled."))
+    parser.add_argument(
+        "--image_condition_paired_suffix_prompt",
+        type=str, default=None,
+        help=("Optional continuation prompt for the Img2-first stream only. "
+              "Unset reuses the main prompt. Changes conditioning and must "
+              "be tested separately from the attention method."))
+    parser.add_argument(
         "--image_condition_paired_prefix_reference_curve",
         type=str,
         default="linear",
@@ -355,7 +410,7 @@ def _parse_args():
         help=("Right-reference share w(u) for prefix budgeting, with "
               "u=latent_position/Img2_anchor_index: linear uses u; smoothstep "
               "uses 3*u^2-2*u^3. This is video time, not sampling progress. "
-              "A nondefault curve requires a reference budget."))
+              "A nondefault curve requires a reference budget or strength."))
     parser.add_argument(
         "--sample_solver",
         type=str,
@@ -719,7 +774,17 @@ def generate(args):
             image_condition_paired_prefix_reference_budget=(
                 args.image_condition_paired_prefix_reference_budget),
             image_condition_paired_prefix_reference_curve=(
-                args.image_condition_paired_prefix_reference_curve))
+                args.image_condition_paired_prefix_reference_curve),
+            image_condition_paired_prefix_reference_strength=(
+                args.image_condition_paired_prefix_reference_strength),
+            image_condition_paired_prefix_preserve_first_frame=(
+                args.image_condition_paired_prefix_preserve_first_frame),
+            image_condition_paired_prefix_reference_fade_start_step=(
+                args.image_condition_paired_prefix_reference_fade_start_step),
+            image_condition_paired_prefix_reference_fade_end_step=(
+                args.image_condition_paired_prefix_reference_fade_end_step),
+            image_condition_paired_suffix_prompt=(
+                args.image_condition_paired_suffix_prompt))
 
     if rank == 0:
         if args.save_file is None:

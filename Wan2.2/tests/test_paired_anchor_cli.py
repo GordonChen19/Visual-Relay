@@ -162,6 +162,55 @@ class PairedAnchorCliTest(unittest.TestCase):
             '--image_condition_paired_stream_weight', '0.4')
         self.assertEqual(args.image_condition_paired_stream_weight, 0.4)
 
+    def test_native_mass_options_and_continuation_prompt(self):
+        for strength in ('0', '0.5', '1'):
+            args = self.parse_paired(
+                '--image_condition_paired_prefix_reference_strength', strength,
+                '--image_condition_paired_prefix_preserve_first_frame',
+                '--image_condition_paired_prefix_reference_curve', 'smoothstep',
+                '--image_condition_paired_prefix_reference_fade_start_step', '25',
+                '--image_condition_paired_prefix_reference_fade_end_step', '30',
+                '--image_condition_paired_suffix_prompt', 'Continue the descent.')
+            self.assertEqual(args.image_condition_paired_prefix_reference_strength,
+                             float(strength))
+            self.assertTrue(args.image_condition_paired_prefix_preserve_first_frame)
+            self.assertEqual(args.image_condition_paired_suffix_prompt, 'Continue the descent.')
+
+    def test_native_mass_rejects_invalid_combinations(self):
+        invalid = [
+            ('--image_condition_paired_prefix_reference_strength', 'nan'),
+            ('--image_condition_paired_prefix_reference_strength', 'inf'),
+            ('--image_condition_paired_prefix_reference_strength=-0.1',),
+            ('--image_condition_paired_prefix_reference_strength', '1.1'),
+            ('--image_condition_paired_prefix_reference_strength', '0',
+             '--image_condition_paired_prefix_reference_budget', '0'),
+            ('--image_condition_paired_prefix_reference_strength', '0',
+             '--image_condition_paired_prefix_route_switch_step', '25'),
+            ('--image_condition_paired_prefix_preserve_first_frame',),
+            ('--image_condition_paired_prefix_reference_fade_start_step', '25'),
+            ('--image_condition_paired_prefix_reference_fade_start_step', '25',
+             '--image_condition_paired_prefix_reference_fade_end_step', '30'),
+            ('--image_condition_paired_prefix_reference_strength', '0.5',
+             '--image_condition_paired_prefix_reference_fade_start_step', '30',
+             '--image_condition_paired_prefix_reference_fade_end_step', '25'),
+            ('--image_condition_paired_prefix_reference_strength', '0.5',
+             '--image_condition_paired_prefix_reference_fade_start_step', '25',
+             '--image_condition_paired_prefix_reference_fade_end_step', '40'),
+            ('--image_condition_paired_suffix_prompt', '   '),
+        ]
+        for options in invalid:
+            with self.subTest(options=options), self.assertRaises(AssertionError):
+                self.parse_paired(*options)
+
+    def test_new_options_require_paired_i2v(self):
+        for task in ('i2v-A14B', 't2v-A14B'):
+            for options in (
+                    ('--image_condition_paired_prefix_reference_strength', '0'),
+                    ('--image_condition_paired_suffix_prompt', 'Continue.')):
+                with self.subTest(task=task, options=options):
+                    with self.assertRaisesRegex(AssertionError, 'paired'):
+                        self.parse('--task', task, '--image', 'one.png', *options)
+
     def test_paired_stream_weight_must_be_a_convex_weight(self):
         with self.assertRaises(AssertionError):
             self.parse(
@@ -314,6 +363,39 @@ class PairedPrefixPipelineValidationTest(unittest.TestCase):
             self.call_generate(
                 image_condition_paired_prefix_reference_budget=0.4,
                 image_condition_paired_prefix_reference_curve='cosine')
+
+    def test_native_mass_api_validation(self):
+        with self.assertRaises(_ReachedImagePreprocessing):
+            self.call_generate(
+                image_condition_paired_prefix_reference_strength=0.5,
+                image_condition_paired_prefix_preserve_first_frame=True,
+                image_condition_paired_prefix_reference_curve='smoothstep',
+                image_condition_paired_prefix_reference_fade_start_step=25,
+                image_condition_paired_prefix_reference_fade_end_step=30,
+                image_condition_paired_suffix_prompt='Continue.')
+        for options in (
+                dict(image_condition_paired_prefix_reference_strength=float('nan')),
+                dict(image_condition_paired_prefix_reference_strength=-0.1),
+                dict(image_condition_paired_prefix_reference_strength=1.1),
+                dict(image_condition_paired_prefix_reference_strength=0.,
+                     image_condition_paired_prefix_reference_budget=0.),
+                dict(image_condition_paired_prefix_reference_strength=0.,
+                     image_condition_paired_prefix_route_switch_step=25),
+                dict(image_condition_paired_prefix_preserve_first_frame=True),
+                dict(image_condition_paired_prefix_reference_fade_start_step=25),
+                dict(image_condition_paired_prefix_reference_fade_start_step=25,
+                     image_condition_paired_prefix_reference_fade_end_step=30),
+                dict(image_condition_paired_prefix_reference_strength=0.5,
+                     image_condition_paired_prefix_reference_fade_start_step=30,
+                     image_condition_paired_prefix_reference_fade_end_step=25),
+                dict(image_condition_paired_suffix_prompt=''),
+                dict(image_condition_paired_suffix_prompt=3),
+                dict(image_condition_paired_anchor_attention=False,
+                     image_condition_paired_suffix_prompt='Continue.'),
+                dict(image_condition_paired_anchor_attention=False,
+                     image_condition_paired_prefix_reference_strength=0.)):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.call_generate(**options)
 
 
 if __name__ == '__main__':

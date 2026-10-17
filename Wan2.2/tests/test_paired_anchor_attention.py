@@ -140,9 +140,14 @@ class PairedAnchorReferenceBudgetTest(unittest.TestCase):
 
     @staticmethod
     def sdpa(q, k, v, **kwargs):
-        return torch.nn.functional.scaled_dot_product_attention(
+        output = torch.nn.functional.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         ).transpose(1, 2)
+        if kwargs.get('return_lse', False):
+            scores = torch.einsum(
+                'bqhd,bkhd->bhqk', q.float(), k.float()) / q.size(-1)**0.5
+            return output, scores.logsumexp(-1).transpose(1, 2)
+        return output
 
     @staticmethod
     def dense(q, k, v):
@@ -355,6 +360,190 @@ class PairedAnchorReferenceBudgetTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'active prefix anchor route'):
                     self.run_attention(
                         prefix_reference_budget=budget, prefix_anchor_active=False)
+
+    def dense_strength_reference(self, strength, curve='linear'):
+        # Independently redistribute dense per-token probabilities. Context
+        # probabilities remain untouched; neither the production residual
+        # formula nor its log-partition ratios are used here.
+        q = self.q[0:1, :self.anchor * self.tokens].float()
+        scores, values = [], []
+        for k, v in self.prefix_groups():
+            scores.append(torch.einsum(
+                'bqhd,bkhd->bhqk', q, k.float()) / q.size(-1)**0.5)
+            values.append(v.float())
+        native = torch.cat(scores, dim=-1).softmax(-1)
+        lengths = [score.size(-1) for score in scores]
+        context, left, right = native.split(lengths, dim=-1)
+        reference_mass = (left.sum(-1, keepdim=True)
+                          + right.sum(-1, keepdim=True))
+        w = torch.arange(self.anchor, dtype=torch.float32) / self.anchor
+        if curve == 'smoothstep':
+            w = w.square() * (3. - 2. * w)
+        w = w.repeat_interleave(self.tokens).view(1, 1, -1, 1)
+        target = torch.cat([
+            context,
+            (1. - strength) * left
+            + strength * reference_mass * (1. - w) * scores[1].softmax(-1),
+            (1. - strength) * right
+            + strength * reference_mass * w * scores[2].softmax(-1),
+        ], dim=-1)
+        output = torch.einsum(
+            'bhqk,bkhd->bqhd', target, torch.cat(values, dim=1))
+        return output, native, target, lengths
+
+    def test_strength_matches_independent_dense_probability_redistribution(self):
+        for strength in (0.1, 0.5, 1.):
+            for curve in ('linear', 'smoothstep'):
+                with self.subTest(strength=strength, curve=curve):
+                    actual = self.run_attention(
+                        prefix_reference_strength=strength,
+                        prefix_reference_curve=curve)
+                    expected = self.dense_strength_reference(strength, curve)[0]
+                    torch.testing.assert_close(
+                        actual[0:1, :self.anchor * self.tokens], expected,
+                        rtol=3e-5, atol=3e-6)
+
+    def test_strength_zero_uses_exact_legacy_fastpath(self):
+        original = self.run_attention()
+        for preserve in (False, True):
+            with self.subTest(preserve=preserve):
+                with mock.patch.object(
+                        attention, 'flash_attention', wraps=self.sdpa) as backend:
+                    actual = attention.paired_anchor_attention(
+                        q=self.q.clone(), k=self.k.clone(), v=self.v.clone(),
+                        seq_lens=torch.tensor([self.main_length, self.suffix_length]),
+                        grid_sizes=torch.tensor([
+                            [self.frames, self.height, self.width],
+                            [self.frames - self.anchor, self.height, self.width],
+                        ]), freqs=self.freqs, anchor_index=self.anchor,
+                        prefix_reference_strength=0.,
+                        prefix_preserve_first_frame=preserve)
+                self.assertTrue(torch.equal(actual, original))
+                self.assertEqual(backend.call_count, 4)
+                self.assertFalse(any(
+                    call.kwargs.get('return_lse', False)
+                    for call in backend.call_args_list))
+
+    def test_strength_preserves_native_context_and_total_reference_mass(self):
+        # Values act as group indicators so output channels expose the masses
+        # actually used by production, independently of ordinary value mixing.
+        self.v.zero_()
+        start, end = self.anchor * self.tokens, (self.anchor + 1) * self.tokens
+        self.v[0, self.tokens:start, :, 0] = 1.
+        self.v[0, end:self.main_length, :, 0] = 1.
+        self.v[0, :self.tokens, :, 1] = 1.
+        self.v[1, :self.tokens, :, 2] = 1.
+        baseline = self.run_attention()[0:1, :start]
+        for strength in (0.25, 1.):
+            with self.subTest(strength=strength):
+                actual = self.run_attention(
+                    prefix_reference_strength=strength)[0:1, :start]
+                torch.testing.assert_close(actual[..., 0], baseline[..., 0])
+                torch.testing.assert_close(
+                    actual[..., 1:3].sum(-1), baseline[..., 1:3].sum(-1),
+                    rtol=2e-5, atol=2e-6)
+                torch.testing.assert_close(
+                    actual[..., :3].sum(-1), torch.ones_like(actual[..., 0]),
+                    rtol=2e-5, atol=2e-6)
+        # With full redistribution, direct left and right masses balance at
+        # the temporal midpoint, without forcing any particular total mass.
+        middle = self.anchor // 2 * self.tokens
+        torch.testing.assert_close(
+            actual[:, middle:middle + self.tokens, :, 1],
+            actual[:, middle:middle + self.tokens, :, 2], rtol=2e-5, atol=2e-6)
+        self.assertGreater(baseline[..., 1:3].sum(-1).std().item(), 0.01)
+
+    def test_preserve_first_frame_keeps_native_attention_and_other_queries(self):
+        original = self.run_attention()
+        changed = self.run_attention(prefix_reference_strength=0.7)
+        preserved = self.run_attention(
+            prefix_reference_strength=0.7, prefix_preserve_first_frame=True)
+        self.assertTrue(torch.equal(
+            preserved[0, :self.tokens], original[0, :self.tokens]))
+        self.assertTrue(torch.equal(
+            preserved[0, self.tokens:], changed[0, self.tokens:]))
+        self.assertFalse(torch.allclose(
+            preserved[0, :self.tokens], changed[0, :self.tokens]))
+
+    def test_strength_preserves_suffix_messenger_and_padding(self):
+        original = self.run_attention()
+        for strength in (0.25, 1.):
+            with self.subTest(strength=strength):
+                actual = self.run_attention(prefix_reference_strength=strength)
+                self.assertEqual(actual.shape, self.q.shape)
+                self.assertEqual(actual.dtype, self.q.dtype)
+                self.assertTrue(torch.equal(
+                    actual[0, self.anchor * self.tokens:],
+                    original[0, self.anchor * self.tokens:]))
+                self.assertTrue(torch.equal(actual[1], original[1]))
+                self.assertEqual(
+                    torch.count_nonzero(actual[0, self.main_length:]).item(), 0)
+                self.assertEqual(
+                    torch.count_nonzero(actual[1, self.suffix_length:]).item(), 0)
+
+    def test_strength_keeps_existing_hybrid_reference_sources(self):
+        start = self.anchor * self.tokens
+        original = self.run_attention(prefix_reference_strength=0.5)[0:1, :start]
+        self.k[1, :self.tokens] += 13.
+        self.v[0, start:start + self.tokens] -= 17.
+        unchanged = self.run_attention(prefix_reference_strength=0.5)[0:1, :start]
+        self.assertTrue(torch.equal(original, unchanged))
+        self.k[0, start, :, 0] += 11.
+        key_changed = self.run_attention(prefix_reference_strength=0.5)[0:1, :start]
+        self.assertFalse(torch.allclose(original, key_changed))
+        self.v[1, :self.tokens] += 7.
+        value_changed = self.run_attention(prefix_reference_strength=0.5)[0:1, :start]
+        self.assertFalse(torch.allclose(key_changed, value_changed))
+
+    def test_strength_is_stable_with_extreme_logits(self):
+        # These finite logits overflow a direct exp(scores), but stable
+        # softmax and differences of log-sum-exp must remain finite.
+        self.q *= 50.
+        self.k *= 50.
+        for strength in (0.25, 1.):
+            with self.subTest(strength=strength):
+                actual = self.run_attention(prefix_reference_strength=strength)
+                expected = self.dense_strength_reference(strength)[0]
+                self.assertTrue(torch.isfinite(actual).all().item())
+                torch.testing.assert_close(
+                    actual[0:1, :self.anchor * self.tokens], expected,
+                    rtol=2e-3, atol=2e-3)
+
+    def test_strength_preserves_output_dtype(self):
+        self.q, self.k, self.v = [x.to(torch.bfloat16) for x in (self.q, self.k, self.v)]
+        actual = self.run_attention(prefix_reference_strength=0.5)
+        expected = self.dense_strength_reference(0.5)[0]
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            actual[0:1, :self.anchor * self.tokens].float(), expected,
+            rtol=0.04, atol=0.015)
+
+    def test_strength_preservation_with_smallest_anchor_is_legacy(self):
+        self.anchor = 1
+        self.suffix_length = (self.frames - self.anchor) * self.tokens
+        original = self.run_attention()
+        actual = self.run_attention(
+            prefix_reference_strength=1., prefix_preserve_first_frame=True)
+        self.assertTrue(torch.equal(actual, original))
+
+    def test_rejects_invalid_strength_configurations(self):
+        for strength in (-0.01, 1.01, float('nan'), float('inf'), -float('inf')):
+            with self.subTest(strength=strength):
+                with self.assertRaisesRegex(ValueError, 'prefix reference strength'):
+                    self.run_attention(prefix_reference_strength=strength)
+        for strength in (0., 0.5, 1.):
+            with self.subTest(strength=strength):
+                with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+                    self.run_attention(
+                        prefix_reference_strength=strength, prefix_reference_budget=0.)
+                with self.assertRaisesRegex(ValueError, 'active prefix anchor route'):
+                    self.run_attention(
+                        prefix_reference_strength=strength, prefix_anchor_active=False)
+        with self.assertRaisesRegex(ValueError, 'preservation requires'):
+            self.run_attention(prefix_preserve_first_frame=True)
+        with self.assertRaisesRegex(ValueError, 'preservation requires'):
+            self.run_attention(
+                prefix_preserve_first_frame=True, prefix_reference_budget=0.3)
 
 
 if __name__ == '__main__':
