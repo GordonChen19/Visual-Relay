@@ -108,14 +108,6 @@ python generate.py \
 
 `0.5` is an initial redistribution strength, not a validated optimum. For an original-route baseline, keep images, indices, prompts, seed, and other sampling settings fixed; omit strength, first-frame protection, and any reference fade/curve options. Keep suffix conditioning unchanged. The ablation runner defines separate comparisons for each intervention.
 
-## English text and defaults
-
-Documentation, comments, built-in prompts, negative prompts, and prompt-expansion instructions are written in English. Prompt expansion defaults to English in both the CLI and Python API; explicitly selecting the existing `zh` option still requests Chinese output for compatibility. Its instructions are also written in English.
-
-The TTS example uses an English transcript and a matching synthesized English reference recording at `Wan2.2/examples/zero_shot_prompt.wav`. The reference says: "I hope that one day you will do even better than I have." It was synthesized with Microsoft Zira Desktop as 24 kHz, 16-bit mono PCM. The generated-speech example text is also English. This sample is a functional input example, not a benchmark of TTS quality.
-
-**Translating the negative prompts changes model conditioning.** Results from the earlier Chinese-default revision may differ even when the attention budget is disabled. Run the original-attention baseline and budget experiments on the **same revision**, with identical positive and negative prompts, to isolate the attention change. Prompt-expansion results may also change after translation; keep expansion disabled for controlled comparisons.
-
 ## Validation and experiments
 
 CPU unit tests use small tensors and a substitute attention kernel to check routing, the formula, and boundary arguments. They do not load model weights or validate CUDA kernels or full video quality. Run from `Wan2.2`:
