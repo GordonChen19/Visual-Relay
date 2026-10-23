@@ -6,7 +6,9 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention, paired_anchor_attention
+from .attention import (flash_attention, paired_anchor_attention,
+                        self_attention_guidance_attention,
+                        temporary_anchor_rope)
 
 __all__ = ['WanModel']
 
@@ -130,7 +132,12 @@ class WanSelfAttention(nn.Module):
                 freqs,
                 paired_anchor_index=None,
                 paired_stream_weight=0.25,
-                paired_prefix_anchor_active=True):
+                paired_prefix_anchor_active=True,
+                paired_prefix_future_eta=0.0,
+                attention_guidance_anchor_index=None,
+                self_attention_guidance_scale=0.5,
+                self_attention_guidance_img2_weight=0.25,
+                self_attention_guidance_rms_cap=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -151,14 +158,21 @@ class WanSelfAttention(nn.Module):
 
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
-        if paired_anchor_index is None:
-            x = flash_attention(
-                q=q,
-                k=k,
-                v=v,
-                k_lens=seq_lens,
-                window_size=self.window_size)
-        else:
+        if attention_guidance_anchor_index is not None:
+            # Expanded M/J both contain the temporary slot and use compressed
+            # retained-frame coordinates. B keeps ordinary local RoPE.
+            expanded_count = 2 if q.size(0) >= 3 else 1
+            q = torch.cat([
+                temporary_anchor_rope(
+                    q[:expanded_count], grid_sizes[:expanded_count], freqs,
+                    attention_guidance_anchor_index), q[expanded_count:]
+            ], dim=0)
+            k = torch.cat([
+                temporary_anchor_rope(
+                    k[:expanded_count], grid_sizes[:expanded_count], freqs,
+                    attention_guidance_anchor_index), k[expanded_count:]
+            ], dim=0)
+        if paired_anchor_index is not None:
             x = paired_anchor_attention(
                 q=q,
                 k=k,
@@ -169,6 +183,27 @@ class WanSelfAttention(nn.Module):
                 anchor_index=paired_anchor_index,
                 stream_weight=paired_stream_weight,
                 prefix_anchor_active=paired_prefix_anchor_active,
+                prefix_future_eta=paired_prefix_future_eta,
+                window_size=self.window_size)
+        elif attention_guidance_anchor_index is not None:
+            x = self_attention_guidance_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                freqs=freqs,
+                anchor_index=attention_guidance_anchor_index,
+                joint_weight=self_attention_guidance_scale,
+                img2_weight=self_attention_guidance_img2_weight,
+                joint_rms_cap=self_attention_guidance_rms_cap,
+                window_size=self.window_size)
+        else:
+            x = flash_attention(
+                q=q,
+                k=k,
+                v=v,
+                k_lens=seq_lens,
                 window_size=self.window_size)
 
         # output
@@ -250,6 +285,11 @@ class WanAttentionBlock(nn.Module):
         paired_anchor_index=None,
         paired_stream_weight=0.25,
         paired_prefix_anchor_active=True,
+        paired_prefix_future_eta=0.0,
+        self_attention_guidance_scale=None,
+        self_attention_guidance_img2_weight=None,
+        self_attention_guidance_rms_cap=None,
+        attention_guidance_anchor_index=None,
     ):
         r"""
         Args:
@@ -268,7 +308,14 @@ class WanAttentionBlock(nn.Module):
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
             seq_lens, grid_sizes, freqs, paired_anchor_index,
-            paired_stream_weight, paired_prefix_anchor_active)
+            paired_stream_weight, paired_prefix_anchor_active,
+            paired_prefix_future_eta,
+            attention_guidance_anchor_index,
+            (0.5 if self_attention_guidance_scale is None else
+             self_attention_guidance_scale),
+            (0.25 if self_attention_guidance_img2_weight is None else
+             self_attention_guidance_img2_weight),
+            self_attention_guidance_rms_cap)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -443,6 +490,11 @@ class WanModel(ModelMixin, ConfigMixin):
         paired_anchor_index=None,
         paired_stream_weight=0.25,
         paired_prefix_anchor_active=True,
+        paired_prefix_future_eta=0.0,
+        self_attention_guidance_scale=None,
+        self_attention_guidance_img2_weight=None,
+        self_attention_guidance_rms_cap=None,
+        attention_guidance_anchor_index=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -486,17 +538,26 @@ class WanModel(ModelMixin, ConfigMixin):
         ])
 
         # time embeddings
-        if t.dim() == 1:
-            # Add the token axis before expansion so this supports both the
-            # standard B=1 path and paired streams with B=2.
-            t = t[:, None].expand(-1, seq_len)
         with torch.amp.autocast('cuda', dtype=torch.float32):
-            bt = t.size(0)
-            t = t.flatten()
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim,
-                                        t).unflatten(0, (bt, seq_len)).float())
-            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+            if t.dim() == 1:
+                # Every token in a sample has the same diffusion timestep.
+                # Compute its modulation once and rely on broadcasting in the
+                # transformer blocks and output head. Expanding before the two
+                # MLPs would materialize B * seq_len * 6 * dim float32 values,
+                # which is several GiB for multi-stream 480p inference.
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim, t).float())[:, None]
+                e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+            else:
+                # Preserve support for callers that intentionally provide a
+                # distinct timestep for every token.
+                bt, token_count = t.shape
+                t = t.flatten()
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(
+                        self.freq_dim, t).unflatten(
+                            0, (bt, token_count)).float())
+                e0 = self.time_projection(e).unflatten(2, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
@@ -518,7 +579,14 @@ class WanModel(ModelMixin, ConfigMixin):
             context_lens=context_lens,
             paired_anchor_index=paired_anchor_index,
             paired_stream_weight=paired_stream_weight,
-            paired_prefix_anchor_active=paired_prefix_anchor_active)
+            paired_prefix_anchor_active=paired_prefix_anchor_active,
+            paired_prefix_future_eta=paired_prefix_future_eta,
+            self_attention_guidance_scale=self_attention_guidance_scale,
+            self_attention_guidance_img2_weight=(
+                self_attention_guidance_img2_weight),
+            self_attention_guidance_rms_cap=(
+                self_attention_guidance_rms_cap),
+            attention_guidance_anchor_index=attention_guidance_anchor_index)
 
         for block in self.blocks:
             x = block(x, **kwargs)

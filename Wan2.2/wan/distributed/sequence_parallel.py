@@ -71,6 +71,11 @@ def sp_dit_forward(
     paired_anchor_index=None,
     paired_stream_weight=0.25,
     paired_prefix_anchor_active=True,
+    paired_prefix_future_eta=0.0,
+    self_attention_guidance_scale=None,
+    self_attention_guidance_img2_weight=None,
+    self_attention_guidance_rms_cap=None,
+    attention_guidance_anchor_index=None,
 ):
     """
     x:              A list of videos each with shape [C, T, H, W].
@@ -100,19 +105,23 @@ def sp_dit_forward(
     ])
 
     # time embeddings
-    if t.dim() == 1:
-        # Insert the token axis explicitly. ``Tensor.expand(B, L)`` only
-        # happened to work for upstream's B=1 timestep tensor; it cannot
-        # expand a paired tensor shaped [2] because that existing dimension
-        # is aligned with L. This form is valid for both paths.
-        t = t[:, None].expand(-1, seq_len)
+    tokenwise_timesteps = t.dim() != 1
     with torch.amp.autocast('cuda', dtype=torch.float32):
-        bt = t.size(0)
-        t = t.flatten()
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim,
-                                    t).unflatten(0, (bt, seq_len)).float())
-        e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+        if not tokenwise_timesteps:
+            # The timestep is constant across every token in a sample. Keep a
+            # singleton token dimension and broadcast it after sequence
+            # sharding instead of constructing a multi-GiB repeated tensor.
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t).float())[:, None]
+            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+        else:
+            bt, token_count = t.shape
+            t = t.flatten()
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(
+                    self.freq_dim, t).unflatten(
+                        0, (bt, token_count)).float())
+            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
         assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
     # context
@@ -125,8 +134,9 @@ def sp_dit_forward(
 
     # Context Parallel
     x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
-    e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
-    e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
+    if tokenwise_timesteps:
+        e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
+        e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
 
     # arguments
     kwargs = dict(
@@ -138,7 +148,13 @@ def sp_dit_forward(
         context_lens=context_lens,
         paired_anchor_index=paired_anchor_index,
         paired_stream_weight=paired_stream_weight,
-        paired_prefix_anchor_active=paired_prefix_anchor_active)
+        paired_prefix_anchor_active=paired_prefix_anchor_active,
+        paired_prefix_future_eta=paired_prefix_future_eta,
+        self_attention_guidance_scale=self_attention_guidance_scale,
+        self_attention_guidance_img2_weight=(
+            self_attention_guidance_img2_weight),
+        self_attention_guidance_rms_cap=self_attention_guidance_rms_cap,
+        attention_guidance_anchor_index=attention_guidance_anchor_index)
 
     for block in self.blocks:
         x = block(x, **kwargs)
@@ -162,6 +178,11 @@ def sp_attn_forward(self,
                     paired_anchor_index=None,
                     paired_stream_weight=0.25,
                     paired_prefix_anchor_active=True,
+                    paired_prefix_future_eta=0.0,
+                    attention_guidance_anchor_index=None,
+                    self_attention_guidance_scale=0.5,
+                    self_attention_guidance_img2_weight=0.25,
+                    self_attention_guidance_rms_cap=None,
                     dtype=torch.bfloat16):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
@@ -191,6 +212,12 @@ def sp_attn_forward(self,
         paired_anchor_index=paired_anchor_index,
         paired_stream_weight=paired_stream_weight,
         paired_prefix_anchor_active=paired_prefix_anchor_active,
+        paired_prefix_future_eta=paired_prefix_future_eta,
+        attention_guidance_anchor_index=attention_guidance_anchor_index,
+        self_attention_guidance_scale=self_attention_guidance_scale,
+        self_attention_guidance_img2_weight=(
+            self_attention_guidance_img2_weight),
+        self_attention_guidance_rms_cap=self_attention_guidance_rms_cap,
     )
 
     # output

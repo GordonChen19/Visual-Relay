@@ -53,6 +53,15 @@ class PairedAnchorCliTest(unittest.TestCase):
         self.assertEqual(args.image, ['img1.png'])
         self.assertFalse(args.image_condition_paired_anchor_attention)
 
+    def test_prefix_future_eta_range(self):
+        args = self.parse('--image', 'img1.png',
+                          '--image_condition_paired_prefix_future_eta', '0.2')
+        self.assertEqual(args.image_condition_paired_prefix_future_eta, 0.2)
+        for value in ('-0.1', '1.1'):
+            with self.assertRaises(AssertionError):
+                self.parse('--image', 'img1.png',
+                           '--image_condition_paired_prefix_future_eta', value)
+
     def test_paired_anchor_accepts_two_aligned_images(self):
         args = self.parse(
             '--image', 'img1.png', '--image_latent_index', '0',
@@ -76,6 +85,79 @@ class PairedAnchorCliTest(unittest.TestCase):
             '--image_condition_paired_anchor_attention',
             '--image_condition_paired_stream_weight', '0.4')
         self.assertEqual(args.image_condition_paired_stream_weight, 0.4)
+
+    def test_self_attention_guidance_accepts_aligned_images(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image', 'img2.png', '--image_latent_index', '12',
+            '--image_condition_self_attention_guidance',
+            '--image_condition_self_attention_guidance_scale', '0.6')
+        self.assertTrue(args.image_condition_self_attention_guidance)
+        self.assertEqual(
+            args.image_condition_self_attention_guidance_scale, 0.6)
+        self.assertEqual(
+            args.image_condition_self_attention_guidance_img2_weight, 0.25)
+        self.assertFalse(args.image_condition_paired_anchor_attention)
+
+    def test_self_attention_guidance_scale_must_be_nonnegative(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image', 'img2.png', '--image_latent_index', '12',
+                '--image_condition_self_attention_guidance',
+                '--image_condition_self_attention_guidance_scale', '-0.1')
+
+    def test_self_attention_guidance_phase_weights_are_independent(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image', 'img2.png', '--image_latent_index', '12',
+            '--image_condition_self_attention_guidance',
+            '--image_condition_self_attention_guidance_scale', '0.8',
+            '--image_condition_self_attention_guidance_img2_weight', '0.3')
+        self.assertEqual(args.image_condition_self_attention_guidance_scale,
+                         0.8)
+        self.assertEqual(
+            args.image_condition_self_attention_guidance_img2_weight, 0.3)
+
+    def test_self_attention_guidance_stop_step_is_configurable(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image', 'img2.png', '--image_latent_index', '12',
+            '--image_condition_self_attention_guidance',
+            '--image_condition_self_attention_guidance_stop_step', '20')
+        self.assertEqual(
+            args.image_condition_self_attention_guidance_stop_step, 20)
+
+    def test_self_attention_guidance_rms_cap_is_configurable(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image', 'img2.png', '--image_latent_index', '12',
+            '--image_condition_self_attention_guidance',
+            '--image_condition_self_attention_guidance_rms_cap', '0.2')
+        self.assertEqual(
+            args.image_condition_self_attention_guidance_rms_cap, 0.2)
+
+    def test_self_attention_guidance_stop_requires_guidance_mode(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png',
+                '--image_condition_self_attention_guidance_stop_step', '20')
+
+    def test_self_attention_guidance_stop_must_precede_sampling_end(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image', 'img2.png', '--image_latent_index', '12',
+                '--image_condition_self_attention_guidance',
+                '--image_condition_self_attention_guidance_stop_step', '40')
+
+    def test_two_multi_image_ablations_are_mutually_exclusive(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image', 'img2.png', '--image_latent_index', '12',
+                '--image_condition_paired_anchor_attention',
+                '--image_condition_self_attention_guidance')
 
     def test_paired_stream_weight_must_be_a_convex_weight(self):
         with self.assertRaises(AssertionError):

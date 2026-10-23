@@ -2,7 +2,9 @@
 import torch
 import torch.distributed as dist
 
-from ..modules.attention import flash_attention, paired_anchor_attention
+from ..modules.attention import (flash_attention, paired_anchor_attention,
+                                 self_attention_guidance_attention,
+                                 temporary_anchor_rope)
 from .util import all_to_all
 
 
@@ -17,6 +19,11 @@ def distributed_attention(
         paired_anchor_index=None,
         paired_stream_weight=0.25,
         paired_prefix_anchor_active=True,
+        paired_prefix_future_eta=0.0,
+        attention_guidance_anchor_index=None,
+        self_attention_guidance_scale=0.5,
+        self_attention_guidance_img2_weight=0.25,
+        self_attention_guidance_rms_cap=None,
 ):
     """
     Performs distributed attention based on DeepSpeed Ulysses attention mechanism.
@@ -38,16 +45,26 @@ def distributed_attention(
     k = all_to_all(k, scatter_dim=2, gather_dim=1)
     v = all_to_all(v, scatter_dim=2, gather_dim=1)
 
+    if attention_guidance_anchor_index is not None:
+        if grid_sizes is None or freqs is None:
+            raise ValueError(
+                "attention-guidance RoPE requires grid sizes and frequencies")
+        # Expanded M/J use compressed retained-frame coordinates. Local B
+        # keeps ordinary first-frame RoPE.
+        expanded_count = 2 if q.size(0) >= 3 else 1
+        q = torch.cat([
+            temporary_anchor_rope(
+                q[:expanded_count], grid_sizes[:expanded_count], freqs,
+                attention_guidance_anchor_index), q[expanded_count:]
+        ], dim=0)
+        k = torch.cat([
+            temporary_anchor_rope(
+                k[:expanded_count], grid_sizes[:expanded_count], freqs,
+                attention_guidance_anchor_index), k[expanded_count:]
+        ], dim=0)
+
     # apply attention
-    if paired_anchor_index is None:
-        x = flash_attention(
-            q,
-            k,
-            v,
-            k_lens=seq_lens,
-            window_size=window_size,
-        )
-    else:
+    if paired_anchor_index is not None:
         if grid_sizes is None:
             raise ValueError(
                 "paired distributed attention requires grid sizes")
@@ -61,6 +78,29 @@ def distributed_attention(
             anchor_index=paired_anchor_index,
             stream_weight=paired_stream_weight,
             prefix_anchor_active=paired_prefix_anchor_active,
+            prefix_future_eta=paired_prefix_future_eta,
+            window_size=window_size,
+        )
+    elif attention_guidance_anchor_index is not None:
+        x = self_attention_guidance_attention(
+            q=q,
+            k=k,
+            v=v,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=freqs,
+            anchor_index=attention_guidance_anchor_index,
+            joint_weight=self_attention_guidance_scale,
+            img2_weight=self_attention_guidance_img2_weight,
+            joint_rms_cap=self_attention_guidance_rms_cap,
+            window_size=window_size,
+        )
+    else:
+        x = flash_attention(
+            q,
+            k,
+            v,
+            k_lens=seq_lens,
             window_size=window_size,
         )
 

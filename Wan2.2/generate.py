@@ -77,9 +77,29 @@ def _validate_args(args):
         args.tts_text = EXAMPLE_PROMPT[args.task]["tts_text"]
 
     if args.task == "i2v-A14B":
+        assert not (args.image_condition_paired_anchor_attention
+                    and args.image_condition_self_attention_guidance), (
+                        "Paired-anchor attention and self-attention guidance "
+                        "are separate ablations and cannot be combined.")
+        assert 0.0 <= args.image_condition_self_attention_guidance_scale <= 1.0, (
+            "--image_condition_self_attention_guidance_scale must be "
+            "in [0, 1].")
+        assert 0.0 <= args.image_condition_self_attention_guidance_img2_weight <= 1.0, (
+            "--image_condition_self_attention_guidance_img2_weight must be "
+            "in [0, 1].")
+        assert (args.image_condition_self_attention_guidance_rms_cap is None
+                or args.image_condition_self_attention_guidance_rms_cap > 0), (
+            "--image_condition_self_attention_guidance_rms_cap must be "
+            "positive.")
+        if args.image_condition_self_attention_guidance_stop_step is not None:
+            assert args.image_condition_self_attention_guidance, (
+                "--image_condition_self_attention_guidance_stop_step requires "
+                "--image_condition_self_attention_guidance.")
         assert args.image is not None, "Please specify the image path for i2v."
         assert 0.0 <= args.image_condition_paired_stream_weight <= 1.0, (
             "--image_condition_paired_stream_weight must be in [0, 1].")
+        assert 0.0 <= args.image_condition_paired_prefix_future_eta <= 1.0, (
+            "--image_condition_paired_prefix_future_eta must be in [0, 1].")
         paired_fade_pairs = {
             "shared": (
                 args.image_condition_paired_fade_start_step,
@@ -92,15 +112,27 @@ def _validate_args(args):
             assert ((fade_steps[0] is None) == (fade_steps[1] is None)), (
                 f"Paired {fade_name} fade start and end steps must be "
                 "supplied together.")
-        if args.image_condition_paired_anchor_attention:
+        if (args.image_condition_paired_anchor_attention
+                or args.image_condition_self_attention_guidance):
             assert len(args.image) == 2, (
-                "Paired anchor attention requires exactly two images.")
+                "The selected multi-image ablation requires exactly two "
+                "images.")
             assert (args.image_latent_index is not None
                     and len(args.image_latent_index) == 2
                     and args.image_latent_index[0] == 0
                     and args.image_latent_index[1] > 0), (
-                        "Paired anchor attention requires image latent "
+                        "The selected multi-image ablation requires image "
+                        "latent "
                         "indices [0, positive].")
+            if args.image_condition_self_attention_guidance:
+                assert all(steps == (None, None)
+                           for steps in paired_fade_pairs.values()), (
+                    "Paired-attention fading cannot be used with the "
+                    "self-attention-guidance ablation.")
+                assert (args.image_condition_paired_prefix_route_switch_step
+                        is None), (
+                    "Paired prefix routing cannot be used with the "
+                    "self-attention-guidance ablation.")
         else:
             assert all(steps == (None, None)
                        for steps in paired_fade_pairs.values()), (
@@ -118,6 +150,8 @@ def _validate_args(args):
     else:
         assert not args.image_condition_paired_anchor_attention, (
             "Paired anchor attention is supported only by i2v-A14B.")
+        assert not args.image_condition_self_attention_guidance, (
+            "Self-attention guidance is supported only by i2v-A14B.")
         assert args.image_latent_index is None, (
             "--image_latent_index is supported only by paired I2V.")
         assert args.image is None or len(args.image) == 1, (
@@ -140,6 +174,12 @@ def _validate_args(args):
                     < args.sample_steps), (
                         "--image_condition_paired_prefix_route_switch_step "
                         "must be in [0, sample_steps).")
+        if args.image_condition_self_attention_guidance_stop_step is not None:
+            assert (0 <=
+                    args.image_condition_self_attention_guidance_stop_step <
+                    args.sample_steps), (
+                        "--image_condition_self_attention_guidance_stop_step "
+                        "must be in [0, sample_steps).")
 
     if args.sample_shift is None:
         args.sample_shift = cfg.sample_shift
@@ -150,7 +190,8 @@ def _validate_args(args):
     if args.frame_num is None:
         args.frame_num = cfg.frame_num
 
-    if args.image_condition_paired_anchor_attention:
+    if (args.image_condition_paired_anchor_attention
+            or args.image_condition_self_attention_guidance):
         latent_frame_num = ((args.frame_num - 1) // cfg.vae_stride[0] + 1)
         assert args.image_latent_index[1] < latent_frame_num - 1, (
             "Img2 must leave at least one latent frame on its right; use an "
@@ -273,15 +314,58 @@ def _parse_args():
     parser.add_argument(
         "--image_condition_paired_anchor_attention",
         action="store_true",
-        help=("Use a full Img1 I2V stream and an aligned Img2-first suffix. "
-              "Suffix attention outputs from the two streams are fused with "
-              "a fixed user-controlled weight."))
+        help=("Use Img1-only C and aligned Img2-first B. Ordinary C frames "
+              "attend all ordinary C frames, excluding the temporary slot. "
+              "C suffix updates blend with B; B0 supplies the temporary "
+              "slot's update and velocity. No joint multi-image encoding."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance",
+        action="store_true",
+        help=("Run expanded Img1-only M, joint Img1/Img2 J, standard "
+              "Img2-first suffix B, and one-frame bridge-anchor H. M's "
+              "temporary slot is excluded from attention. J prefix sees its joint "
+              "anchor while J suffix sees H; H reads itself plus J's suffix. "
+              "After alignment, M prefix blends M/J while M suffix blends "
+              "M/J/B1:; B0 replaces the temporary anchor velocity."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_scale",
+        type=float,
+        default=0.5,
+        help=("J output weight used in both prefix and suffix fusion "
+              "(default: 0.5)."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_img2_weight",
+        type=float,
+        default=0.25,
+        help=("B1: suffix-output weight used only after the J stop-step "
+              "handoff. Before the handoff, suffix fusion is M/J only "
+              "(default: 0.25)."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_rms_cap",
+        type=float,
+        default=None,
+        help=("Optional per-frame, per-head cap on the injected J-M attention "
+              "residual RMS, expressed as a fraction of M RMS."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_stop_step",
+        type=int,
+        default=None,
+        help=("Optional zero-based sampling step at which J guidance stops. "
+              "Afterward M continues with B suffix guidance and B0 anchor "
+              "velocity replacement."))
+    parser.add_argument(
+        "--image_condition_paired_prefix_future_eta",
+        type=float, default=0.0,
+        help=("Prefix future-attention nudge eta in [0, 1]. Always excludes "
+              "the temporary anchor and adjusts future mass by eta*w*(1-w). "
+              "Zero uses ordinary softmax over retained C frames."))
     parser.add_argument(
         "--image_condition_paired_stream_weight",
         type=float,
         default=0.25,
-        help=("Fixed Img2-stream attention-output weight used by paired "
-              "anchor attention; must be in [0, 1] (default: 0.25)."))
+        help=("Fixed Img2-stream attention-output weight used independently "
+              "for the C/B and D/B suffix fusions; must be in [0, 1] "
+              "(default: 0.25)."))
     parser.add_argument(
         "--image_condition_paired_fade_start_step",
         type=int,
@@ -313,11 +397,8 @@ def _parse_args():
         "--image_condition_paired_prefix_route_switch_step",
         type=int,
         default=None,
-        help=("Optional hard Img2-anchor removal step. Prefix queries always "
-              "attend ordinary Stream-A frames on both sides of the anchor. "
-              "Before this step they additionally attend the shifted "
-              "fresh-cache Stream-B Img2 "
-              "anchor; at and after it only that anchor is removed."))
+        help=("Legacy compatibility option; no effect in paired mode because "
+              "the temporary slot is always excluded from C attention."))
     parser.add_argument(
         "--sample_solver",
         type=str,
@@ -497,7 +578,9 @@ def generate(args):
         opened_images = [
             Image.open(path).convert("RGB") for path in image_paths
         ]
-        img = (opened_images if args.image_condition_paired_anchor_attention
+        img = (opened_images if (
+            args.image_condition_paired_anchor_attention
+            or args.image_condition_self_attention_guidance)
                else opened_images[0])
         logging.info("Input image(s): %s", image_paths)
 
@@ -666,6 +749,8 @@ def generate(args):
             image_latent_indices=args.image_latent_index,
             image_condition_paired_anchor_attention=(
                 args.image_condition_paired_anchor_attention),
+            image_condition_paired_prefix_future_eta=(
+                args.image_condition_paired_prefix_future_eta),
             image_condition_paired_stream_weight=(
                 args.image_condition_paired_stream_weight),
             image_condition_paired_fade_start_step=(
@@ -677,7 +762,17 @@ def generate(args):
             image_condition_paired_suffix_fade_end_step=(
                 args.image_condition_paired_suffix_fade_end_step),
             image_condition_paired_prefix_route_switch_step=(
-                args.image_condition_paired_prefix_route_switch_step))
+                args.image_condition_paired_prefix_route_switch_step),
+            image_condition_self_attention_guidance=(
+                args.image_condition_self_attention_guidance),
+            image_condition_self_attention_guidance_scale=(
+                args.image_condition_self_attention_guidance_scale),
+            image_condition_self_attention_guidance_img2_weight=(
+                args.image_condition_self_attention_guidance_img2_weight),
+            image_condition_self_attention_guidance_rms_cap=(
+                args.image_condition_self_attention_guidance_rms_cap),
+            image_condition_self_attention_guidance_stop_step=(
+                args.image_condition_self_attention_guidance_stop_step))
 
     if rank == 0:
         if args.save_file is None:

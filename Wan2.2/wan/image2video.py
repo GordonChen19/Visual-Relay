@@ -19,6 +19,8 @@ from tqdm import tqdm
 from .distributed.fsdp import free_model, shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
+from .modules.attention import (begin_value_rms_diagnostics,
+                                end_value_rms_diagnostics)
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
@@ -252,11 +254,17 @@ class WanI2V:
                  image_latent_indices=None,
                  image_condition_paired_anchor_attention=False,
                  image_condition_paired_stream_weight=0.25,
+                 image_condition_paired_prefix_future_eta=0.0,
                  image_condition_paired_fade_start_step=None,
                  image_condition_paired_fade_end_step=None,
                  image_condition_paired_suffix_fade_start_step=None,
                  image_condition_paired_suffix_fade_end_step=None,
-                 image_condition_paired_prefix_route_switch_step=None):
+                 image_condition_paired_prefix_route_switch_step=None,
+                 image_condition_self_attention_guidance=False,
+                 image_condition_self_attention_guidance_scale=0.5,
+                 image_condition_self_attention_guidance_img2_weight=0.25,
+                 image_condition_self_attention_guidance_rms_cap=None,
+                 image_condition_self_attention_guidance_stop_step=None):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -291,10 +299,18 @@ class WanI2V:
                 In paired mode, use ``[0, anchor]`` to align Img2 with the
                 requested latent frame in the full Img1 stream.
             image_condition_paired_anchor_attention (`bool`, *optional*):
-                Enable the per-layer Img1-main/Img2-suffix attention fusion.
+                Enable Img1-only C and fresh-cache Img2-first B. C-prefix
+                queries read every ordinary C frame, excluding the transport
+                slot. There is no joint encoding or D stream. B0 supplies
+                the transport slot's attention output and predicted velocity.
             image_condition_paired_stream_weight (`float`, *optional*):
                 Fixed weight assigned to the full Img2 suffix-attention output
-                when paired mode fuses suffix tokens at every DiT layer.
+                when paired mode fuses it with C's suffix continuity output.
+                The fused update is applied to C's retained suffix.
+            image_condition_paired_prefix_future_eta (`float`, *optional*):
+                Framewise future-attention adjustment in [0, 1]. Zero uses
+                ordinary attention; positive eta adjusts future mass w to
+                w + eta*w*(1-w), preserving within-group probabilities.
             image_condition_paired_fade_start_step (`int`, *optional*):
                 Sampling-step index at which the Stream-B suffix fusion weight
                 begins a cosine fade.
@@ -307,11 +323,27 @@ class WanI2V:
             image_condition_paired_suffix_fade_end_step (`int`, *optional*):
                 Stream-B-suffix-only fade end.
             image_condition_paired_prefix_route_switch_step (`int`, *optional*):
-                Hard anchor-removal step. Prefix queries always attend ordinary
-                Stream-A frames on both sides of the anchor. Before this step,
-                they additionally attend a hybrid anchor using the
-                history-aware Stream-A key and fresh-cache Stream-B Img2
-                value; at and after it, only that hybrid route is removed.
+                Legacy compatibility option; ignored because C always hides
+                the temporary slot from all ordinary attention queries.
+            image_condition_self_attention_guidance (`bool`, *optional*):
+                Run expanded Img1-only M, joint Img1/Img2 J, standard
+                Img2-first suffix B. J provides the single anchor used by
+                both its prefix and suffix routes. M's
+                temporary slot is excluded from attention. Removing J's anchor
+                aligns its ordinary attention output with M's retained output
+                for uniform M/J guidance. B0 supplies the temporary anchor
+                velocity used by the internal scheduler state.
+            image_condition_self_attention_guidance_scale (`float`, *optional*):
+                Per-layer weight of J's completed attention output.
+            image_condition_self_attention_guidance_img2_weight (`float`, *optional*):
+                Weight of aligned B1: outputs in M's suffix fusion.
+            image_condition_self_attention_guidance_rms_cap (`float`, *optional*):
+                Optional per-frame, per-head J-M attention residual RMS cap,
+                expressed relative to M's attention-output RMS.
+            image_condition_self_attention_guidance_stop_step (`int`, *optional*):
+                Zero-based sampling step at which J is removed. At and after
+                this step, B continues guiding M's suffix and supplying the
+                anchor velocity while M's temporary slot stays isolated.
 
         Returns:
             torch.Tensor:
@@ -324,6 +356,43 @@ class WanI2V:
         # preprocess
         guide_scale = (guide_scale, guide_scale) if isinstance(
             guide_scale, float) else guide_scale
+        if (image_condition_paired_anchor_attention
+                and image_condition_self_attention_guidance):
+            raise ValueError(
+                "paired-anchor attention and self-attention guidance are "
+                "separate ablations")
+        if not 0 <= image_condition_self_attention_guidance_scale <= 1:
+            raise ValueError(
+                "self-attention guidance scale must be in [0, 1]")
+        if not 0 <= image_condition_self_attention_guidance_img2_weight <= 1:
+            raise ValueError(
+                "self-attention Img2 weight must be in [0, 1]")
+        if (image_condition_self_attention_guidance_rms_cap is not None
+                and image_condition_self_attention_guidance_rms_cap <= 0):
+            raise ValueError(
+                "self-attention guidance RMS cap must be positive")
+        if image_condition_self_attention_guidance_stop_step is not None:
+            if not image_condition_self_attention_guidance:
+                raise ValueError(
+                    "self-attention guidance stop step requires the "
+                    "self-attention-guidance ablation")
+            if not (0 <= image_condition_self_attention_guidance_stop_step <
+                    sampling_steps):
+                raise ValueError(
+                    "self-attention guidance stop step must be in "
+                    "[0, sampling_steps)")
+        if image_condition_self_attention_guidance and any(
+                value is not None for value in (
+                    image_condition_paired_fade_start_step,
+                    image_condition_paired_fade_end_step,
+                    image_condition_paired_suffix_fade_start_step,
+                    image_condition_paired_suffix_fade_end_step,
+                    image_condition_paired_prefix_route_switch_step)):
+            raise ValueError(
+                "paired fading and prefix routing do not apply to the "
+                "self-attention-guidance ablation")
+        multi_stream_mode = (image_condition_paired_anchor_attention
+                             or image_condition_self_attention_guidance)
         if image_condition_paired_anchor_attention:
             if not 0.0 <= image_condition_paired_stream_weight <= 1.0:
                 raise ValueError(
@@ -360,15 +429,18 @@ class WanI2V:
                 image_condition_paired_suffix_fade_end_step
                 if image_condition_paired_suffix_fade_end_step is not None
                 else image_condition_paired_fade_end_step)
+        if multi_stream_mode:
             if not isinstance(img, (list, tuple)) or len(img) != 2:
                 raise ValueError(
-                    "paired anchor attention requires exactly two images")
+                    "the selected multi-image ablation requires exactly two "
+                    "images")
             if (image_latent_indices is None
                     or len(image_latent_indices) != 2
                     or image_latent_indices[0] != 0
                     or image_latent_indices[1] <= 0):
                 raise ValueError(
-                    "paired anchor attention requires indices [0, positive]")
+                    "the selected multi-image ablation requires indices "
+                    "[0, positive]")
             imgs = [
                 TF.to_tensor(value).sub_(0.5).div_(0.5).to(self.device)
                 for value in img
@@ -396,7 +468,7 @@ class WanI2V:
         w = lat_w * self.vae_stride[2]
 
         latent_frame_num = (F - 1) // self.vae_stride[0] + 1
-        if (image_condition_paired_anchor_attention
+        if (multi_stream_mode
                 and anchor_index >= latent_frame_num - 1):
             raise ValueError(
                 "paired Img2 anchor must have at least one latent frame on "
@@ -405,7 +477,7 @@ class WanI2V:
         # replacing an output latent. It is removed before VAE decoding, so an
         # 81-frame request still decodes 21 retained latents.
         model_latent_frame_num = (latent_frame_num + 1
-                                  if image_condition_paired_anchor_attention
+                                  if multi_stream_mode
                                   else latent_frame_num)
         max_seq_len = model_latent_frame_num * lat_h * lat_w // (
             self.patch_size[1] * self.patch_size[2])
@@ -487,6 +559,8 @@ class WanI2V:
                 anchor[:, None].expand(-1, self.vae_stride[0], -1, -1))
             return video
 
+        if not 0.0 <= image_condition_paired_prefix_future_eta <= 1.0:
+            raise ValueError("paired prefix future eta must be in [0, 1]")
         if image_condition_paired_anchor_attention:
             suffix_latent_frame_num = model_latent_frame_num - anchor_index
             suffix_frame_num = (1 + self.vae_stride[0]
@@ -496,57 +570,95 @@ class WanI2V:
             encoded = self.vae.encode([
                 conditioning_video(imgs[0], F),
                 conditioning_video(imgs[1], suffix_frame_num),
-                joint_anchor_conditioning_video(
-                    imgs[0], imgs[1], expanded_frame_num, anchor_index),
             ])
             if (encoded[0].size(1) != latent_frame_num
-                    or encoded[1].size(1) != suffix_latent_frame_num
-                    or encoded[2].size(1) != model_latent_frame_num):
-                raise RuntimeError(
-                    "paired conditioning VAE lengths do not align")
-            # Ordinary Stream-A slots retain the compact Img1-only encoding.
-            # Only its temporary anchor slot uses the joint causal encoding;
-            # Stream B independently uses a fresh-cache Img2-first suffix.
+                    or encoded[1].size(1) != suffix_latent_frame_num):
+                raise RuntimeError("paired B/C conditioning lengths do not align")
             expanded_msk = insert_latent_slot(msk, anchor_index)
             expanded_main = insert_latent_slot(encoded[0], anchor_index)
-            expanded_msk[:, anchor_index:anchor_index + 1].fill_(1)
-            expanded_main[:, anchor_index:anchor_index + 1].copy_(
-                encoded[2][:, anchor_index:anchor_index + 1])
-            y = torch.concat([expanded_msk, expanded_main])
+            # Transport slot only: never expose it as a conditioning anchor.
+            expanded_msk[:, anchor_index:anchor_index + 1].zero_()
+            expanded_main[:, anchor_index:anchor_index + 1].zero_()
             suffix_y = torch.concat([
                 first_frame_mask(suffix_frame_num), encoded[1]
             ])
+            hybrid_y = torch.concat([expanded_msk, expanded_main])
             del encoded, expanded_msk, expanded_main
             logging.info(
-                "Paired anchor attention: %d retained latents plus temporary "
-                "Img2 anchor at %d (%d working latents), with a %d-latent "
-                "fresh-cache Img2 suffix; fixed full-suffix fusion weight "
-                "%.3f. While its anchor route is active, every prefix query "
-                "uses one softmax over all ordinary Stream-A frames plus a "
-                "hybrid anchor with the history-aware Stream-A key and "
-                "fresh-cache Stream-B Img2 value. "
-                "Stream B independently "
-                "evolves a fresh-cache Img2 "
-                "anchor, while the joint-conditioned Stream-A anchor keeps "
-                "its own prediction and is removed prior to decoding",
-                latent_frame_num, anchor_index, model_latent_frame_num,
-                suffix_latent_frame_num,
+                "Paired two-stream attention: Img1-only C and fresh-cache "
+                "Img2-first B; no joint encoding or D stream. C prefix reads "
+                "every ordinary C frame, excluding transport slot %d; "
+                "framewise future eta=%.3f. Retained C suffix blends C/B "
+                "attention at weight %.3f. The transport slot receives B0 "
+                "attention and velocity and is removed before decoding. "
+                "Prefix route-switch is inactive because the slot is always hidden",
+                anchor_index, image_condition_paired_prefix_future_eta,
                 image_condition_paired_stream_weight)
             if suffix_fade_start_step is not None:
-                logging.info(
-                    "Paired Stream-B suffix cosine fade: sampling steps %d "
-                    "through %d; weight %.3f -> 0; scheduler state is not reset",
-                    suffix_fade_start_step,
-                    suffix_fade_end_step,
-                    image_condition_paired_stream_weight)
-            if image_condition_paired_prefix_route_switch_step is not None:
-                logging.info(
-                    "Paired prefix routing handoff at sampling step %d: before "
-                    "the step, prefix queries see all ordinary Stream-A frames "
-                    "plus a history-aware Stream-A anchor key paired with the "
-                    "fresh-cache Stream-B Img2 value; at and after the step, "
-                    "only that hybrid anchor route is removed",
-                    image_condition_paired_prefix_route_switch_step)
+                logging.info("B suffix weight cosine fade: steps %d through %d",
+                             suffix_fade_start_step, suffix_fade_end_step)
+        elif image_condition_self_attention_guidance:
+            guidance_local_latent_frame_num = (
+                model_latent_frame_num - anchor_index)
+            guidance_local_frame_num = (
+                1 + self.vae_stride[0]
+                * (guidance_local_latent_frame_num - 1))
+            expanded_frame_num = (1 + self.vae_stride[0]
+                                  * (model_latent_frame_num - 1))
+            encoded = self.vae.encode([
+                conditioning_video(imgs[0], F),
+                joint_anchor_conditioning_video(
+                    imgs[0], imgs[1], expanded_frame_num, anchor_index),
+                conditioning_video(imgs[1], guidance_local_frame_num),
+            ])
+            if (encoded[0].size(1) != latent_frame_num
+                    or encoded[1].size(1) != model_latent_frame_num
+                    or encoded[2].size(1) !=
+                    guidance_local_latent_frame_num):
+                raise RuntimeError(
+                    "self-attention-guidance conditioning lengths do not "
+                    "match the expanded layout")
+            # M expands ordinary Img1-only conditioning with a masked transport
+            # slot. That slot is excluded from attention. J uses the joint
+            # multi-image encode, B is standard Img2-first I2V, and J uses one
+            # history-aware anchor for both prefix and suffix.
+            primary_mask = insert_latent_slot(
+                first_frame_mask(F), anchor_index)
+            primary_encoded = insert_latent_slot(encoded[0], anchor_index)
+            primary_mask[:, anchor_index:anchor_index + 1].zero_()
+            joint_mask = first_frame_mask(expanded_frame_num)
+            joint_mask[:, anchor_index:anchor_index + 1].fill_(1)
+            primary_y = torch.concat([primary_mask, primary_encoded])
+            joint_y = torch.concat([joint_mask, encoded[1]])
+            guidance_local_y = torch.concat([
+                first_frame_mask(guidance_local_frame_num), encoded[2]
+            ])
+            del encoded, primary_mask, primary_encoded, joint_mask
+            logging.info(
+                "Self-attention-guidance ablation: expanded M and joint J "
+                "have %d latents with a temporary slot at %d. M's slot is "
+                "masked and excluded from all attention; its retained "
+                "neighbours are adjacent under compressed RoPE. B is a "
+                "standard %d-latent Img2-first suffix. J-prefix and J-suffix "
+                "queries both use J's single history-aware joint anchor; the "
+                "anchor reads itself plus J's suffix at every layer. Removing "
+                "J's anchor "
+                "aligns J with M's retained positions. Before handoff, both "
+                "prefix and suffix M use M/J weights %.3f/%.3f and B1: is "
+                "excluded. After handoff, suffix M uses M/B weights "
+                "%.3f/%.3f. B0's predicted "
+                "velocity replaces M's temporary anchor velocity after each "
+                "active model call; the slot is discarded before decoding. "
+                "J-to-M handoff step (M/B continue): %s",
+                model_latent_frame_num, anchor_index,
+                guidance_local_latent_frame_num,
+                (1.0 - image_condition_self_attention_guidance_scale),
+                image_condition_self_attention_guidance_scale,
+                (1.0 - image_condition_self_attention_guidance_img2_weight),
+                image_condition_self_attention_guidance_img2_weight,
+                ("disabled" if
+                 image_condition_self_attention_guidance_stop_step is None
+                 else str(image_condition_self_attention_guidance_stop_step)))
         else:
             y = self.vae.encode([conditioning_video(imgs[0], F)])[0]
             y = torch.concat([msk, y])
@@ -598,18 +710,68 @@ class WanI2V:
                 arg_c = {
                     'context': [context[0], context[0]],
                     'seq_len': max_seq_len,
-                    'y': [y, suffix_y],
+                    'y': [suffix_y, hybrid_y],
                     'paired_anchor_index': anchor_index,
                     'paired_stream_weight': image_condition_paired_stream_weight,
                     'paired_prefix_anchor_active': True,
+                    'paired_prefix_future_eta':
+                    image_condition_paired_prefix_future_eta,
                 }
                 arg_null = {
                     'context': [context_null[0], context_null[0]],
                     'seq_len': max_seq_len,
-                    'y': [y, suffix_y],
+                    'y': [suffix_y, hybrid_y],
                     'paired_anchor_index': anchor_index,
                     'paired_stream_weight': image_condition_paired_stream_weight,
                     'paired_prefix_anchor_active': True,
+                    'paired_prefix_future_eta':
+                    image_condition_paired_prefix_future_eta,
+                }
+            elif image_condition_self_attention_guidance:
+                arg_c = {
+                    'context': [context[0], context[0], context[0]],
+                    'seq_len': max_seq_len,
+                    'y': [primary_y, joint_y, guidance_local_y],
+                    'self_attention_guidance_scale':
+                    image_condition_self_attention_guidance_scale,
+                    'self_attention_guidance_img2_weight':
+                    image_condition_self_attention_guidance_img2_weight,
+                    'self_attention_guidance_rms_cap':
+                    image_condition_self_attention_guidance_rms_cap,
+                    'attention_guidance_anchor_index': anchor_index,
+                }
+                m_b_arg_c = {
+                    'context': [context[0], context[0]],
+                    'seq_len': max_seq_len,
+                    'y': [primary_y, guidance_local_y],
+                    'self_attention_guidance_scale': 0.0,
+                    'self_attention_guidance_img2_weight':
+                    image_condition_self_attention_guidance_img2_weight,
+                    'self_attention_guidance_rms_cap': None,
+                    'attention_guidance_anchor_index': anchor_index,
+                }
+                m_b_arg_null = {
+                    'context': [context_null[0], context_null[0]],
+                    'seq_len': max_seq_len,
+                    'y': [primary_y, guidance_local_y],
+                    'self_attention_guidance_scale': 0.0,
+                    'self_attention_guidance_img2_weight':
+                    image_condition_self_attention_guidance_img2_weight,
+                    'self_attention_guidance_rms_cap': None,
+                    'attention_guidance_anchor_index': anchor_index,
+                }
+                arg_null = {
+                    'context': [context_null[0], context_null[0],
+                                context_null[0]],
+                    'seq_len': max_seq_len,
+                    'y': [primary_y, joint_y, guidance_local_y],
+                    'self_attention_guidance_scale':
+                    image_condition_self_attention_guidance_scale,
+                    'self_attention_guidance_img2_weight':
+                    image_condition_self_attention_guidance_img2_weight,
+                    'self_attention_guidance_rms_cap':
+                    image_condition_self_attention_guidance_rms_cap,
+                    'attention_guidance_anchor_index': anchor_index,
                 }
             else:
                 arg_c = {
@@ -639,15 +801,33 @@ class WanI2V:
                     / (fade_end_step - fade_start_step))
                 return 0.5 * (1.0 + math.cos(math.pi * fade_progress))
 
+            def assemble_paired_prediction(predictions):
+                if len(predictions) != 2:
+                    raise RuntimeError("paired model must return B and C predictions")
+                suffix_prediction, hybrid_prediction = predictions
+                if (suffix_prediction.size(1) != suffix_latent_frame_num
+                        or hybrid_prediction.size(1) != model_latent_frame_num):
+                    raise RuntimeError("paired prediction lengths do not match B/C")
+                # Reproduce the early local-anchor routing at prediction
+                # level: after all DiT layers, substitute B0's Img2-first
+                # velocity for the temporary C anchor. This happens
+                # independently for conditional and unconditional predictions
+                # before CFG, so the scheduler receives the CFG-combined B0
+                # velocity at the anchor while evolving the latent normally.
+                hybrid_prediction = hybrid_prediction.clone()
+                hybrid_prediction[:, anchor_index:anchor_index + 1].copy_(
+                    suffix_prediction[:, :1])
+                return hybrid_prediction
+
             for sampling_step, t in enumerate(tqdm(timesteps)):
+                current_arg_c = arg_c
+                current_arg_null = arg_null
+                self_attention_guidance_active = False
                 if image_condition_paired_anchor_attention:
                     suffix_fade_factor = paired_fade_factor(
                         sampling_step, suffix_fade_start_step,
                         suffix_fade_end_step)
-                    anchor_is_enabled = (
-                        image_condition_paired_prefix_route_switch_step is None
-                        or sampling_step <
-                        image_condition_paired_prefix_route_switch_step)
+                    anchor_is_enabled = False
                     current_stream_weight = (
                         image_condition_paired_stream_weight
                         * suffix_fade_factor)
@@ -656,10 +836,44 @@ class WanI2V:
                     arg_null['paired_stream_weight'] = current_stream_weight
                     arg_null['paired_prefix_anchor_active'] = anchor_is_enabled
                     latent_model_input = [
-                        latent.to(self.device),
                         latent[:, anchor_index:].to(self.device),
+                        latent.to(self.device),
                     ]
                     timestep = [t, t]
+                elif image_condition_self_attention_guidance:
+                    current_latent = latent.to(self.device)
+                    self_attention_guidance_active = (
+                        image_condition_self_attention_guidance_stop_step is
+                        None or sampling_step <
+                        image_condition_self_attention_guidance_stop_step)
+                    if self_attention_guidance_active:
+                        # M/J start from the exact same current noisy latent;
+                        # B receives its aligned anchor/suffix slice.
+                        latent_model_input = [
+                            current_latent,
+                            current_latent,
+                            current_latent[:, anchor_index:],
+                        ]
+                        timestep = [t, t, t]
+                    else:
+                        # J handoff: keep M and the aligned Img2-first B.
+                        # M prefix stays pure M while B continues to guide M's
+                        # suffix and supplies B0's anchor velocity.
+                        latent_model_input = [
+                            current_latent,
+                            current_latent[:, anchor_index:],
+                        ]
+                        timestep = [t, t]
+                        current_arg_c = m_b_arg_c
+                        current_arg_null = m_b_arg_null
+                        if (sampling_step ==
+                                image_condition_self_attention_guidance_stop_step):
+                            logging.info(
+                                "Self-attention guidance stopped at sampling "
+                                "step %d: Stream J is disabled; Stream B "
+                                "continues suffix guidance and B0 anchor "
+                                "velocity replacement",
+                                sampling_step)
                 else:
                     latent_model_input = [latent.to(self.device)]
                     timestep = [t]
@@ -671,20 +885,105 @@ class WanI2V:
                     boundary,
                     offload_model,
                     release_high_noise_model=
-                    image_condition_paired_anchor_attention)
+                    multi_stream_mode)
                 sample_guide_scale = guide_scale[1] if t.item(
                 ) >= boundary else guide_scale[0]
 
+                collect_value_diagnostics = (
+                    image_condition_self_attention_guidance
+                    and self_attention_guidance_active
+                    and sampling_step % 5 == 0)
+                if collect_value_diagnostics:
+                    begin_value_rms_diagnostics(sampling_step)
                 predictions_cond = model(
-                    latent_model_input, t=timestep, **arg_c)
-                noise_pred_cond = predictions_cond[0]
-                del predictions_cond
+                    latent_model_input, t=timestep, **current_arg_c)
+                value_diagnostics = (
+                    end_value_rms_diagnostics()
+                    if collect_value_diagnostics else None)
+                if value_diagnostics is not None and self.rank == 0:
+                    retained_labels = list(range(anchor_index)) + list(
+                        range(anchor_index + 1, model_latent_frame_num))
+                    def format_metric(values):
+                        return "[" + ", ".join(
+                            f"{value:.4f}" for value in values) + "]"
+                    logging.info(
+                        "Self-attention value RMS diagnostics at sampling "
+                        "step %d, averaged over %d DiT layers; retained "
+                        "expanded-frame labels=%s; J anchor=%d",
+                        value_diagnostics['sampling_step'],
+                        value_diagnostics['layers'], retained_labels,
+                        anchor_index)
+                    logging.info(
+                        "Value RMS M per retained frame: %s",
+                        format_metric(value_diagnostics['m_rms']))
+                    logging.info(
+                        "Value RMS J per retained frame: %s",
+                        format_metric(value_diagnostics['j_rms']))
+                    logging.info(
+                        "Value RMS J-M per retained frame: %s",
+                        format_metric(value_diagnostics['delta_rms']))
+                    logging.info(
+                        "Value RMS J/M ratio per retained frame: %s; "
+                        "J anchor RMS=%.4f",
+                        format_metric(value_diagnostics['j_over_m']),
+                        value_diagnostics['j_anchor_rms'])
+                if image_condition_paired_anchor_attention:
+                    noise_pred_cond = assemble_paired_prediction(
+                        predictions_cond)
+                    del predictions_cond
+                elif image_condition_self_attention_guidance:
+                    expected_predictions = (
+                        3 if self_attention_guidance_active else 2)
+                    if len(predictions_cond) != expected_predictions:
+                        raise RuntimeError(
+                            "self-attention guidance returned the wrong "
+                            "number of conditional predictions")
+                    suffix_prediction_cond = predictions_cond[
+                        2 if self_attention_guidance_active else 1]
+                    if (suffix_prediction_cond.size(1) !=
+                            guidance_local_latent_frame_num):
+                        raise RuntimeError(
+                            "B conditional prediction has the "
+                            "wrong temporal length")
+                    noise_pred_cond = predictions_cond[0].clone()
+                    noise_pred_cond[:, anchor_index:anchor_index + 1].copy_(
+                        suffix_prediction_cond[:, :1])
+                    del suffix_prediction_cond
+                    del predictions_cond
+                else:
+                    noise_pred_cond = predictions_cond[0]
+                    del predictions_cond
                 if offload_model:
                     torch.cuda.empty_cache()
                 predictions_uncond = model(
-                    latent_model_input, t=timestep, **arg_null)
-                noise_pred_uncond = predictions_uncond[0]
-                del predictions_uncond
+                    latent_model_input, t=timestep, **current_arg_null)
+                if image_condition_paired_anchor_attention:
+                    noise_pred_uncond = assemble_paired_prediction(
+                        predictions_uncond)
+                    del predictions_uncond
+                elif image_condition_self_attention_guidance:
+                    expected_predictions = (
+                        3 if self_attention_guidance_active else 2)
+                    if len(predictions_uncond) != expected_predictions:
+                        raise RuntimeError(
+                            "self-attention guidance returned the wrong "
+                            "number of unconditional predictions")
+                    suffix_prediction_uncond = predictions_uncond[
+                        2 if self_attention_guidance_active else 1]
+                    if (suffix_prediction_uncond.size(1) !=
+                            guidance_local_latent_frame_num):
+                        raise RuntimeError(
+                            "B unconditional prediction has the "
+                            "wrong temporal length")
+                    noise_pred_uncond = predictions_uncond[0].clone()
+                    noise_pred_uncond[:,
+                                      anchor_index:anchor_index + 1].copy_(
+                                          suffix_prediction_uncond[:, :1])
+                    del suffix_prediction_uncond
+                    del predictions_uncond
+                else:
+                    noise_pred_uncond = predictions_uncond[0]
+                    del predictions_uncond
                 if offload_model:
                     torch.cuda.empty_cache()
                 noise_pred = noise_pred_uncond + sample_guide_scale * (
@@ -702,6 +1001,8 @@ class WanI2V:
 
                 x0 = [latent]
                 del latent_model_input, timestep
+                if image_condition_self_attention_guidance:
+                    del current_latent
 
             if offload_model:
                 self.low_noise_model.cpu()
@@ -710,7 +1011,7 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
-                if image_condition_paired_anchor_attention:
+                if multi_stream_mode:
                     retained_x0 = torch.cat([
                         x0[0][:, :anchor_index],
                         x0[0][:, anchor_index + 1:]
