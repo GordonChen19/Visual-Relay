@@ -245,19 +245,23 @@ def paired_anchor_attention(
     window_size=(-1, -1),
     dtype=torch.bfloat16,
 ):
-    """Two-stream B/C routing with an always-hidden C transport slot.
+    """B/C routing with a joint-conditioned first-suffix proxy H.
 
-    C is Img1-only; B is Img2-first. Prefix queries read ordinary C frames.
-    Retained suffix updates blend C and B. B0 supplies the transport update.
+    C is Img1-only and its temporary anchor is hidden. H is a second
+    representation of C's first retained suffix frame, initialized from the
+    same noisy latent but conditioned by the joint Img1/Img2 VAE encoding.
+    Prefix queries use H K/V in place of regular C at that aligned frame.
+    Retained C suffix queries use ordinary C and blend with aligned B output.
+    H receives B1's attention update, but its final prediction is discarded.
     ``prefix_anchor_active`` is retained for API compatibility and ignored.
     """
     if window_size != (-1, -1):
         raise ValueError("paired anchor attention requires global attention")
     if freqs is None:
         raise ValueError("paired anchor attention requires RoPE frequencies")
-    if q.size(0) != 2 or len(seq_lens) != 2 or len(grid_sizes) != 2:
+    if q.size(0) != 3 or len(seq_lens) != 3 or len(grid_sizes) != 3:
         raise ValueError(
-            "paired anchor attention requires B and C streams")
+            "paired anchor attention requires B, C, and H streams")
     if not 0.0 <= stream_weight <= 1.0:
         raise ValueError("paired stream weight must be between zero and one")
 
@@ -265,19 +269,26 @@ def paired_anchor_attention(
         int(value) for value in grid_sizes[0].tolist())
     joint_frames, joint_height, joint_width = (
         int(value) for value in grid_sizes[1].tolist())
+    proxy_frames, proxy_height, proxy_width = (
+        int(value) for value in grid_sizes[2].tolist())
     anchor_index = int(anchor_index)
     if not 0 < anchor_index < joint_frames - 1:
         raise ValueError("paired anchor must follow a non-empty prefix")
     if (suffix_height, suffix_width) != (joint_height, joint_width):
         raise ValueError("paired streams must have identical spatial grids")
+    if ((proxy_height, proxy_width) != (joint_height, joint_width)
+            or proxy_frames != 1):
+        raise ValueError("paired H proxy must contain one aligned frame")
     if suffix_frames != joint_frames - anchor_index:
         raise ValueError("paired B stream must align with the C suffix")
 
     tokens_per_frame = joint_height * joint_width
     suffix_seq_len = suffix_frames * tokens_per_frame
     joint_seq_len = joint_frames * tokens_per_frame
+    proxy_seq_len = tokens_per_frame
     if (suffix_seq_len != int(seq_lens[0])
-            or joint_seq_len != int(seq_lens[1])):
+            or joint_seq_len != int(seq_lens[1])
+            or proxy_seq_len != int(seq_lens[2])):
         raise ValueError("paired stream grid and sequence lengths disagree")
 
     suffix_q = q[0:1, :suffix_seq_len]
@@ -286,9 +297,14 @@ def paired_anchor_attention(
     joint_q = q[1:2, :joint_seq_len]
     joint_k = k[1:2, :joint_seq_len]
     joint_v = v[1:2, :joint_seq_len]
+    proxy_k = k[2:3, :proxy_seq_len]
+    proxy_v = v[2:3, :proxy_seq_len]
 
-    # Remove the transport gap in retained Q/K coordinates. The transport
-    # slot has no C query route and is never used as C key/value memory.
+    # Compress retained C suffix positions left across the hidden transport
+    # slot. H begins with local position zero, so shift its key to the same
+    # compressed global position as regular C[anchor+1]. Prefix attention uses
+    # H at that coordinate and omits the regular copy, avoiding duplicate
+    # softmax mass at one temporal position.
     anchor_frame_start = anchor_index * tokens_per_frame
     anchor_frame_end = anchor_frame_start + tokens_per_frame
     compressed_suffix_q = _shift_temporal_rope(
@@ -297,6 +313,8 @@ def paired_anchor_attention(
         joint_k[:, anchor_frame_end:joint_seq_len], -1, freqs)
     positioned_joint_suffix_k = compressed_suffix_k
     joint_suffix_v = joint_v[:, anchor_frame_end:joint_seq_len]
+    positioned_proxy_k = _shift_temporal_rope(
+        proxy_k, anchor_index, freqs)
 
     # B remains an independent Img2-first reference stream and evolves normally.
     suffix_output = flash_attention(
@@ -310,12 +328,14 @@ def paired_anchor_attention(
     joint_suffix_query_start = anchor_start + tokens_per_frame
     img2_suffix_output = suffix_output[:, tokens_per_frame:suffix_seq_len]
 
-    # Prefix queries read only ordinary C K/V, never the transport slot.
+    # Prefix queries read C prefix, H in place of the first regular suffix
+    # frame, and the remaining ordinary C suffix frames. The transport anchor
+    # and regular C[anchor+1] are both absent from this route.
     if not 0.0 <= prefix_future_eta <= 1.0:
         raise ValueError("prefix future eta must be in [0, 1]")
     if prefix_future_eta > 0:
-        # Frame-dependent grouping: own/earlier prefix versus later prefix
-        # plus all ordinary C suffix tokens. The temporary anchor is always excluded.
+        # Frame-dependent grouping: own/earlier prefix versus later prefix,
+        # the H proxy, and ordinary C frames after the proxied frame.
         prefix_parts = []
         for frame in range(anchor_index):
             start = frame * tokens_per_frame
@@ -327,9 +347,12 @@ def paired_anchor_attention(
             future_output, future_lse = flash_attention(
                 q=query,
                 k=torch.cat([joint_k[:, end:anchor_start],
-                             positioned_joint_suffix_k], dim=1),
+                             positioned_proxy_k,
+                             positioned_joint_suffix_k[:, tokens_per_frame:]],
+                            dim=1),
                 v=torch.cat([joint_v[:, end:anchor_start],
-                             joint_suffix_v], dim=1),
+                             proxy_v,
+                             joint_suffix_v[:, tokens_per_frame:]], dim=1),
                 window_size=window_size, dtype=dtype, return_lse=True)
             weight = torch.sigmoid(future_lse - past_lse)
             weight = weight + prefix_future_eta * weight * (1.0 - weight)
@@ -342,11 +365,13 @@ def paired_anchor_attention(
     else:
         prefix_k = torch.cat([
             joint_k[:, :anchor_start],
-            positioned_joint_suffix_k,
+            positioned_proxy_k,
+            positioned_joint_suffix_k[:, tokens_per_frame:],
         ], dim=1)
         prefix_v = torch.cat([
             joint_v[:, :anchor_start],
-            joint_suffix_v,
+            proxy_v,
+            joint_suffix_v[:, tokens_per_frame:],
         ], dim=1)
         prefix_output = flash_attention(
             q=joint_q[:, :anchor_start],
@@ -360,6 +385,12 @@ def paired_anchor_attention(
     # cross-attention, and FFN remain in the primary stream, and its final
     # velocity is replaced by B0 after the model call.
     anchor_output = suffix_output[:, :tokens_per_frame]
+
+    # H is aligned with B1, the first retained suffix frame. Reusing B1's
+    # complete attention update lets the proxy evolve with Img2-first suffix
+    # context at every layer without treating B0 (the removed anchor) as if it
+    # were the same frame.
+    proxy_output = suffix_output[:, tokens_per_frame:2 * tokens_per_frame]
 
     # Each retained C-suffix query attends to every ordinary C frame, with the
     # temporary anchor excluded. B independently supplies its Img2-first suffix
@@ -403,7 +434,13 @@ def paired_anchor_attention(
             joint_output.new_zeros(
                 1, padded_len - joint_seq_len, *joint_output.shape[2:])
         ], dim=1)
-    return torch.cat([suffix_output, joint_output], dim=0)
+    if proxy_seq_len < padded_len:
+        proxy_output = torch.cat([
+            proxy_output,
+            proxy_output.new_zeros(
+                1, padded_len - proxy_seq_len, *proxy_output.shape[2:])
+        ], dim=1)
+    return torch.cat([suffix_output, joint_output, proxy_output], dim=0)
 
 
 @torch.amp.autocast('cuda', enabled=False)

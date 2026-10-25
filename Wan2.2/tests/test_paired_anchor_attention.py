@@ -15,7 +15,7 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
     @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_prefix_future_nudge_matches_dense_framewise_reference(self):
         generator = torch.Generator().manual_seed(42)
-        q = torch.randn(2, 10, 2, 4, generator=generator)
+        q = torch.randn(3, 10, 2, 4, generator=generator)
         k = torch.randn(2, 10, 2, 4, generator=generator)
         v = torch.randn(2, 10, 2, 4, generator=generator)
         # C: five frames, two spatial tokens each; anchor at frame 2.
@@ -32,12 +32,14 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
                   mock.patch.object(attention, '_shift_temporal_rope',
                                     side_effect=lambda x, *args: x)):
                 output = attention.paired_anchor_attention(
-                    q, k, v, torch.tensor([6, 10]),
-                    torch.tensor([[3, 1, 2], [5, 1, 2]]),
+                    q, k, v, torch.tensor([6, 10, 2]),
+                    torch.tensor([[3, 1, 2], [5, 1, 2], [1, 1, 2]]),
                     torch.ones(10, 2, dtype=torch.complex64), 2,
                     prefix_anchor_active=False, prefix_future_eta=eta)
-            keys = torch.cat([k[1:2, :4], k[1:2, 6:10]], dim=1)
-            values = torch.cat([v[1:2, :4], v[1:2, 6:10]], dim=1)
+            # Prefix memory is C0:C2, H, then C4:C5. C2 is the hidden
+            # transport slot and C3 is the regular copy replaced by H.
+            keys = torch.cat([k[1:2, :4], k[2:3, :2], k[1:2, 8:10]], dim=1)
+            values = torch.cat([v[1:2, :4], v[2:3, :2], v[1:2, 8:10]], dim=1)
             for frame in range(2):
                 query = q[1:2, frame * 2:(frame + 1) * 2]
                 logits = torch.einsum('bqhd,bkhd->bhqk', query, keys) / 2.0
@@ -276,14 +278,16 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
             shifted.flatten().tolist(), [0.0, 1.0, -3.0, -7.0, -6.0])
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
-    def test_two_stream_prefix_hides_transport_and_uses_c_suffix(self):
-        q = torch.zeros(2, 4, 1, 2)
+    def test_paired_prefix_uses_joint_proxy_but_regular_frame_velocity(self):
+        q = torch.zeros(3, 4, 1, 2)
         k = torch.zeros_like(q)
         v = torch.zeros_like(q)
         k[0, :2, 0, 0] = torch.tensor([30., 31.])
         v[0, :2, 0, 0] = torch.tensor([40., 41.])
         k[1, :, 0, 0] = torch.tensor([50., 51., 52., 53.])
         v[1, :, 0, 0] = torch.tensor([60., 61., 62., 63.])
+        k[2, 0, 0, 0] = 70.
+        v[2, 0, 0, 0] = 80.
         for legacy_anchor_flag in (True, False):
             calls = []
             def fake_flash(q, k, v, **kwargs):
@@ -293,18 +297,28 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
                   mock.patch.object(attention, '_shift_temporal_rope',
                                     side_effect=lambda x, shift, f: x + 100 * shift)):
                 output = attention.paired_anchor_attention(
-                    q, k, v, torch.tensor([2, 4]),
-                    torch.tensor([[2, 1, 1], [4, 1, 1]]),
+                    q, k, v, torch.tensor([2, 4, 1]),
+                    torch.tensor([[2, 1, 1], [4, 1, 1], [1, 1, 1]]),
                     torch.ones(4, 1, dtype=torch.complex64), 2,
                     stream_weight=0.25, prefix_anchor_active=legacy_anchor_flag)
             self.assertEqual(len(calls), 3)
-            # Prefix and suffix both read C0, C1, compressed C3, never C2.
-            for call in calls[1:]:
-                self.assertEqual(call[1][0, :, 0, 0].tolist(), [50., 51., -47.])
-                self.assertEqual(call[2][0, :, 0, 0].tolist(), [60., 61., 63.])
+            # Prefix reads C0, C1 and H (shifted to C3's compressed
+            # coordinate). It reads neither transport C2 nor regular C3.
+            self.assertEqual(
+                calls[1][1][0, :, 0, 0].tolist(), [50., 51., 270.])
+            self.assertEqual(
+                calls[1][2][0, :, 0, 0].tolist(), [60., 61., 80.])
+            # C suffix uses ordinary C, including regular C3, and excludes C2.
+            self.assertEqual(
+                calls[2][1][0, :, 0, 0].tolist(), [50., 51., -47.])
+            self.assertEqual(
+                calls[2][2][0, :, 0, 0].tolist(), [60., 61., 63.])
             self.assertEqual(output.shape, q.shape)
-            # B output=1, C prefix=2, C suffix=.75*3+.25*1=2.5.
+            # B output=1, C prefix=2, hidden slot=B0=1, C suffix=2.5,
+            # and H receives aligned B1 output=1. H's prediction is discarded
+            # by image2video.py rather than copied into regular C3.
             self.assertEqual(output[1, :, 0, 0].tolist(), [2., 2., 1., 2.5])
+            self.assertEqual(output[2, 0, 0, 0].item(), 1.)
 
 
 if __name__ == '__main__':

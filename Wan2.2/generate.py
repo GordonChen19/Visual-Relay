@@ -314,10 +314,10 @@ def _parse_args():
     parser.add_argument(
         "--image_condition_paired_anchor_attention",
         action="store_true",
-        help=("Use Img1-only C and aligned Img2-first B. Ordinary C frames "
-              "attend all ordinary C frames, excluding the temporary slot. "
-              "C suffix updates blend with B; B0 supplies the temporary "
-              "slot's update and velocity. No joint multi-image encoding."))
+        help=("Use Img1-only C, aligned Img2-first B, and a one-frame joint "
+              "proxy H for C's first retained suffix frame. Prefix queries "
+              "use H instead of regular C at that frame; H's final prediction "
+              "is discarded, so the retained velocity comes from regular C."))
     parser.add_argument(
         "--image_condition_self_attention_guidance",
         action="store_true",
@@ -397,8 +397,7 @@ def _parse_args():
         "--image_condition_paired_prefix_route_switch_step",
         type=int,
         default=None,
-        help=("Legacy compatibility option; no effect in paired mode because "
-              "the temporary slot is always excluded from C attention."))
+        help="Legacy compatibility option; currently ignored in paired mode.")
     parser.add_argument(
         "--sample_solver",
         type=str,

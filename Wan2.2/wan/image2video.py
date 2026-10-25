@@ -299,10 +299,11 @@ class WanI2V:
                 In paired mode, use ``[0, anchor]`` to align Img2 with the
                 requested latent frame in the full Img1 stream.
             image_condition_paired_anchor_attention (`bool`, *optional*):
-                Enable Img1-only C and fresh-cache Img2-first B. C-prefix
-                queries read every ordinary C frame, excluding the transport
-                slot. There is no joint encoding or D stream. B0 supplies
-                the transport slot's attention output and predicted velocity.
+                Enable Img1-only C, fresh-cache Img2-first B, and a one-frame
+                joint-conditioned proxy H for C's first retained suffix
+                frame. Prefix queries use H in place of regular C at that
+                frame. H never supplies a scheduler prediction; the retained
+                frame's final velocity always comes from regular C.
             image_condition_paired_stream_weight (`float`, *optional*):
                 Fixed weight assigned to the full Img2 suffix-attention output
                 when paired mode fuses it with C's suffix continuity output.
@@ -323,8 +324,7 @@ class WanI2V:
             image_condition_paired_suffix_fade_end_step (`int`, *optional*):
                 Stream-B-suffix-only fade end.
             image_condition_paired_prefix_route_switch_step (`int`, *optional*):
-                Legacy compatibility option; ignored because C always hides
-                the temporary slot from all ordinary attention queries.
+                Legacy compatibility option; currently ignored.
             image_condition_self_attention_guidance (`bool`, *optional*):
                 Run expanded Img1-only M, joint Img1/Img2 J, standard
                 Img2-first suffix B. J provides the single anchor used by
@@ -570,30 +570,49 @@ class WanI2V:
             encoded = self.vae.encode([
                 conditioning_video(imgs[0], F),
                 conditioning_video(imgs[1], suffix_frame_num),
+                joint_anchor_conditioning_video(
+                    imgs[0], imgs[1], expanded_frame_num, anchor_index),
             ])
             if (encoded[0].size(1) != latent_frame_num
-                    or encoded[1].size(1) != suffix_latent_frame_num):
+                    or encoded[1].size(1) != suffix_latent_frame_num
+                    or encoded[2].size(1) != model_latent_frame_num):
                 raise RuntimeError("paired B/C conditioning lengths do not align")
             expanded_msk = insert_latent_slot(msk, anchor_index)
             expanded_main = insert_latent_slot(encoded[0], anchor_index)
-            # Transport slot only: never expose it as a conditioning anchor.
+            # C's inserted slot is transport only and is absent from retained
+            # attention. Every retained C frame therefore stays Img1-only.
             expanded_msk[:, anchor_index:anchor_index + 1].zero_()
             expanded_main[:, anchor_index:anchor_index + 1].zero_()
+            # H is a second representation of the first retained suffix frame
+            # (expanded index anchor+1), not a second Img2-anchor token. It
+            # carries that frame's joint causal-VAE history but shares the
+            # exact same noisy latent as regular C at every denoising step.
+            joint_mask = first_frame_mask(expanded_frame_num)
+            joint_mask[:, anchor_index:anchor_index + 1].fill_(1)
+            proxy_index = anchor_index + 1
+            proxy_y = torch.concat([
+                joint_mask[:, proxy_index:proxy_index + 1],
+                encoded[2][:, proxy_index:proxy_index + 1],
+            ])
             suffix_y = torch.concat([
                 first_frame_mask(suffix_frame_num), encoded[1]
             ])
             hybrid_y = torch.concat([expanded_msk, expanded_main])
-            del encoded, expanded_msk, expanded_main
+            del encoded, expanded_msk, expanded_main, joint_mask
             logging.info(
-                "Paired two-stream attention: Img1-only C and fresh-cache "
-                "Img2-first B; no joint encoding or D stream. C prefix reads "
-                "every ordinary C frame, excluding transport slot %d; "
+                "Paired proxy attention: Img1-only C, fresh-cache Img2-first "
+                "B, and one-frame joint-conditioned H aligned to retained "
+                "frame %d. C transport slot %d is hidden. Prefix queries use "
+                "H instead of regular C%d, then read later ordinary C frames; "
                 "framewise future eta=%.3f. Retained C suffix blends C/B "
-                "attention at weight %.3f. The transport slot receives B0 "
-                "attention and velocity and is removed before decoding. "
-                "Prefix route-switch is inactive because the slot is always hidden",
-                anchor_index, image_condition_paired_prefix_future_eta,
-                image_condition_paired_stream_weight)
+                "attention at weight %.3f. H receives aligned B1 attention "
+                "each layer, but H's final prediction is discarded; regular "
+                "C%d supplies the retained frame velocity. B0 still supplies "
+                "the hidden transport velocity, which is removed before "
+                "decoding",
+                proxy_index, anchor_index, proxy_index,
+                image_condition_paired_prefix_future_eta,
+                image_condition_paired_stream_weight, proxy_index)
             if suffix_fade_start_step is not None:
                 logging.info("B suffix weight cosine fade: steps %d through %d",
                              suffix_fade_start_step, suffix_fade_end_step)
@@ -708,9 +727,9 @@ class WanI2V:
 
             if image_condition_paired_anchor_attention:
                 arg_c = {
-                    'context': [context[0], context[0]],
+                    'context': [context[0], context[0], context[0]],
                     'seq_len': max_seq_len,
-                    'y': [suffix_y, hybrid_y],
+                    'y': [suffix_y, hybrid_y, proxy_y],
                     'paired_anchor_index': anchor_index,
                     'paired_stream_weight': image_condition_paired_stream_weight,
                     'paired_prefix_anchor_active': True,
@@ -718,9 +737,10 @@ class WanI2V:
                     image_condition_paired_prefix_future_eta,
                 }
                 arg_null = {
-                    'context': [context_null[0], context_null[0]],
+                    'context': [context_null[0], context_null[0],
+                                context_null[0]],
                     'seq_len': max_seq_len,
-                    'y': [suffix_y, hybrid_y],
+                    'y': [suffix_y, hybrid_y, proxy_y],
                     'paired_anchor_index': anchor_index,
                     'paired_stream_weight': image_condition_paired_stream_weight,
                     'paired_prefix_anchor_active': True,
@@ -802,12 +822,15 @@ class WanI2V:
                 return 0.5 * (1.0 + math.cos(math.pi * fade_progress))
 
             def assemble_paired_prediction(predictions):
-                if len(predictions) != 2:
-                    raise RuntimeError("paired model must return B and C predictions")
-                suffix_prediction, hybrid_prediction = predictions
+                if len(predictions) != 3:
+                    raise RuntimeError(
+                        "paired model must return B, C, and H predictions")
+                suffix_prediction, hybrid_prediction, proxy_prediction = predictions
                 if (suffix_prediction.size(1) != suffix_latent_frame_num
-                        or hybrid_prediction.size(1) != model_latent_frame_num):
-                    raise RuntimeError("paired prediction lengths do not match B/C")
+                        or hybrid_prediction.size(1) != model_latent_frame_num
+                        or proxy_prediction.size(1) != 1):
+                    raise RuntimeError(
+                        "paired prediction lengths do not match B/C/H")
                 # Reproduce the early local-anchor routing at prediction
                 # level: after all DiT layers, substitute B0's Img2-first
                 # velocity for the temporary C anchor. This happens
@@ -817,6 +840,9 @@ class WanI2V:
                 hybrid_prediction = hybrid_prediction.clone()
                 hybrid_prediction[:, anchor_index:anchor_index + 1].copy_(
                     suffix_prediction[:, :1])
+                # H is attention memory only. In particular, never copy its
+                # prediction into regular C[anchor+1]; the scheduler uses C's
+                # own prediction for that retained frame.
                 return hybrid_prediction
 
             for sampling_step, t in enumerate(tqdm(timesteps)):
@@ -838,8 +864,10 @@ class WanI2V:
                     latent_model_input = [
                         latent[:, anchor_index:].to(self.device),
                         latent.to(self.device),
+                        latent[:, anchor_index + 1:anchor_index + 2].to(
+                            self.device),
                     ]
-                    timestep = [t, t]
+                    timestep = [t, t, t]
                 elif image_condition_self_attention_guidance:
                     current_latent = latent.to(self.device)
                     self_attention_guidance_active = (
