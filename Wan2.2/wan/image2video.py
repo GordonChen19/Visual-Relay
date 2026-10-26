@@ -770,29 +770,20 @@ class WanI2V:
                     'self_attention_guidance_rms_cap': None,
                     'attention_guidance_anchor_index': anchor_index,
                 }
-                m_b_arg_null = {
-                    'context': [context_null[0], context_null[0]],
+                arg_null = {
+                    'context': [context_null[0]],
                     'seq_len': max_seq_len,
-                    'y': [primary_y, guidance_local_y],
+                    'y': [primary_y],
                     'self_attention_guidance_scale': 0.0,
-                    'self_attention_guidance_img2_weight':
-                    image_condition_self_attention_guidance_img2_weight,
+                    'self_attention_guidance_img2_weight': 0.0,
                     'self_attention_guidance_rms_cap': None,
                     'attention_guidance_anchor_index': anchor_index,
                 }
-                arg_null = {
-                    'context': [context_null[0], context_null[0],
-                                context_null[0]],
-                    'seq_len': max_seq_len,
-                    'y': [primary_y, joint_y, guidance_local_y],
-                    'self_attention_guidance_scale':
-                    image_condition_self_attention_guidance_scale,
-                    'self_attention_guidance_img2_weight':
-                    image_condition_self_attention_guidance_img2_weight,
-                    'self_attention_guidance_rms_cap':
-                    image_condition_self_attention_guidance_rms_cap,
-                    'attention_guidance_anchor_index': anchor_index,
-                }
+                logging.info(
+                    "Self-attention guidance applies only to the conditional "
+                    "CFG call. The negative-prompt call runs Img1-only M "
+                    "throughout sampling, with no J/B guidance or B0 "
+                    "anchor-velocity substitution")
             else:
                 arg_c = {
                     'context': [context[0]],
@@ -893,7 +884,6 @@ class WanI2V:
                         ]
                         timestep = [t, t]
                         current_arg_c = m_b_arg_c
-                        current_arg_null = m_b_arg_null
                         if (sampling_step ==
                                 image_condition_self_attention_guidance_stop_step):
                             logging.info(
@@ -983,31 +973,31 @@ class WanI2V:
                     del predictions_cond
                 if offload_model:
                     torch.cuda.empty_cache()
+                # The ablation's negative CFG branch always runs M alone.
+                # Keep the shared expanded layout and compressed RoPE, while
+                # isolating its temporary slot from retained-frame attention.
+                uncond_model_input = (
+                    [current_latent] if image_condition_self_attention_guidance
+                    else latent_model_input)
+                uncond_timestep = (
+                    timestep[:1] if image_condition_self_attention_guidance
+                    else timestep)
                 predictions_uncond = model(
-                    latent_model_input, t=timestep, **current_arg_null)
+                    uncond_model_input, t=uncond_timestep, **current_arg_null)
+                del uncond_model_input, uncond_timestep
                 if image_condition_paired_anchor_attention:
                     noise_pred_uncond = assemble_paired_prediction(
                         predictions_uncond)
                     del predictions_uncond
                 elif image_condition_self_attention_guidance:
-                    expected_predictions = (
-                        3 if self_attention_guidance_active else 2)
-                    if len(predictions_uncond) != expected_predictions:
+                    if len(predictions_uncond) != 1:
                         raise RuntimeError(
-                            "self-attention guidance returned the wrong "
-                            "number of unconditional predictions")
-                    suffix_prediction_uncond = predictions_uncond[
-                        2 if self_attention_guidance_active else 1]
-                    if (suffix_prediction_uncond.size(1) !=
-                            guidance_local_latent_frame_num):
+                            "Img1-only negative CFG call must return only M")
+                    if predictions_uncond[0].size(1) != model_latent_frame_num:
                         raise RuntimeError(
-                            "B unconditional prediction has the "
+                            "M unconditional prediction has the "
                             "wrong temporal length")
-                    noise_pred_uncond = predictions_uncond[0].clone()
-                    noise_pred_uncond[:,
-                                      anchor_index:anchor_index + 1].copy_(
-                                          suffix_prediction_uncond[:, :1])
-                    del suffix_prediction_uncond
+                    noise_pred_uncond = predictions_uncond[0]
                     del predictions_uncond
                 else:
                     noise_pred_uncond = predictions_uncond[0]
