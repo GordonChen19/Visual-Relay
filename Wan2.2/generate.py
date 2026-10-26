@@ -337,9 +337,8 @@ def _parse_args():
         "--image_condition_self_attention_guidance_img2_weight",
         type=float,
         default=0.25,
-        help=("B1: suffix-output weight used only after the J stop-step "
-              "handoff. Before the handoff, suffix fusion is M/J only "
-              "(default: 0.25)."))
+        help=("Legacy compatibility option; unused by the self-attention "
+              "guidance ablation, which switches to pure M at stop_step."))
     parser.add_argument(
         "--image_condition_self_attention_guidance_rms_cap",
         type=float,
@@ -350,9 +349,9 @@ def _parse_args():
         "--image_condition_self_attention_guidance_stop_step",
         type=int,
         default=None,
-        help=("Optional zero-based sampling step at which J guidance stops. "
-              "Afterward M continues with B suffix guidance and B0 anchor "
-              "velocity replacement."))
+        help=("Optional zero-based sampling step at which J and B stop. "
+              "Afterward both CFG calls use Img1-only M, with no guidance "
+              "or anchor velocity replacement."))
     parser.add_argument(
         "--image_condition_paired_prefix_future_eta",
         type=float, default=0.0,

@@ -336,14 +336,14 @@ class WanI2V:
             image_condition_self_attention_guidance_scale (`float`, *optional*):
                 Per-layer weight of J's completed attention output.
             image_condition_self_attention_guidance_img2_weight (`float`, *optional*):
-                Weight of aligned B1: outputs in M's suffix fusion.
+                Legacy compatibility option; unused by this ablation.
             image_condition_self_attention_guidance_rms_cap (`float`, *optional*):
                 Optional per-frame, per-head J-M attention residual RMS cap,
                 expressed relative to M's attention-output RMS.
             image_condition_self_attention_guidance_stop_step (`int`, *optional*):
-                Zero-based sampling step at which J is removed. At and after
-                this step, B continues guiding M's suffix and supplying the
-                anchor velocity while M's temporary slot stays isolated.
+                Zero-based sampling step at which J and B are removed. Both
+                CFG calls then use Img1-only M with no guidance or anchor
+                velocity substitution. The temporary slot stays isolated.
 
         Returns:
             torch.Tensor:
@@ -664,17 +664,15 @@ class WanI2V:
                 "J's anchor "
                 "aligns J with M's retained positions. Before handoff, both "
                 "prefix and suffix M use M/J weights %.3f/%.3f and B1: is "
-                "excluded. After handoff, suffix M uses M/B weights "
-                "%.3f/%.3f. B0's predicted "
-                "velocity replaces M's temporary anchor velocity after each "
-                "active model call; the slot is discarded before decoding. "
-                "J-to-M handoff step (M/B continue): %s",
+                "excluded. After handoff, both CFG calls use Img1-only M "
+                "without J/B guidance. B0's predicted velocity replaces M's "
+                "temporary anchor velocity only in conditional calls before "
+                "handoff; the slot is discarded before decoding. "
+                "Guidance stop step: %s",
                 model_latent_frame_num, anchor_index,
                 guidance_local_latent_frame_num,
                 (1.0 - image_condition_self_attention_guidance_scale),
                 image_condition_self_attention_guidance_scale,
-                (1.0 - image_condition_self_attention_guidance_img2_weight),
-                image_condition_self_attention_guidance_img2_weight,
                 ("disabled" if
                  image_condition_self_attention_guidance_stop_step is None
                  else str(image_condition_self_attention_guidance_stop_step)))
@@ -760,13 +758,12 @@ class WanI2V:
                     image_condition_self_attention_guidance_rms_cap,
                     'attention_guidance_anchor_index': anchor_index,
                 }
-                m_b_arg_c = {
-                    'context': [context[0], context[0]],
+                m_only_arg_c = {
+                    'context': [context[0]],
                     'seq_len': max_seq_len,
-                    'y': [primary_y, guidance_local_y],
+                    'y': [primary_y],
                     'self_attention_guidance_scale': 0.0,
-                    'self_attention_guidance_img2_weight':
-                    image_condition_self_attention_guidance_img2_weight,
+                    'self_attention_guidance_img2_weight': 0.0,
                     'self_attention_guidance_rms_cap': None,
                     'attention_guidance_anchor_index': anchor_index,
                 }
@@ -875,22 +872,18 @@ class WanI2V:
                         ]
                         timestep = [t, t, t]
                     else:
-                        # J handoff: keep M and the aligned Img2-first B.
-                        # M prefix stays pure M while B continues to guide M's
-                        # suffix and supplies B0's anchor velocity.
-                        latent_model_input = [
-                            current_latent,
-                            current_latent[:, anchor_index:],
-                        ]
-                        timestep = [t, t]
-                        current_arg_c = m_b_arg_c
+                        # Pure Img1 I2V on retained positions. The isolated
+                        # transport slot remains only for scheduler layout.
+                        latent_model_input = [current_latent]
+                        timestep = [t]
+                        current_arg_c = m_only_arg_c
                         if (sampling_step ==
                                 image_condition_self_attention_guidance_stop_step):
                             logging.info(
                                 "Self-attention guidance stopped at sampling "
-                                "step %d: Stream J is disabled; Stream B "
-                                "continues suffix guidance and B0 anchor "
-                                "velocity replacement",
+                                "step %d: J and B are disabled; both CFG "
+                                "calls run Img1-only M with no attention "
+                                "guidance or anchor velocity replacement",
                                 sampling_step)
                 else:
                     latent_model_input = [latent.to(self.device)]
@@ -951,22 +944,23 @@ class WanI2V:
                     del predictions_cond
                 elif image_condition_self_attention_guidance:
                     expected_predictions = (
-                        3 if self_attention_guidance_active else 2)
+                        3 if self_attention_guidance_active else 1)
                     if len(predictions_cond) != expected_predictions:
                         raise RuntimeError(
                             "self-attention guidance returned the wrong "
                             "number of conditional predictions")
-                    suffix_prediction_cond = predictions_cond[
-                        2 if self_attention_guidance_active else 1]
-                    if (suffix_prediction_cond.size(1) !=
-                            guidance_local_latent_frame_num):
-                        raise RuntimeError(
-                            "B conditional prediction has the "
-                            "wrong temporal length")
-                    noise_pred_cond = predictions_cond[0].clone()
-                    noise_pred_cond[:, anchor_index:anchor_index + 1].copy_(
-                        suffix_prediction_cond[:, :1])
-                    del suffix_prediction_cond
+                    noise_pred_cond = predictions_cond[0]
+                    if self_attention_guidance_active:
+                        suffix_prediction_cond = predictions_cond[2]
+                        if (suffix_prediction_cond.size(1) !=
+                                guidance_local_latent_frame_num):
+                            raise RuntimeError(
+                                "B conditional prediction has the "
+                                "wrong temporal length")
+                        noise_pred_cond = noise_pred_cond.clone()
+                        noise_pred_cond[:, anchor_index:anchor_index + 1].copy_(
+                            suffix_prediction_cond[:, :1])
+                        del suffix_prediction_cond
                     del predictions_cond
                 else:
                     noise_pred_cond = predictions_cond[0]
