@@ -321,12 +321,11 @@ def _parse_args():
     parser.add_argument(
         "--image_condition_self_attention_guidance",
         action="store_true",
-        help=("Run expanded Img1-only M, joint Img1/Img2 J, standard "
-              "Img2-first suffix B, and one-frame bridge-anchor H. M's "
-              "temporary slot is excluded from attention. J prefix sees its joint "
-              "anchor while J suffix sees H; H reads itself plus J's suffix. "
-              "After alignment, M prefix blends M/J while M suffix blends "
-              "M/J/B1:; B0 replaces the temporary anchor velocity."))
+        help=("Run expanded Img1-only M, joint Img1/Img2 J, and standard "
+              "Img2-first suffix B in both CFG branches. M's temporary slot "
+              "is excluded from attention. Removing J's anchor aligns its "
+              "retained attention output with M for M/J guidance; B0 replaces "
+              "the temporary anchor velocity before CFG."))
     parser.add_argument(
         "--image_condition_self_attention_guidance_scale",
         type=float,
