@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import math
+
 import torch
 
 try:
@@ -229,6 +231,50 @@ def flash_attention(
     else:
         raise RuntimeError("unexpected FlashAttention LSE rank")
     return x, softmax_lse.float()
+
+
+def _duplicate_position_attention(
+    q,
+    ordinary_k,
+    ordinary_v,
+    duplicate_k,
+    duplicate_v,
+    window_size=(-1, -1),
+    dtype=torch.bfloat16,
+):
+    """Attend to one ordinary group and one duplicated temporal position.
+
+    ``duplicate_k``/``duplicate_v`` contain two frame representations that
+    intentionally share one temporal RoPE coordinate. Subtracting ``log(2)``
+    from that group's LSE is exactly equivalent to applying the same negative
+    logit bias to every token in the pair. It removes the pair's automatic
+    factor-of-two softmax-mass advantage without changing the learned
+    preference between its two representations.
+    """
+    if ordinary_k.size(1) == 0 or duplicate_k.size(1) == 0:
+        raise ValueError(
+            "duplicate-position attention requires two non-empty groups")
+    ordinary_output, ordinary_lse = flash_attention(
+        q=q,
+        k=ordinary_k,
+        v=ordinary_v,
+        window_size=window_size,
+        dtype=dtype,
+        return_lse=True)
+    duplicate_output, duplicate_lse = flash_attention(
+        q=q,
+        k=duplicate_k,
+        v=duplicate_v,
+        window_size=window_size,
+        dtype=dtype,
+        return_lse=True)
+    duplicate_lse = duplicate_lse - math.log(2.0)
+    duplicate_weight = torch.sigmoid(
+        duplicate_lse - ordinary_lse).unsqueeze(-1)
+    merged = (
+        (1.0 - duplicate_weight) * ordinary_output.float()
+        + duplicate_weight * duplicate_output.float())
+    return merged.to(ordinary_output.dtype)
 
 
 def paired_anchor_attention(
@@ -640,34 +686,60 @@ def self_attention_guidance_attention(
         dtype=dtype)
 
     # J-prefix sees its own joint anchor. Its compressed anchor key is moved
-    # back onto the first suffix coordinate for the prefix-facing route.
+    # onto the first suffix coordinate for the prefix-facing route. Treat the
+    # anchor and first suffix frame as two representations of that one
+    # temporal position, and subtract log(2) from their group evidence so the
+    # duplicated coordinate does not receive twice the softmax odds merely
+    # because it contains two frame-sized K/V sets.
     joint_prefix_anchor_k = _shift_temporal_rope(
         k[1:2, anchor_start:anchor_end], 0.5, freqs)
-    j_prefix_output = flash_attention(
+    first_suffix_end = anchor_end + tokens_per_frame
+    j_prefix_output = _duplicate_position_attention(
         q=q[1:2, :anchor_start],
-        k=torch.cat([
-            k[1:2, :anchor_start], joint_prefix_anchor_k,
-            k[1:2, anchor_end:joint_seq_len],
+        ordinary_k=torch.cat([
+            k[1:2, :anchor_start],
+            k[1:2, first_suffix_end:joint_seq_len],
         ], dim=1),
-        v=v[1:2, :joint_seq_len],
+        ordinary_v=torch.cat([
+            v[1:2, :anchor_start],
+            v[1:2, first_suffix_end:joint_seq_len],
+        ], dim=1),
+        duplicate_k=torch.cat([
+            joint_prefix_anchor_k,
+            k[1:2, anchor_end:first_suffix_end],
+        ], dim=1),
+        duplicate_v=torch.cat([
+            v[1:2, anchor_start:anchor_end],
+            v[1:2, anchor_end:first_suffix_end],
+        ], dim=1),
         window_size=window_size,
         dtype=dtype)
 
     # J-suffix uses the same history-aware joint anchor as J-prefix. Move its
     # key onto the suffix-facing coordinate shared with the final prefix
-    # position. J ordinary suffix coordinates are already shifted left once.
+    # position. Apply the same duplicate-position correction to the final
+    # prefix frame plus anchor pair. J ordinary suffix coordinates are already
+    # shifted left once.
     positioned_joint_anchor_k = _shift_temporal_rope(
         k[1:2, anchor_start:anchor_end], -0.5, freqs)
-    j_suffix_output = flash_attention(
+    last_prefix_start = anchor_start - tokens_per_frame
+    j_suffix_output = _duplicate_position_attention(
         q=q[1:2, anchor_end:joint_seq_len],
-        k=torch.cat([
-            k[1:2, :anchor_start],
-            positioned_joint_anchor_k,
+        ordinary_k=torch.cat([
+            k[1:2, :last_prefix_start],
             k[1:2, anchor_end:joint_seq_len],
         ], dim=1),
-        v=torch.cat([
-            v[1:2, :anchor_start], v[1:2, anchor_start:anchor_end],
+        ordinary_v=torch.cat([
+            v[1:2, :last_prefix_start],
             v[1:2, anchor_end:joint_seq_len],
+        ], dim=1),
+        duplicate_k=torch.cat([
+            k[1:2, last_prefix_start:anchor_start],
+            positioned_joint_anchor_k,
+        ], dim=1),
+        duplicate_v=torch.cat([
+            v[1:2, last_prefix_start:anchor_start],
+            v[1:2, anchor_start:anchor_end],
         ], dim=1),
         window_size=window_size,
         dtype=dtype)

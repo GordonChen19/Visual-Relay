@@ -324,8 +324,10 @@ def _parse_args():
         help=("Run expanded Img1-only M, joint Img1/Img2 J, and standard "
               "Img2-first suffix B in both CFG branches. M's temporary slot "
               "is excluded from attention. Removing J's anchor aligns its "
-              "retained attention output with M for M/J guidance; B0 replaces "
-              "the temporary anchor velocity before CFG."))
+              "retained attention output with M for M/J guidance. J retained "
+              "queries apply a -log(2) softmax-mass correction to the two "
+              "representations sharing each anchor-adjacent RoPE coordinate. "
+              "B0 replaces the temporary anchor velocity before CFG."))
     parser.add_argument(
         "--image_condition_self_attention_guidance_scale",
         type=float,

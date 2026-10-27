@@ -13,6 +13,39 @@ if torch is not None:
 class PairedAnchorAttentionRoutingTest(unittest.TestCase):
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_duplicate_position_attention_matches_negative_log2_bias(self):
+        generator = torch.Generator().manual_seed(7)
+        q = torch.randn(1, 3, 2, 4, generator=generator)
+        ordinary_k = torch.randn(1, 5, 2, 4, generator=generator)
+        ordinary_v = torch.randn(1, 5, 2, 4, generator=generator)
+        duplicate_k = torch.randn(1, 4, 2, 4, generator=generator)
+        duplicate_v = torch.randn(1, 4, 2, 4, generator=generator)
+
+        def dense_flash(q, k, v, return_lse=False, **kwargs):
+            logits = torch.einsum('bqhd,bkhd->bhqk', q, k) / 2.0
+            output = torch.einsum(
+                'bhqk,bkhd->bqhd', logits.softmax(-1), v)
+            if return_lse:
+                return output, logits.logsumexp(-1).transpose(1, 2)
+            return output
+
+        with mock.patch.object(attention, 'flash_attention', dense_flash):
+            actual = attention._duplicate_position_attention(
+                q, ordinary_k, ordinary_v, duplicate_k, duplicate_v,
+                dtype=torch.bfloat16)
+
+        ordinary_logits = torch.einsum(
+            'bqhd,bkhd->bhqk', q, ordinary_k) / 2.0
+        duplicate_logits = (
+            torch.einsum('bqhd,bkhd->bhqk', q, duplicate_k) / 2.0
+            - torch.log(torch.tensor(2.0)))
+        logits = torch.cat([ordinary_logits, duplicate_logits], dim=-1)
+        values = torch.cat([ordinary_v, duplicate_v], dim=1)
+        expected = torch.einsum(
+            'bhqk,bkhd->bqhd', logits.softmax(-1), values)
+        torch.testing.assert_close(actual, expected)
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_prefix_future_nudge_matches_dense_framewise_reference(self):
         generator = torch.Generator().manual_seed(42)
         q = torch.randn(3, 10, 2, 4, generator=generator)
@@ -64,7 +97,11 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
 
         def fake_flash(q, k, v, **kwargs):
             calls.append((q.clone(), k.clone(), v.clone()))
-            return torch.full_like(q, float(len(calls)))
+            result = torch.full_like(q, float(len(calls)))
+            if kwargs.get('return_lse', False):
+                return result, torch.zeros(
+                    q.size(0), q.size(1), q.size(2), dtype=torch.float32)
+            return result
 
         with mock.patch.object(attention, 'flash_attention', fake_flash):
             output = attention.self_attention_guidance_attention(
@@ -172,8 +209,9 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
                 (q.size(0), q.size(1), q.size(2), v.size(3)),
                 float(len(calls)),
                 dtype=q.dtype)
-            if q.size(0) == 2:
-                result[1].add_(10)
+            if kwargs.get('return_lse', False):
+                return result, torch.zeros(
+                    q.size(0), q.size(1), q.size(2), dtype=torch.float32)
             return result
 
         def fake_shift(tensor, shift, freqs):
@@ -194,37 +232,50 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
                 joint_weight=0.5,
                 img2_weight=0.25)
 
-        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(calls), 7)
         # M excludes its anchor from retained Q/K/V.
         self.assertEqual(
             calls[0][1][0, :, 0, 0].tolist(), [20., 21., 23., 24., 25.])
         self.assertEqual(
             calls[0][2][0, :, 0, 0].tolist(), [30., 31., 33., 34., 35.])
-        # J prefix sees its joint anchor.
+        # J prefix ordinary group excludes the anchor and first suffix frame;
+        # its duplicate group contains exactly those two representations.
         self.assertEqual(
-            calls[1][1][0, :, 0, 0].tolist(), [0., 1., 52., 3., 4., 5.])
+            calls[1][1][0, :, 0, 0].tolist(), [0., 1., 4., 5.])
         self.assertEqual(
-            calls[1][2][0, :, 0, 0].tolist(), [10., 11., 12., 13., 14., 15.])
-        # J suffix sees the same joint anchor at its suffix-facing position.
+            calls[1][2][0, :, 0, 0].tolist(), [10., 11., 14., 15.])
         self.assertEqual(
             calls[2][1][0, :, 0, 0].tolist(),
-            [0.0, 1.0, -48.0, 3.0, 4.0, 5.0])
+            [52.0, 3.0])
         self.assertEqual(
             calls[2][2][0, :, 0, 0].tolist(),
-            [10.0, 11.0, 12.0, 13.0, 14.0, 15.0])
+            [12.0, 13.0])
+        # J suffix ordinary group omits the last prefix and anchor; its
+        # duplicate group contains the colocated last-prefix/anchor pair.
+        self.assertEqual(
+            calls[3][1][0, :, 0, 0].tolist(), [0., 3., 4., 5.])
+        self.assertEqual(
+            calls[3][2][0, :, 0, 0].tolist(), [10., 13., 14., 15.])
+        self.assertEqual(
+            calls[4][1][0, :, 0, 0].tolist(), [1., -48.])
+        self.assertEqual(
+            calls[4][2][0, :, 0, 0].tolist(), [11., 12.])
         # J anchor reads itself and the J suffix; B remains standard.
         self.assertEqual(
-            calls[3][0][0, :, 0, 0].tolist(), [-50.])
+            calls[5][0][0, :, 0, 0].tolist(), [-50.])
         self.assertEqual(
-            calls[3][1][0, :, 0, 0].tolist(), [-48., 3., 4., 5.])
+            calls[5][1][0, :, 0, 0].tolist(), [-48., 3., 4., 5.])
         self.assertEqual(
-            calls[4][1][0, :, 0, 0].tolist(), [40., 41., 42., 43.])
+            calls[6][1][0, :, 0, 0].tolist(), [40., 41., 42., 43.])
+        # Equal group LSEs become a 1/3 duplicate-group weight after -log(2).
+        torch.testing.assert_close(
+            output[0, :, 0, 0],
+            torch.tensor([5 / 3, 5 / 3, 0., 8 / 3, 8 / 3, 8 / 3]))
+        torch.testing.assert_close(
+            output[1, :, 0, 0],
+            torch.tensor([7 / 3, 7 / 3, 6., 13 / 3, 13 / 3, 13 / 3]))
         self.assertEqual(
-            output[0, :, 0, 0].tolist(), [1.5, 1.5, 0., 2., 2., 2.])
-        self.assertEqual(
-            output[1, :, 0, 0].tolist(), [2., 2., 4., 3., 3., 3.])
-        self.assertEqual(
-            output[2, :, 0, 0].tolist(), [5., 5., 5., 5., 0., 0.])
+            output[2, :, 0, 0].tolist(), [7., 7., 7., 7., 0., 0.])
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_guidance_scale_must_be_a_convex_weight(self):
