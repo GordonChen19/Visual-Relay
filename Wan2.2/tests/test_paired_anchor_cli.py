@@ -53,6 +53,38 @@ class PairedAnchorCliTest(unittest.TestCase):
         self.assertEqual(args.image, ['img1.png'])
         self.assertFalse(args.image_condition_paired_anchor_attention)
 
+    def test_one_way_prompt_guidance_accepts_paired_prompts(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'begin from img1',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'continue from img2',
+            '--image_condition_one_way_prompt_guidance',
+            '--image_condition_one_way_prompt_guidance_weight', '0.3')
+        self.assertTrue(args.image_condition_one_way_prompt_guidance)
+        self.assertEqual(args.image_prompt,
+                         ['begin from img1', 'continue from img2'])
+        self.assertEqual(
+            args.image_condition_one_way_prompt_guidance_weight, 0.3)
+
+    def test_one_way_prompt_guidance_requires_two_prompts(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image', 'img2.png', '--image_latent_index', '10',
+                '--image_prompt', 'only one prompt',
+                '--image_condition_one_way_prompt_guidance')
+
+    def test_one_way_prompt_guidance_is_isolated(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image_prompt', 'prompt one',
+                '--image', 'img2.png', '--image_latent_index', '10',
+                '--image_prompt', 'prompt two',
+                '--image_condition_one_way_prompt_guidance',
+                '--image_condition_self_attention_guidance')
+
     def test_prefix_future_eta_range(self):
         args = self.parse('--image', 'img1.png',
                           '--image_condition_paired_prefix_future_eta', '0.2')
@@ -127,6 +159,27 @@ class PairedAnchorCliTest(unittest.TestCase):
             '--image_condition_self_attention_guidance_stop_step', '20')
         self.assertEqual(
             args.image_condition_self_attention_guidance_stop_step, 20)
+
+    def test_post_stop_img2_suffix_guidance_is_configurable(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image', 'img2.png', '--image_latent_index', '12',
+            '--image_condition_self_attention_guidance',
+            '--image_condition_self_attention_guidance_stop_step', '20',
+            '--image_condition_self_attention_guidance_post_stop_img2_suffix',
+            '--image_condition_self_attention_guidance_img2_weight', '0.3')
+        self.assertTrue(
+            args.image_condition_self_attention_guidance_post_stop_img2_suffix)
+        self.assertEqual(
+            args.image_condition_self_attention_guidance_img2_weight, 0.3)
+
+    def test_post_stop_img2_suffix_guidance_requires_stop_step(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image', 'img2.png', '--image_latent_index', '12',
+                '--image_condition_self_attention_guidance',
+                '--image_condition_self_attention_guidance_post_stop_img2_suffix')
 
     def test_self_attention_guidance_rms_cap_is_configurable(self):
         args = self.parse(

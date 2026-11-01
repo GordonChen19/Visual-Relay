@@ -6,7 +6,9 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import (flash_attention, paired_anchor_attention,
+from .attention import (duplicate_anchor_rope, flash_attention,
+                        one_way_img2_attention,
+                        paired_anchor_attention,
                         self_attention_guidance_attention,
                         temporary_anchor_rope)
 
@@ -134,10 +136,15 @@ class WanSelfAttention(nn.Module):
                 paired_stream_weight=0.25,
                 paired_prefix_anchor_active=True,
                 paired_prefix_future_eta=0.0,
+                one_way_img2_anchor_index=None,
+                one_way_img2_weight=0.25,
                 attention_guidance_anchor_index=None,
                 self_attention_guidance_scale=0.5,
                 self_attention_guidance_img2_weight=0.25,
-                self_attention_guidance_rms_cap=None):
+                self_attention_guidance_rms_cap=None,
+                self_attention_guidance_anchor_prior=None,
+                self_attention_guidance_joint_query_single_memory_alpha=None,
+                self_attention_guidance_selective_suffix_memory_alpha=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -158,6 +165,20 @@ class WanSelfAttention(nn.Module):
 
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
+        if one_way_img2_anchor_index is not None:
+            # M contains [joint auxiliary anchor, ordinary Img1-only anchor].
+            # Preserve the native M timeline by assigning both the same
+            # integer coordinate. B retains ordinary local Img2-first RoPE.
+            q = torch.cat([
+                duplicate_anchor_rope(
+                    q[:1], grid_sizes[:1], freqs,
+                    one_way_img2_anchor_index), q[1:]
+            ], dim=0)
+            k = torch.cat([
+                duplicate_anchor_rope(
+                    k[:1], grid_sizes[:1], freqs,
+                    one_way_img2_anchor_index), k[1:]
+            ], dim=0)
         if attention_guidance_anchor_index is not None:
             # Expanded M/J both contain the temporary slot and use compressed
             # retained-frame coordinates. B keeps ordinary local RoPE.
@@ -172,7 +193,17 @@ class WanSelfAttention(nn.Module):
                     k[:expanded_count], grid_sizes[:expanded_count], freqs,
                     attention_guidance_anchor_index), k[expanded_count:]
             ], dim=0)
-        if paired_anchor_index is not None:
+        if one_way_img2_anchor_index is not None:
+            x = one_way_img2_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                anchor_index=one_way_img2_anchor_index,
+                img2_weight=one_way_img2_weight,
+                window_size=self.window_size)
+        elif paired_anchor_index is not None:
             x = paired_anchor_attention(
                 q=q,
                 k=k,
@@ -197,6 +228,11 @@ class WanSelfAttention(nn.Module):
                 joint_weight=self_attention_guidance_scale,
                 img2_weight=self_attention_guidance_img2_weight,
                 joint_rms_cap=self_attention_guidance_rms_cap,
+                anchor_prior=self_attention_guidance_anchor_prior,
+                joint_query_single_memory_alpha=(
+                    self_attention_guidance_joint_query_single_memory_alpha),
+                selective_suffix_memory_alpha=(
+                    self_attention_guidance_selective_suffix_memory_alpha),
                 window_size=self.window_size)
         else:
             x = flash_attention(
@@ -286,9 +322,14 @@ class WanAttentionBlock(nn.Module):
         paired_stream_weight=0.25,
         paired_prefix_anchor_active=True,
         paired_prefix_future_eta=0.0,
+        one_way_img2_anchor_index=None,
+        one_way_img2_weight=0.25,
         self_attention_guidance_scale=None,
         self_attention_guidance_img2_weight=None,
         self_attention_guidance_rms_cap=None,
+        self_attention_guidance_anchor_prior=None,
+        self_attention_guidance_joint_query_single_memory_alpha=None,
+        self_attention_guidance_selective_suffix_memory_alpha=None,
         attention_guidance_anchor_index=None,
     ):
         r"""
@@ -307,15 +348,30 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs, paired_anchor_index,
-            paired_stream_weight, paired_prefix_anchor_active,
-            paired_prefix_future_eta,
-            attention_guidance_anchor_index,
-            (0.5 if self_attention_guidance_scale is None else
-             self_attention_guidance_scale),
-            (0.25 if self_attention_guidance_img2_weight is None else
-             self_attention_guidance_img2_weight),
-            self_attention_guidance_rms_cap)
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=freqs,
+            paired_anchor_index=paired_anchor_index,
+            paired_stream_weight=paired_stream_weight,
+            paired_prefix_anchor_active=paired_prefix_anchor_active,
+            paired_prefix_future_eta=paired_prefix_future_eta,
+            one_way_img2_anchor_index=one_way_img2_anchor_index,
+            one_way_img2_weight=one_way_img2_weight,
+            attention_guidance_anchor_index=attention_guidance_anchor_index,
+            self_attention_guidance_scale=(
+                0.5 if self_attention_guidance_scale is None else
+                self_attention_guidance_scale),
+            self_attention_guidance_img2_weight=(
+                0.25 if self_attention_guidance_img2_weight is None else
+                self_attention_guidance_img2_weight),
+            self_attention_guidance_rms_cap=(
+                self_attention_guidance_rms_cap),
+            self_attention_guidance_anchor_prior=(
+                self_attention_guidance_anchor_prior),
+            self_attention_guidance_joint_query_single_memory_alpha=(
+                self_attention_guidance_joint_query_single_memory_alpha),
+            self_attention_guidance_selective_suffix_memory_alpha=(
+                self_attention_guidance_selective_suffix_memory_alpha))
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -491,9 +547,14 @@ class WanModel(ModelMixin, ConfigMixin):
         paired_stream_weight=0.25,
         paired_prefix_anchor_active=True,
         paired_prefix_future_eta=0.0,
+        one_way_img2_anchor_index=None,
+        one_way_img2_weight=0.25,
         self_attention_guidance_scale=None,
         self_attention_guidance_img2_weight=None,
         self_attention_guidance_rms_cap=None,
+        self_attention_guidance_anchor_prior=None,
+        self_attention_guidance_joint_query_single_memory_alpha=None,
+        self_attention_guidance_selective_suffix_memory_alpha=None,
         attention_guidance_anchor_index=None,
     ):
         r"""
@@ -581,11 +642,19 @@ class WanModel(ModelMixin, ConfigMixin):
             paired_stream_weight=paired_stream_weight,
             paired_prefix_anchor_active=paired_prefix_anchor_active,
             paired_prefix_future_eta=paired_prefix_future_eta,
+            one_way_img2_anchor_index=one_way_img2_anchor_index,
+            one_way_img2_weight=one_way_img2_weight,
             self_attention_guidance_scale=self_attention_guidance_scale,
             self_attention_guidance_img2_weight=(
                 self_attention_guidance_img2_weight),
             self_attention_guidance_rms_cap=(
                 self_attention_guidance_rms_cap),
+            self_attention_guidance_anchor_prior=(
+                self_attention_guidance_anchor_prior),
+            self_attention_guidance_joint_query_single_memory_alpha=(
+                self_attention_guidance_joint_query_single_memory_alpha),
+            self_attention_guidance_selective_suffix_memory_alpha=(
+                self_attention_guidance_selective_suffix_memory_alpha),
             attention_guidance_anchor_index=attention_guidance_anchor_index)
 
         for block in self.blocks:

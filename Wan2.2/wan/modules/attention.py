@@ -18,9 +18,9 @@ except ModuleNotFoundError:
 import warnings
 
 __all__ = [
-    'begin_value_rms_diagnostics',
-    'end_value_rms_diagnostics',
     'flash_attention',
+    'one_way_img2_attention',
+    'duplicate_anchor_rope',
     'paired_anchor_attention',
     'self_attention_guidance_attention',
     'temporary_anchor_rope',
@@ -28,67 +28,169 @@ __all__ = [
 ]
 
 
-_VALUE_RMS_DIAGNOSTICS = None
+def one_way_img2_attention(
+    q,
+    k,
+    v,
+    seq_lens,
+    grid_sizes,
+    anchor_index,
+    img2_weight=0.25,
+    window_size=(-1, -1),
+    dtype=torch.bfloat16,
+):
+    """Apply one-way Img2-first attention-output guidance to an Img1 stream.
+
+    Sample zero is an expanded Img1-first stream ``M`` containing an auxiliary
+    joint anchor immediately before the ordinary Img1-only anchor frame.
+    Sample one is an independently evolving Img2-first stream ``B`` whose
+    first latent is aligned with ``M[anchor_index]``.  Both streams perform
+    ordinary full bidirectional self-attention over their own tokens.  Only
+    the completed attention outputs are coupled:
+
+    Prefix queries read a hybrid anchor instead of ordinary M10: A10 supplies
+    its history-aware key while B0 supplies the corresponding value. Their M
+    memory otherwise contains the prefix and retained suffix, but excludes
+    retained M10. A10 uses its own query and attends only to the prefix plus
+    itself.
+    Retained M10/suffix queries read only the ordinary 21-frame M memory with
+    A10 removed. B0 completely replaces M10's attention output, while B1: is
+    interpolated only into the retained post-anchor suffix.
+
+    ``O_B`` is returned unchanged, so information flows strictly B -> M.
+    This function performs no RoPE modification or temporal compression.
+    """
+    if q.size(0) != 2 or k.size(0) != 2 or v.size(0) != 2:
+        raise ValueError("one-way Img2 guidance requires exactly M/B streams")
+    if window_size != (-1, -1):
+        raise ValueError("one-way Img2 guidance requires global attention")
+    if not 0.0 <= img2_weight <= 1.0:
+        raise ValueError("one-way Img2 guidance weight must be in [0, 1]")
+
+    main_frames, height, width = (
+        int(value) for value in grid_sizes[0].tolist())
+    suffix_frames, suffix_height, suffix_width = (
+        int(value) for value in grid_sizes[1].tolist())
+    if (height, width) != (suffix_height, suffix_width):
+        raise ValueError("M/B spatial grids must match")
+    if not 0 < anchor_index < main_frames:
+        raise ValueError("one-way Img2 anchor must be inside the M timeline")
+    if suffix_frames != main_frames - anchor_index - 1:
+        raise ValueError(
+            "B frames must align with the auxiliary anchor and retained suffix")
+
+    tokens_per_frame = height * width
+    main_seq_len = main_frames * tokens_per_frame
+    suffix_seq_len = suffix_frames * tokens_per_frame
+    anchor_start = anchor_index * tokens_per_frame
+    anchor_end = anchor_start + tokens_per_frame
+    retained_anchor_end = anchor_end + tokens_per_frame
+    if (int(seq_lens[0]) != main_seq_len
+            or int(seq_lens[1]) != suffix_seq_len):
+        raise ValueError("one-way Img2 M/B sequence lengths disagree")
+
+    # Prefix queries use A10's history-aware key to select the Img2 anchor but
+    # read B0's fresh-cache Img2 value. Retain the ordinary suffix in memory,
+    # but remove ordinary M10.
+    prefix_k = torch.cat([
+        k[0:1, :anchor_end], k[0:1, retained_anchor_end:main_seq_len]
+    ], dim=1)
+    prefix_v = torch.cat([
+        v[0:1, :anchor_start], v[1:2, :tokens_per_frame],
+        v[0:1, retained_anchor_end:main_seq_len]
+    ], dim=1)
+    prefix_output = flash_attention(
+        q=q[0:1, :anchor_start],
+        k=prefix_k,
+        v=prefix_v,
+        window_size=window_size,
+        dtype=dtype)
+    # The retained anchor and suffix remain an ordinary fully bidirectional
+    # Img1 stream: they read every retained M frame but never the auxiliary
+    # joint anchor.
+    retained_main_k = torch.cat([
+        k[0:1, :anchor_start], k[0:1, anchor_end:main_seq_len]
+    ], dim=1)
+    retained_main_v = torch.cat([
+        v[0:1, :anchor_start], v[0:1, anchor_end:main_seq_len]
+    ], dim=1)
+    retained_anchor_suffix_output = flash_attention(
+        q=q[0:1, anchor_end:main_seq_len],
+        k=retained_main_k,
+        v=retained_main_v,
+        window_size=window_size,
+        dtype=dtype)
+    # Keep the jointly conditioned auxiliary anchor integrated with the
+    # prefix throughout the DiT pass. It uses its own query and can read the
+    # preceding main-stream prefix plus itself, but not retained M10 or the
+    # post-anchor suffix.
+    auxiliary_anchor_output = flash_attention(
+        q=q[0:1, anchor_start:anchor_end],
+        k=k[0:1, :anchor_end],
+        v=v[0:1, :anchor_end],
+        window_size=window_size,
+        dtype=dtype)
+    img2_output = flash_attention(
+        q=q[1:2, :suffix_seq_len],
+        k=k[1:2, :suffix_seq_len],
+        v=v[1:2, :suffix_seq_len],
+        window_size=window_size,
+        dtype=dtype)
+
+    # Use B0 as the complete layerwise update for retained M10. Guide the true
+    # post-anchor suffix separately, where M11: and B1: are aligned.
+    retained_anchor_output = img2_output[:, :tokens_per_frame]
+    retained_suffix_output = retained_anchor_suffix_output[:,
+                                                            tokens_per_frame:]
+    img2_suffix_output = img2_output[:, tokens_per_frame:]
+    if retained_suffix_output.size(1) != img2_suffix_output.size(1):
+        raise RuntimeError("one-way M/B post-anchor suffixes do not align")
+    guided_retained_suffix = (
+        (1.0 - img2_weight) * retained_suffix_output
+        + img2_weight * img2_suffix_output)
+    guided_main = torch.cat([
+        prefix_output,
+        auxiliary_anchor_output,
+        retained_anchor_output,
+        guided_retained_suffix,
+        torch.zeros_like(q[0:1, main_seq_len:]),
+    ], dim=1)
+    padded_img2 = torch.cat([
+        img2_output,
+        torch.zeros_like(q[1:2, suffix_seq_len:]),
+    ], dim=1)
+    return torch.cat([guided_main, padded_img2], dim=0)
 
 
-def begin_value_rms_diagnostics(sampling_step):
-    """Accumulate aligned M/J value magnitudes for one model evaluation."""
-    global _VALUE_RMS_DIAGNOSTICS
-    _VALUE_RMS_DIAGNOSTICS = {
-        'sampling_step': int(sampling_step),
-        'layers': 0,
-        'm_sq': None,
-        'j_sq': None,
-        'delta_sq': None,
-        'anchor_sq': None,
-    }
+def duplicate_anchor_rope(x, grid_sizes, freqs, anchor_index):
+    """Give an auxiliary anchor and retained anchor the same temporal index.
 
-
-def end_value_rms_diagnostics():
-    """Return layer-averaged per-frame RMS metrics and clear the collector."""
-    global _VALUE_RMS_DIAGNOSTICS
-    state = _VALUE_RMS_DIAGNOSTICS
-    _VALUE_RMS_DIAGNOSTICS = None
-    if state is None or state['layers'] == 0:
-        return None
-    layers = float(state['layers'])
-    m_rms = (state['m_sq'] / layers).sqrt().detach().float().cpu()
-    j_rms = (state['j_sq'] / layers).sqrt().detach().float().cpu()
-    delta_rms = (state['delta_sq'] / layers).sqrt().detach().float().cpu()
-    anchor_rms = (state['anchor_sq'] / layers).sqrt().detach().float().cpu()
-    return {
-        'sampling_step': state['sampling_step'],
-        'layers': state['layers'],
-        'm_rms': m_rms.tolist(),
-        'j_rms': j_rms.tolist(),
-        'delta_rms': delta_rms.tolist(),
-        'j_over_m': (j_rms / m_rms.clamp_min(1e-8)).tolist(),
-        'j_anchor_rms': float(anchor_rms.item()),
-    }
-
-
-def _record_value_rms(v, frames, tokens_per_frame, anchor_index):
-    state = _VALUE_RMS_DIAGNOSTICS
-    if state is None or v.size(0) < 3:
-        return
-    seq_len = frames * tokens_per_frame
-    m = v[0, :seq_len].reshape(
-        frames, tokens_per_frame, v.size(2), v.size(3))
-    j = v[1, :seq_len].reshape(
-        frames, tokens_per_frame, v.size(2), v.size(3))
-    m = torch.cat([m[:anchor_index], m[anchor_index + 1:]], dim=0)
-    j_anchor = j[anchor_index]
-    j = torch.cat([j[:anchor_index], j[anchor_index + 1:]], dim=0)
-    reduce_dims = (1, 2, 3)
-    m_sq = m.float().square().mean(dim=reduce_dims)
-    j_sq = j.float().square().mean(dim=reduce_dims)
-    delta_sq = (j.float() - m.float()).square().mean(dim=reduce_dims)
-    anchor_sq = j_anchor.float().square().mean()
-    for name, value in (
-            ('m_sq', m_sq), ('j_sq', j_sq),
-            ('delta_sq', delta_sq), ('anchor_sq', anchor_sq)):
-        state[name] = value if state[name] is None else state[name] + value
-    state['layers'] += 1
+    ``x`` has already received ordinary RoPE for an expanded timeline ordered
+    as ``[..., auxiliary_anchor, retained_anchor, retained_suffix...]``. The
+    auxiliary anchor keeps its integer position and every later frame shifts
+    left by one. The retained 21-frame timeline therefore preserves its normal
+    coordinates while the auxiliary anchor shares the retained anchor's
+    temporal position. No frame is placed at a fractional coordinate.
+    """
+    if anchor_index is None:
+        return x
+    output = []
+    for batch_index, (frames, height, width) in enumerate(
+            grid_sizes.tolist()):
+        if not 0 < anchor_index < frames - 1:
+            raise ValueError(
+                "duplicate anchor must have retained frames on both sides")
+        tokens_per_frame = height * width
+        anchor_end = (anchor_index + 1) * tokens_per_frame
+        sequence_end = frames * tokens_per_frame
+        sample = x[batch_index:batch_index + 1]
+        output.append(torch.cat([
+            sample[:, :anchor_end],
+            _shift_temporal_rope(sample[:, anchor_end:sequence_end], -1,
+                                 freqs),
+            sample[:, sequence_end:],
+        ], dim=1))
+    return torch.cat(output, dim=0)
 
 
 def flash_attention(
@@ -233,51 +335,7 @@ def flash_attention(
     return x, softmax_lse.float()
 
 
-def _duplicate_position_attention(
-    q,
-    ordinary_k,
-    ordinary_v,
-    duplicate_k,
-    duplicate_v,
-    window_size=(-1, -1),
-    dtype=torch.bfloat16,
-):
-    """Attend to one ordinary group and one duplicated temporal position.
-
-    ``duplicate_k``/``duplicate_v`` contain two frame representations that
-    intentionally share one temporal RoPE coordinate. Subtracting ``log(2)``
-    from that group's LSE is exactly equivalent to applying the same negative
-    logit bias to every token in the pair. It removes the pair's automatic
-    factor-of-two softmax-mass advantage without changing the learned
-    preference between its two representations.
-    """
-    if ordinary_k.size(1) == 0 or duplicate_k.size(1) == 0:
-        raise ValueError(
-            "duplicate-position attention requires two non-empty groups")
-    ordinary_output, ordinary_lse = flash_attention(
-        q=q,
-        k=ordinary_k,
-        v=ordinary_v,
-        window_size=window_size,
-        dtype=dtype,
-        return_lse=True)
-    duplicate_output, duplicate_lse = flash_attention(
-        q=q,
-        k=duplicate_k,
-        v=duplicate_v,
-        window_size=window_size,
-        dtype=dtype,
-        return_lse=True)
-    duplicate_lse = duplicate_lse - math.log(2.0)
-    duplicate_weight = torch.sigmoid(
-        duplicate_lse - ordinary_lse).unsqueeze(-1)
-    merged = (
-        (1.0 - duplicate_weight) * ordinary_output.float()
-        + duplicate_weight * duplicate_output.float())
-    return merged.to(ordinary_output.dtype)
-
-
-def paired_anchor_attention(
+def _legacy_paired_anchor_attention(
     q,
     k,
     v,
@@ -489,6 +547,145 @@ def paired_anchor_attention(
     return torch.cat([suffix_output, joint_output, proxy_output], dim=0)
 
 
+def paired_anchor_attention(
+    q,
+    k,
+    v,
+    seq_lens,
+    grid_sizes,
+    freqs,
+    anchor_index,
+    stream_weight=0.25,
+    prefix_anchor_active=True,
+    prefix_future_eta=0.0,
+    window_size=(-1, -1),
+    dtype=torch.bfloat16,
+):
+    """Update retained C queries from mass-normalized C/B memory.
+
+    B is standard Img2-first I2V. C is standard Img1-first I2V with a hidden
+    transport slot. B0 maintains that slot but is excluded from retained C
+    attention. Aligned C-suffix and B1: representations are alternatives in
+    one exact softmax; ``stream_weight`` is the B-source prior alpha.
+    """
+    del prefix_anchor_active, prefix_future_eta
+    if window_size != (-1, -1):
+        raise ValueError("paired anchor attention requires global attention")
+    if freqs is None:
+        raise ValueError("paired anchor attention requires RoPE frequencies")
+    if q.size(0) != 2 or len(seq_lens) != 2 or len(grid_sizes) != 2:
+        raise ValueError("paired memory attention requires B and C streams")
+    if not 0.0 <= stream_weight <= 1.0:
+        raise ValueError("paired memory alpha must be between zero and one")
+
+    suffix_frames, suffix_height, suffix_width = (
+        int(value) for value in grid_sizes[0].tolist())
+    main_frames, main_height, main_width = (
+        int(value) for value in grid_sizes[1].tolist())
+    anchor_index = int(anchor_index)
+    if not 0 < anchor_index < main_frames - 1:
+        raise ValueError("paired anchor must have retained frames on both sides")
+    if (suffix_height, suffix_width) != (main_height, main_width):
+        raise ValueError("paired streams must have identical spatial grids")
+    if suffix_frames != main_frames - anchor_index:
+        raise ValueError("B must align with the hidden anchor and C suffix")
+
+    tokens_per_frame = main_height * main_width
+    suffix_seq_len = suffix_frames * tokens_per_frame
+    main_seq_len = main_frames * tokens_per_frame
+    if (suffix_seq_len != int(seq_lens[0])
+            or main_seq_len != int(seq_lens[1])):
+        raise ValueError("paired stream sequence lengths disagree")
+
+    b_q = q[0:1, :suffix_seq_len]
+    b_k = k[0:1, :suffix_seq_len]
+    b_v = v[0:1, :suffix_seq_len]
+    c_q = q[1:2, :main_seq_len]
+    c_k = k[1:2, :main_seq_len]
+    c_v = v[1:2, :main_seq_len]
+
+    # B remains a normal Img2-first stream, including direct access to B0.
+    b_output = flash_attention(
+        q=b_q, k=b_k, v=b_v, window_size=window_size, dtype=dtype)
+
+    anchor_start = anchor_index * tokens_per_frame
+    anchor_end = anchor_start + tokens_per_frame
+
+    # Remove C's hidden transport slot and compress the retained suffix by one
+    # temporal position. Exported B1: keys are shifted from local B positions
+    # to the same compressed global coordinates as the aligned C suffix.
+    compressed_c_suffix_q = _shift_temporal_rope(
+        c_q[:, anchor_end:main_seq_len], -1, freqs)
+    compressed_c_suffix_k = _shift_temporal_rope(
+        c_k[:, anchor_end:main_seq_len], -1, freqs)
+    c_suffix_v = c_v[:, anchor_end:main_seq_len]
+    aligned_b_suffix_k = _shift_temporal_rope(
+        b_k[:, tokens_per_frame:suffix_seq_len], anchor_index - 1, freqs)
+    aligned_b_suffix_v = b_v[:, tokens_per_frame:suffix_seq_len]
+    if aligned_b_suffix_k.size(1) != compressed_c_suffix_k.size(1):
+        raise ValueError("B1: did not align with retained C suffix")
+
+    retained_c_q = torch.cat([
+        c_q[:, :anchor_start], compressed_c_suffix_q
+    ], dim=1)
+
+    group_outputs = []
+    group_lses = []
+
+    def add_group(group_k, group_v, log_prior=0.0):
+        output, lse = flash_attention(
+            q=retained_c_q,
+            k=group_k,
+            v=group_v,
+            window_size=window_size,
+            dtype=dtype,
+            return_lse=True)
+        group_outputs.append(output.float())
+        group_lses.append(lse + log_prior)
+
+    # Prefix memory is unique and therefore receives no source prior.
+    add_group(c_k[:, :anchor_start], c_v[:, :anchor_start])
+    if stream_weight < 1.0:
+        add_group(
+            compressed_c_suffix_k,
+            c_suffix_v,
+            math.log1p(-float(stream_weight)))
+    if stream_weight > 0.0:
+        add_group(
+            aligned_b_suffix_k,
+            aligned_b_suffix_v,
+            math.log(float(stream_weight)))
+
+    weights = torch.stack(group_lses, dim=-1).softmax(dim=-1).unsqueeze(-1)
+    retained_c_output = (
+        weights * torch.stack(group_outputs, dim=-2)).sum(dim=-2).to(
+            c_q.dtype)
+
+    # B0 is not C memory, but its complete update maintains the discarded
+    # transport latent so B remains a coherent Img2-first suffix at the next
+    # denoising step.
+    c_output = torch.cat([
+        retained_c_output[:, :anchor_start],
+        b_output[:, :tokens_per_frame],
+        retained_c_output[:, anchor_start:],
+    ], dim=1)
+
+    padded_len = q.size(1)
+    if suffix_seq_len < padded_len:
+        b_output = torch.cat([
+            b_output,
+            b_output.new_zeros(
+                1, padded_len - suffix_seq_len, *b_output.shape[2:])
+        ], dim=1)
+    if main_seq_len < padded_len:
+        c_output = torch.cat([
+            c_output,
+            c_output.new_zeros(
+                1, padded_len - main_seq_len, *c_output.shape[2:])
+        ], dim=1)
+    return torch.cat([b_output, c_output], dim=0)
+
+
 @torch.amp.autocast('cuda', enabled=False)
 def _shift_temporal_rope(x, position_delta, freqs):
     """Shift only temporal RoPE on an already-rotated token tensor."""
@@ -545,6 +742,58 @@ def temporary_anchor_rope(x, grid_sizes, freqs, anchor_index):
     return torch.cat(output, dim=0)
 
 
+def _shared_position_prior_attention(
+    q,
+    ordinary_k,
+    ordinary_v,
+    anchor_k,
+    anchor_v,
+    neighbour_k,
+    neighbour_v,
+    anchor_prior,
+    window_size=(-1, -1),
+    dtype=torch.bfloat16,
+    return_lse=False,
+):
+    """Exactly merge three groups into one prior-weighted softmax.
+
+    Anchor and neighbour priors sum to one, preventing two representations at
+    one temporal RoPE coordinate from receiving an automatic factor-of-two
+    mass advantage.
+    """
+    if not 0.0 < anchor_prior < 1.0:
+        raise ValueError("anchor prior must be strictly between zero and one")
+    if (ordinary_k.size(1) == 0 or anchor_k.size(1) == 0
+            or neighbour_k.size(1) == 0):
+        raise ValueError("shared-position attention groups must be non-empty")
+
+    ordinary_output, ordinary_lse = flash_attention(
+        q=q, k=ordinary_k, v=ordinary_v, window_size=window_size,
+        dtype=dtype, return_lse=True)
+    anchor_output, anchor_lse = flash_attention(
+        q=q, k=anchor_k, v=anchor_v, window_size=window_size,
+        dtype=dtype, return_lse=True)
+    neighbour_output, neighbour_lse = flash_attention(
+        q=q, k=neighbour_k, v=neighbour_v, window_size=window_size,
+        dtype=dtype, return_lse=True)
+
+    group_lse = torch.stack([
+        ordinary_lse,
+        anchor_lse + math.log(float(anchor_prior)),
+        neighbour_lse + math.log1p(-float(anchor_prior)),
+    ], dim=-1)
+    group_weights = group_lse.softmax(dim=-1).unsqueeze(-1)
+    group_outputs = torch.stack([
+        ordinary_output.float(), anchor_output.float(),
+        neighbour_output.float()
+    ], dim=-2)
+    output = (group_weights * group_outputs).sum(dim=-2).to(
+        ordinary_output.dtype)
+    if return_lse:
+        return output, torch.logsumexp(group_lse, dim=-1)
+    return output
+
+
 def self_attention_guidance_attention(
     q,
     k,
@@ -556,6 +805,9 @@ def self_attention_guidance_attention(
     joint_weight=0.5,
     img2_weight=0.25,
     joint_rms_cap=None,
+    anchor_prior=None,
+    joint_query_single_memory_alpha=None,
+    selective_suffix_memory_alpha=None,
     window_size=(-1, -1),
     dtype=torch.bfloat16,
 ):
@@ -568,6 +820,20 @@ def self_attention_guidance_attention(
     plus J's suffix. Removing J's anchor
     aligns its ordinary outputs with M's retained outputs, after which M receives
     ``O_M + joint_weight * (O_J - O_M)`` at every retained position.
+    When ``joint_query_single_memory_alpha`` is set, J prefix and suffix
+    queries also interrogate retained Img1-only M K/V. J-memory and M-memory
+    outputs are merged from their exact log-normalizers with complementary
+    source priors, and those results directly update M's aligned prefix and
+    suffix without a second M/J output interpolation. Anchor routing remains
+    unchanged.
+    When ``selective_suffix_memory_alpha`` is set, M-prefix memory is omitted.
+    J-prefix queries see unique J prefix, the J anchor and aligned J/M suffix;
+    J-suffix queries see the same memories. At the prefix-facing shared RoPE
+    position, the anchor receives prior ``pi`` and the aligned J/M first-suffix
+    pair jointly receives ``1-pi``; alpha then divides that neighbour mass
+    between J and M. This prevents J-anchor/J-suffix/M-suffix duplication from
+    creating three positions' worth of evidence. A neutral ``pi=0.5`` is used
+    when no explicit anchor prior is supplied.
     """
     if q.size(0) < 1 or k.size(0) != q.size(0) or v.size(0) != q.size(0):
         raise ValueError(
@@ -581,6 +847,20 @@ def self_attention_guidance_attention(
         raise ValueError("Img2 attention weight must be in [0, 1]")
     if joint_rms_cap is not None and joint_rms_cap <= 0.0:
         raise ValueError("joint RMS cap must be positive")
+    if anchor_prior is not None and not 0.0 < anchor_prior < 1.0:
+        raise ValueError("anchor prior must be strictly between zero and one")
+    if (joint_query_single_memory_alpha is not None
+            and not 0.0 <= joint_query_single_memory_alpha <= 1.0):
+        raise ValueError(
+            "joint-query single-memory alpha must be in [0, 1]")
+    if (selective_suffix_memory_alpha is not None
+            and not 0.0 <= selective_suffix_memory_alpha <= 1.0):
+        raise ValueError(
+            "selective suffix-memory alpha must be in [0, 1]")
+    if (joint_query_single_memory_alpha is not None
+            and selective_suffix_memory_alpha is not None):
+        raise ValueError(
+            "full-memory and selective-suffix memory modes are exclusive")
     frames, height, width = (
         int(value) for value in grid_sizes[0].tolist())
     if not 0 < anchor_index < frames - 1:
@@ -673,76 +953,236 @@ def self_attention_guidance_attention(
             or int(seq_lens[2]) != suffix_seq_len):
         raise ValueError(
             "self-attention-guidance M/J/B sequence lengths disagree")
-    _record_value_rms(v, frames, tokens_per_frame, anchor_index)
 
     # M's temporary anchor is absent from every retained query's Q/K/V set.
     # Its neighbours are adjacent because temporary_anchor_rope shifted all
     # post-anchor retained positions left by one.
+    m_retained_q = torch.cat([
+        q[0:1, :anchor_start], q[0:1, anchor_end:seq_len]
+    ], dim=1)
+    m_retained_k = torch.cat([
+        k[0:1, :anchor_start], k[0:1, anchor_end:seq_len]
+    ], dim=1)
+    m_retained_v = torch.cat([
+        v[0:1, :anchor_start], v[0:1, anchor_end:seq_len]
+    ], dim=1)
     m_retained_output = flash_attention(
-        q=torch.cat([q[0:1, :anchor_start], q[0:1, anchor_end:seq_len]], dim=1),
-        k=torch.cat([k[0:1, :anchor_start], k[0:1, anchor_end:seq_len]], dim=1),
-        v=torch.cat([v[0:1, :anchor_start], v[0:1, anchor_end:seq_len]], dim=1),
+        q=m_retained_q,
+        k=m_retained_k,
+        v=m_retained_v,
         window_size=window_size,
         dtype=dtype)
 
-    # J-prefix sees its own joint anchor. Its compressed anchor key is moved
-    # onto the first suffix coordinate for the prefix-facing route. Treat the
-    # anchor and first suffix frame as two representations of that one
-    # temporal position, and subtract log(2) from their group evidence so the
-    # duplicated coordinate does not receive twice the softmax odds merely
-    # because it contains two frame-sized K/V sets.
+    use_split_memory = joint_query_single_memory_alpha is not None
+    use_selective_suffix_memory = selective_suffix_memory_alpha is not None
+    single_memory_alpha = (
+        None if joint_query_single_memory_alpha is None else
+        float(joint_query_single_memory_alpha))
+
+    def merge_joint_and_m_memory(j_memory_result, j_query):
+        """Merge J and retained-M memories under one exact biased softmax."""
+        if not use_split_memory:
+            return j_memory_result
+        if single_memory_alpha == 0.0:
+            return j_memory_result[0]
+        m_memory_output, m_memory_lse = flash_attention(
+            q=j_query,
+            k=m_retained_k,
+            v=m_retained_v,
+            window_size=window_size,
+            dtype=dtype,
+            return_lse=True)
+        if single_memory_alpha == 1.0:
+            return m_memory_output
+        j_memory_output, j_memory_lse = j_memory_result
+        source_lse = torch.stack([
+            j_memory_lse + math.log1p(-single_memory_alpha),
+            m_memory_lse + math.log(single_memory_alpha),
+        ], dim=-1)
+        source_weights = source_lse.softmax(dim=-1).unsqueeze(-1)
+        source_outputs = torch.stack([
+            j_memory_output.float(), m_memory_output.float()
+        ], dim=-2)
+        return (source_weights * source_outputs).sum(dim=-2).to(
+            j_memory_output.dtype)
+
+    def grouped_attention(query, groups):
+        """Evaluate disjoint K/V groups as one exact prior-biased softmax."""
+        group_outputs = []
+        group_lses = []
+        for group_k, group_v, log_prior in groups:
+            group_output, group_lse = flash_attention(
+                q=query,
+                k=group_k,
+                v=group_v,
+                window_size=window_size,
+                dtype=dtype,
+                return_lse=True)
+            group_outputs.append(group_output.float())
+            group_lses.append(group_lse + float(log_prior))
+        if len(group_outputs) == 1:
+            return group_outputs[0].to(query.dtype)
+        stacked_lse = torch.stack(group_lses, dim=-1)
+        weights = stacked_lse.softmax(dim=-1).unsqueeze(-1)
+        outputs = torch.stack(group_outputs, dim=-2)
+        return (weights * outputs).sum(dim=-2).to(query.dtype)
+
+    # J-prefix sees its joint anchor moved onto the first suffix coordinate.
+    # In selective mode, hierarchical priors make the anchor and the aligned
+    # J/M first-suffix pair collectively occupy one shared temporal position.
     joint_prefix_anchor_k = _shift_temporal_rope(
         k[1:2, anchor_start:anchor_end], 0.5, freqs)
-    first_suffix_end = anchor_end + tokens_per_frame
-    j_prefix_output = _duplicate_position_attention(
-        q=q[1:2, :anchor_start],
-        ordinary_k=torch.cat([
-            k[1:2, :anchor_start],
-            k[1:2, first_suffix_end:joint_seq_len],
-        ], dim=1),
-        ordinary_v=torch.cat([
-            v[1:2, :anchor_start],
-            v[1:2, first_suffix_end:joint_seq_len],
-        ], dim=1),
-        duplicate_k=torch.cat([
+    j_prefix_q = q[1:2, :anchor_start]
+    if use_selective_suffix_memory:
+        selective_alpha = float(selective_suffix_memory_alpha)
+        selective_anchor_prior = (
+            0.5 if anchor_prior is None else float(anchor_prior))
+        first_suffix_end = anchor_end + tokens_per_frame
+        prefix_groups = [(
+            k[1:2, :anchor_start], v[1:2, :anchor_start], 0.0)]
+        prefix_groups.append((
             joint_prefix_anchor_k,
-            k[1:2, anchor_end:first_suffix_end],
-        ], dim=1),
-        duplicate_v=torch.cat([
             v[1:2, anchor_start:anchor_end],
-            v[1:2, anchor_end:first_suffix_end],
-        ], dim=1),
-        window_size=window_size,
-        dtype=dtype)
+            math.log(selective_anchor_prior)))
+        if selective_alpha < 1.0:
+            prefix_groups.append((
+                k[1:2, anchor_end:first_suffix_end],
+                v[1:2, anchor_end:first_suffix_end],
+                math.log1p(-selective_anchor_prior)
+                + math.log1p(-selective_alpha)))
+            if first_suffix_end < joint_seq_len:
+                prefix_groups.append((
+                    k[1:2, first_suffix_end:joint_seq_len],
+                    v[1:2, first_suffix_end:joint_seq_len],
+                    math.log1p(-selective_alpha)))
+        if selective_alpha > 0.0:
+            prefix_groups.append((
+                k[0:1, anchor_end:first_suffix_end],
+                v[0:1, anchor_end:first_suffix_end],
+                math.log1p(-selective_anchor_prior)
+                + math.log(selective_alpha)))
+            if first_suffix_end < seq_len:
+                prefix_groups.append((
+                    k[0:1, first_suffix_end:seq_len],
+                    v[0:1, first_suffix_end:seq_len],
+                    math.log(selective_alpha)))
+        j_prefix_output = grouped_attention(j_prefix_q, prefix_groups)
+    else:
+        if anchor_prior is None:
+            j_prefix_result = flash_attention(
+                q=j_prefix_q,
+                k=torch.cat([
+                    k[1:2, :anchor_start], joint_prefix_anchor_k,
+                    k[1:2, anchor_end:joint_seq_len],
+                ], dim=1),
+                v=v[1:2, :joint_seq_len],
+                window_size=window_size,
+                dtype=dtype,
+                return_lse=use_split_memory)
+        else:
+            first_suffix_end = anchor_end + tokens_per_frame
+            j_prefix_result = _shared_position_prior_attention(
+                q=j_prefix_q,
+                ordinary_k=torch.cat([
+                    k[1:2, :anchor_start],
+                    k[1:2, first_suffix_end:joint_seq_len],
+                ], dim=1),
+                ordinary_v=torch.cat([
+                    v[1:2, :anchor_start],
+                    v[1:2, first_suffix_end:joint_seq_len],
+                ], dim=1),
+                anchor_k=joint_prefix_anchor_k,
+                anchor_v=v[1:2, anchor_start:anchor_end],
+                neighbour_k=k[1:2, anchor_end:first_suffix_end],
+                neighbour_v=v[1:2, anchor_end:first_suffix_end],
+                anchor_prior=anchor_prior,
+                window_size=window_size,
+                dtype=dtype,
+                return_lse=use_split_memory)
+        j_prefix_output = merge_joint_and_m_memory(
+            j_prefix_result, j_prefix_q)
 
     # J-suffix uses the same history-aware joint anchor as J-prefix. Move its
     # key onto the suffix-facing coordinate shared with the final prefix
-    # position. Apply the same duplicate-position correction to the final
-    # prefix frame plus anchor pair. J ordinary suffix coordinates are already
-    # shifted left once.
+    # position. All visible J keys participate in one ordinary softmax. J
+    # ordinary suffix coordinates are already shifted left once.
     positioned_joint_anchor_k = _shift_temporal_rope(
         k[1:2, anchor_start:anchor_end], -0.5, freqs)
-    last_prefix_start = anchor_start - tokens_per_frame
-    j_suffix_output = _duplicate_position_attention(
-        q=q[1:2, anchor_end:joint_seq_len],
-        ordinary_k=torch.cat([
-            k[1:2, :last_prefix_start],
-            k[1:2, anchor_end:joint_seq_len],
-        ], dim=1),
-        ordinary_v=torch.cat([
-            v[1:2, :last_prefix_start],
-            v[1:2, anchor_end:joint_seq_len],
-        ], dim=1),
-        duplicate_k=torch.cat([
-            k[1:2, last_prefix_start:anchor_start],
-            positioned_joint_anchor_k,
-        ], dim=1),
-        duplicate_v=torch.cat([
-            v[1:2, last_prefix_start:anchor_start],
-            v[1:2, anchor_start:anchor_end],
-        ], dim=1),
-        window_size=window_size,
-        dtype=dtype)
+    j_suffix_q = q[1:2, anchor_end:joint_seq_len]
+    if use_selective_suffix_memory:
+        suffix_groups = []
+        if anchor_prior is None:
+            suffix_groups.append((
+                torch.cat([
+                    k[1:2, :anchor_start], positioned_joint_anchor_k
+                ], dim=1),
+                torch.cat([
+                    v[1:2, :anchor_start],
+                    v[1:2, anchor_start:anchor_end]
+                ], dim=1),
+                0.0))
+        else:
+            last_prefix_start = anchor_start - tokens_per_frame
+            suffix_groups.extend([
+                (k[1:2, :last_prefix_start],
+                 v[1:2, :last_prefix_start], 0.0),
+                (positioned_joint_anchor_k,
+                 v[1:2, anchor_start:anchor_end],
+                 math.log(float(anchor_prior))),
+                (k[1:2, last_prefix_start:anchor_start],
+                 v[1:2, last_prefix_start:anchor_start],
+                 math.log1p(-float(anchor_prior))),
+            ])
+        if selective_alpha < 1.0:
+            suffix_groups.append((
+                k[1:2, anchor_end:joint_seq_len],
+                v[1:2, anchor_end:joint_seq_len],
+                math.log1p(-selective_alpha)))
+        if selective_alpha > 0.0:
+            suffix_groups.append((
+                k[0:1, anchor_end:seq_len],
+                v[0:1, anchor_end:seq_len],
+                math.log(selective_alpha)))
+        j_suffix_output = grouped_attention(j_suffix_q, suffix_groups)
+    else:
+        if anchor_prior is None:
+            j_suffix_result = flash_attention(
+                q=j_suffix_q,
+                k=torch.cat([
+                    k[1:2, :anchor_start],
+                    positioned_joint_anchor_k,
+                    k[1:2, anchor_end:joint_seq_len],
+                ], dim=1),
+                v=torch.cat([
+                    v[1:2, :anchor_start], v[1:2, anchor_start:anchor_end],
+                    v[1:2, anchor_end:joint_seq_len],
+                ], dim=1),
+                window_size=window_size,
+                dtype=dtype,
+                return_lse=use_split_memory)
+        else:
+            last_prefix_start = anchor_start - tokens_per_frame
+            j_suffix_result = _shared_position_prior_attention(
+                q=j_suffix_q,
+                ordinary_k=torch.cat([
+                    k[1:2, :last_prefix_start],
+                    k[1:2, anchor_end:joint_seq_len],
+                ], dim=1),
+                ordinary_v=torch.cat([
+                    v[1:2, :last_prefix_start],
+                    v[1:2, anchor_end:joint_seq_len],
+                ], dim=1),
+                anchor_k=positioned_joint_anchor_k,
+                anchor_v=v[1:2, anchor_start:anchor_end],
+                neighbour_k=k[1:2, last_prefix_start:anchor_start],
+                neighbour_v=v[1:2, last_prefix_start:anchor_start],
+                anchor_prior=anchor_prior,
+                window_size=window_size,
+                dtype=dtype,
+                return_lse=use_split_memory)
+
+        j_suffix_output = merge_joint_and_m_memory(
+            j_suffix_result, j_suffix_q)
 
     # The sole multi-image anchor evolves from itself and J's suffix. For this
     # anchor-query route, place both its query and self key at the final-prefix
@@ -798,13 +1238,25 @@ def self_attention_guidance_attention(
         return (m_frames + alpha_eff.to(delta_frames.dtype) *
                 delta_frames).reshape_as(m_output)
 
-    guided_m_prefix_output = inject_joint_residual(
-        m_prefix_output, j_prefix_output, anchor_index)
+    direct_joint_update = (
+        joint_query_single_memory_alpha is not None
+        or selective_suffix_memory_alpha is not None)
+    if not direct_joint_update:
+        guided_m_prefix_output = inject_joint_residual(
+            m_prefix_output, j_prefix_output, anchor_index)
+    else:
+        guided_m_prefix_output = j_prefix_output
     # Before the J handoff, suffix guidance is exclusively M/J. B is still
     # evaluated so B0 can supply the anchor velocity, but B1: does not enter
     # the layer-wise suffix update until the two-stream M/B handoff route.
-    guided_m_suffix_output = inject_joint_residual(
-        m_suffix_output, j_suffix_output, frames - anchor_index - 1)
+    if not direct_joint_update:
+        guided_m_suffix_output = inject_joint_residual(
+            m_suffix_output, j_suffix_output, frames - anchor_index - 1)
+    else:
+        # Each split output already lets one J query choose J versus M memory
+        # inside one exact normalization. Mixing it with O_M again would
+        # reintroduce the completed-output interpolation this ablation avoids.
+        guided_m_suffix_output = j_suffix_output
     guided_m_retained_output = torch.cat([
         guided_m_prefix_output, guided_m_suffix_output
     ], dim=1)

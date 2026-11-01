@@ -2,7 +2,9 @@
 import torch
 import torch.distributed as dist
 
-from ..modules.attention import (flash_attention, paired_anchor_attention,
+from ..modules.attention import (duplicate_anchor_rope, flash_attention,
+                                 one_way_img2_attention,
+                                 paired_anchor_attention,
                                  self_attention_guidance_attention,
                                  temporary_anchor_rope)
 from .util import all_to_all
@@ -20,10 +22,15 @@ def distributed_attention(
         paired_stream_weight=0.25,
         paired_prefix_anchor_active=True,
         paired_prefix_future_eta=0.0,
+        one_way_img2_anchor_index=None,
+        one_way_img2_weight=0.25,
         attention_guidance_anchor_index=None,
         self_attention_guidance_scale=0.5,
         self_attention_guidance_img2_weight=0.25,
         self_attention_guidance_rms_cap=None,
+        self_attention_guidance_anchor_prior=None,
+        self_attention_guidance_joint_query_single_memory_alpha=None,
+        self_attention_guidance_selective_suffix_memory_alpha=None,
 ):
     """
     Performs distributed attention based on DeepSpeed Ulysses attention mechanism.
@@ -45,6 +52,21 @@ def distributed_attention(
     k = all_to_all(k, scatter_dim=2, gather_dim=1)
     v = all_to_all(v, scatter_dim=2, gather_dim=1)
 
+    if one_way_img2_anchor_index is not None:
+        if grid_sizes is None or freqs is None:
+            raise ValueError(
+                "one-way Img2 RoPE requires grid sizes and frequencies")
+        q = torch.cat([
+            duplicate_anchor_rope(
+                q[:1], grid_sizes[:1], freqs,
+                one_way_img2_anchor_index), q[1:]
+        ], dim=0)
+        k = torch.cat([
+            duplicate_anchor_rope(
+                k[:1], grid_sizes[:1], freqs,
+                one_way_img2_anchor_index), k[1:]
+        ], dim=0)
+
     if attention_guidance_anchor_index is not None:
         if grid_sizes is None or freqs is None:
             raise ValueError(
@@ -64,7 +86,21 @@ def distributed_attention(
         ], dim=0)
 
     # apply attention
-    if paired_anchor_index is not None:
+    if one_way_img2_anchor_index is not None:
+        if grid_sizes is None:
+            raise ValueError(
+                "one-way Img2 distributed attention requires grid sizes")
+        x = one_way_img2_attention(
+            q=q,
+            k=k,
+            v=v,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            anchor_index=one_way_img2_anchor_index,
+            img2_weight=one_way_img2_weight,
+            window_size=window_size,
+        )
+    elif paired_anchor_index is not None:
         if grid_sizes is None:
             raise ValueError(
                 "paired distributed attention requires grid sizes")
@@ -93,6 +129,11 @@ def distributed_attention(
             joint_weight=self_attention_guidance_scale,
             img2_weight=self_attention_guidance_img2_weight,
             joint_rms_cap=self_attention_guidance_rms_cap,
+            anchor_prior=self_attention_guidance_anchor_prior,
+            joint_query_single_memory_alpha=(
+                self_attention_guidance_joint_query_single_memory_alpha),
+            selective_suffix_memory_alpha=(
+                self_attention_guidance_selective_suffix_memory_alpha),
             window_size=window_size,
         )
     else:

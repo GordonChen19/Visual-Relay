@@ -1,3 +1,4 @@
+import math
 import unittest
 from unittest import mock
 
@@ -13,13 +14,49 @@ if torch is not None:
 class PairedAnchorAttentionRoutingTest(unittest.TestCase):
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
-    def test_duplicate_position_attention_matches_negative_log2_bias(self):
-        generator = torch.Generator().manual_seed(7)
+    def test_one_way_img2_guidance_updates_only_aligned_main_outputs(self):
+        q = torch.zeros(2, 6, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        v[0, :, 0, 0] = torch.tensor([10., 11., 12., 13., 14., 15.])
+        v[1, :3, 0, 0] = torch.tensor([20., 21., 22.])
+        calls = []
+        value_calls = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1)))
+            value_calls.append(v.clone())
+            return torch.full_like(q, float(len(calls)))
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash):
+            output = attention.one_way_img2_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([6, 3]),
+                grid_sizes=torch.tensor([[6, 1, 1], [3, 1, 1]]),
+                anchor_index=2,
+                img2_weight=0.25)
+
+        self.assertEqual(calls, [(2, 5), (3, 5), (1, 3), (3, 3)])
+        self.assertEqual(value_calls[0][0, :, 0, 0].tolist(),
+                         [10.0, 11.0, 20.0, 14.0, 15.0])
+        self.assertEqual(output[0, :, 0, 0].tolist(),
+                         [1.0, 1.0, 3.0, 4.0, 2.5, 2.5])
+        self.assertEqual(output[1, :3, 0, 0].tolist(), [4.0, 4.0, 4.0])
+        self.assertEqual(output[1, 3:, 0, 0].tolist(), [0.0, 0.0, 0.0])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_shared_position_prior_matches_one_biased_softmax(self):
+        generator = torch.Generator().manual_seed(17)
         q = torch.randn(1, 3, 2, 4, generator=generator)
         ordinary_k = torch.randn(1, 5, 2, 4, generator=generator)
         ordinary_v = torch.randn(1, 5, 2, 4, generator=generator)
-        duplicate_k = torch.randn(1, 4, 2, 4, generator=generator)
-        duplicate_v = torch.randn(1, 4, 2, 4, generator=generator)
+        anchor_k = torch.randn(1, 2, 2, 4, generator=generator)
+        anchor_v = torch.randn(1, 2, 2, 4, generator=generator)
+        neighbour_k = torch.randn(1, 2, 2, 4, generator=generator)
+        neighbour_v = torch.randn(1, 2, 2, 4, generator=generator)
+        anchor_prior = 0.8
 
         def dense_flash(q, k, v, return_lse=False, **kwargs):
             logits = torch.einsum('bqhd,bkhd->bhqk', q, k) / 2.0
@@ -30,29 +67,35 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
             return output
 
         with mock.patch.object(attention, 'flash_attention', dense_flash):
-            actual = attention._duplicate_position_attention(
-                q, ordinary_k, ordinary_v, duplicate_k, duplicate_v,
+            actual = attention._shared_position_prior_attention(
+                q, ordinary_k, ordinary_v, anchor_k, anchor_v,
+                neighbour_k, neighbour_v, anchor_prior,
                 dtype=torch.bfloat16)
 
         ordinary_logits = torch.einsum(
             'bqhd,bkhd->bhqk', q, ordinary_k) / 2.0
-        duplicate_logits = (
-            torch.einsum('bqhd,bkhd->bhqk', q, duplicate_k) / 2.0
-            - torch.log(torch.tensor(2.0)))
-        logits = torch.cat([ordinary_logits, duplicate_logits], dim=-1)
-        values = torch.cat([ordinary_v, duplicate_v], dim=1)
+        anchor_logits = (
+            torch.einsum('bqhd,bkhd->bhqk', q, anchor_k) / 2.0
+            + torch.log(torch.tensor(anchor_prior)))
+        neighbour_logits = (
+            torch.einsum('bqhd,bkhd->bhqk', q, neighbour_k) / 2.0
+            + torch.log(torch.tensor(1.0 - anchor_prior)))
+        logits = torch.cat(
+            [ordinary_logits, anchor_logits, neighbour_logits], dim=-1)
+        values = torch.cat(
+            [ordinary_v, anchor_v, neighbour_v], dim=1)
         expected = torch.einsum(
             'bhqk,bkhd->bqhd', logits.softmax(-1), values)
         torch.testing.assert_close(actual, expected)
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
-    def test_prefix_future_nudge_matches_dense_framewise_reference(self):
+    def test_paired_memory_alpha_matches_dense_biased_softmax(self):
         generator = torch.Generator().manual_seed(42)
-        q = torch.randn(3, 10, 2, 4, generator=generator)
-        k = torch.randn(2, 10, 2, 4, generator=generator)
-        v = torch.randn(2, 10, 2, 4, generator=generator)
-        # C: five frames, two spatial tokens each; anchor at frame 2.
-        # B: three frames. Use two heads to check LSE axes.
+        q = torch.randn(2, 5, 2, 4, generator=generator)
+        k = torch.randn(2, 5, 2, 4, generator=generator)
+        v = torch.randn(2, 5, 2, 4, generator=generator)
+        alpha = 0.25
+
         def dense_flash(q, k, v, return_lse=False, **kwargs):
             logits = torch.einsum('bqhd,bkhd->bhqk', q, k) / 2.0
             output = torch.einsum('bhqk,bkhd->bqhd', logits.softmax(-1), v)
@@ -60,33 +103,32 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
                 return output, logits.logsumexp(-1).transpose(1, 2)
             return output
 
-        for eta in (0.0, 0.2, 1.0):
-            with (mock.patch.object(attention, 'flash_attention', dense_flash),
-                  mock.patch.object(attention, '_shift_temporal_rope',
-                                    side_effect=lambda x, *args: x)):
-                output = attention.paired_anchor_attention(
-                    q, k, v, torch.tensor([6, 10, 2]),
-                    torch.tensor([[3, 1, 2], [5, 1, 2], [1, 1, 2]]),
-                    torch.ones(10, 2, dtype=torch.complex64), 2,
-                    prefix_anchor_active=False, prefix_future_eta=eta)
-            # Prefix memory is C0:C2, H, then C4:C5. C2 is the hidden
-            # transport slot and C3 is the regular copy replaced by H.
-            keys = torch.cat([k[1:2, :4], k[2:3, :2], k[1:2, 8:10]], dim=1)
-            values = torch.cat([v[1:2, :4], v[2:3, :2], v[1:2, 8:10]], dim=1)
-            for frame in range(2):
-                query = q[1:2, frame * 2:(frame + 1) * 2]
-                logits = torch.einsum('bqhd,bkhd->bhqk', query, keys) / 2.0
-                probabilities = logits.softmax(-1)
-                split = (frame + 1) * 2
-                future_mass = probabilities[..., split:].sum(-1, keepdim=True)
-                target_mass = future_mass + eta * future_mass * (1 - future_mass)
-                adjusted = torch.cat([
-                    probabilities[..., :split] * (1 - target_mass) / (1 - future_mass),
-                    probabilities[..., split:] * target_mass / future_mass,
-                ], dim=-1)
-                expected = torch.einsum('bhqk,bkhd->bqhd', adjusted, values)
-                torch.testing.assert_close(
-                    output[1:2, frame * 2:(frame + 1) * 2], expected)
+        with (mock.patch.object(attention, 'flash_attention', dense_flash),
+              mock.patch.object(attention, '_shift_temporal_rope',
+                                side_effect=lambda x, *args: x)):
+            output = attention.paired_anchor_attention(
+                q, k, v, torch.tensor([3, 5]),
+                torch.tensor([[3, 1, 1], [5, 1, 1]]),
+                torch.ones(5, 1, dtype=torch.complex64), 2,
+                stream_weight=alpha)
+
+        retained_q = torch.cat([q[1:2, :2], q[1:2, 3:5]], dim=1)
+        prefix_logits = torch.einsum(
+            'bqhd,bkhd->bhqk', retained_q, k[1:2, :2]) / 2.0
+        c_suffix_logits = (
+            torch.einsum('bqhd,bkhd->bhqk', retained_q, k[1:2, 3:5])
+            / 2.0 + math.log(1.0 - alpha))
+        b_suffix_logits = (
+            torch.einsum('bqhd,bkhd->bhqk', retained_q, k[0:1, 1:3])
+            / 2.0 + math.log(alpha))
+        logits = torch.cat(
+            [prefix_logits, c_suffix_logits, b_suffix_logits], dim=-1)
+        values = torch.cat(
+            [v[1:2, :2], v[1:2, 3:5], v[0:1, 1:3]], dim=1)
+        expected = torch.einsum(
+            'bhqk,bkhd->bqhd', logits.softmax(-1), values)
+        actual = torch.cat([output[1:2, :2], output[1:2, 3:5]], dim=1)
+        torch.testing.assert_close(actual, expected)
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_guidance_rms_cap_limits_joint_residual_per_frame(self):
@@ -122,6 +164,163 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
         self.assertEqual(
             output[0, :, 0, 0].tolist(),
             [1.1, 1.1, 0.0, 1.1, 1.1, 1.1])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_joint_prefix_and_suffix_split_memory_match_dense_softmax(self):
+        generator = torch.Generator().manual_seed(91)
+        q = torch.randn(3, 6, 1, 2, generator=generator)
+        k = torch.randn(3, 6, 1, 2, generator=generator)
+        v = torch.randn(3, 6, 1, 2, generator=generator)
+        alpha = 0.25
+
+        def dense_flash(q, k, v, return_lse=False, **kwargs):
+            logits = torch.einsum(
+                'bqhd,bkhd->bhqk', q, k) / math.sqrt(q.size(-1))
+            output = torch.einsum(
+                'bhqk,bkhd->bqhd', logits.softmax(-1), v)
+            if return_lse:
+                return output, logits.logsumexp(-1).transpose(1, 2)
+            return output
+
+        with (mock.patch.object(attention, 'flash_attention', dense_flash),
+              mock.patch.object(attention, '_shift_temporal_rope',
+                                side_effect=lambda x, *args: x)):
+            output = attention.self_attention_guidance_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([6, 6, 4]),
+                grid_sizes=torch.tensor(
+                    [[6, 1, 1], [6, 1, 1], [4, 1, 1]]),
+                freqs=torch.zeros(5, 1),
+                anchor_index=2,
+                joint_weight=0.5,
+                joint_query_single_memory_alpha=alpha)
+
+        m_k = torch.cat([k[0:1, :2], k[0:1, 3:6]], dim=1)
+        m_v = torch.cat([v[0:1, :2], v[0:1, 3:6]], dim=1)
+
+        j_prefix_q = q[1:2, :2]
+        j_prefix_logits = (
+            torch.einsum('bqhd,bkhd->bhqk', j_prefix_q, k[1:2, :6])
+            / math.sqrt(q.size(-1)) + math.log(1.0 - alpha))
+        m_prefix_logits = (
+            torch.einsum('bqhd,bkhd->bhqk', j_prefix_q, m_k)
+            / math.sqrt(q.size(-1)) + math.log(alpha))
+        prefix_logits = torch.cat(
+            [j_prefix_logits, m_prefix_logits], dim=-1)
+        prefix_values = torch.cat([v[1:2, :6], m_v], dim=1)
+        expected_prefix = torch.einsum(
+            'bhqk,bkhd->bqhd', prefix_logits.softmax(-1), prefix_values)
+        torch.testing.assert_close(output[1:2, :2], expected_prefix)
+        torch.testing.assert_close(output[0:1, :2], expected_prefix)
+
+        j_suffix_q = q[1:2, 3:6]
+        j_logits = (
+            torch.einsum('bqhd,bkhd->bhqk', j_suffix_q, k[1:2, :6])
+            / math.sqrt(q.size(-1)) + math.log(1.0 - alpha))
+        m_logits = (
+            torch.einsum('bqhd,bkhd->bhqk', j_suffix_q, m_k)
+            / math.sqrt(q.size(-1)) + math.log(alpha))
+        logits = torch.cat([j_logits, m_logits], dim=-1)
+        values = torch.cat([v[1:2, :6], m_v], dim=1)
+        expected = torch.einsum(
+            'bhqk,bkhd->bqhd', logits.softmax(-1), values)
+        torch.testing.assert_close(output[1:2, 3:6], expected)
+        # The optional split-memory mode directly uses the joint-query result
+        # for M's suffix instead of interpolating it with completed O_M.
+        torch.testing.assert_close(output[0:1, 3:6], expected)
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_selective_suffix_memory_matches_dense_biased_softmax(self):
+        generator = torch.Generator().manual_seed(123)
+        q = torch.randn(3, 6, 1, 2, generator=generator)
+        k = torch.randn(3, 6, 1, 2, generator=generator)
+        v = torch.randn(3, 6, 1, 2, generator=generator)
+        alpha = 0.25
+        anchor_prior = 0.8
+
+        def dense_flash(q, k, v, return_lse=False, **kwargs):
+            logits = torch.einsum(
+                'bqhd,bkhd->bhqk', q, k) / math.sqrt(q.size(-1))
+            output = torch.einsum(
+                'bhqk,bkhd->bqhd', logits.softmax(-1), v)
+            if return_lse:
+                return output, logits.logsumexp(-1).transpose(1, 2)
+            return output
+
+        with (mock.patch.object(attention, 'flash_attention', dense_flash),
+              mock.patch.object(attention, '_shift_temporal_rope',
+                                side_effect=lambda x, *args: x)):
+            output = attention.self_attention_guidance_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([6, 6, 4]),
+                grid_sizes=torch.tensor(
+                    [[6, 1, 1], [6, 1, 1], [4, 1, 1]]),
+                freqs=torch.zeros(5, 1),
+                anchor_index=2,
+                joint_weight=0.5,
+                anchor_prior=anchor_prior,
+                selective_suffix_memory_alpha=alpha)
+
+        scale = math.sqrt(q.size(-1))
+        j_prefix_q = q[1:2, :2]
+        prefix_logits = torch.cat([
+            torch.einsum(
+                'bqhd,bkhd->bhqk', j_prefix_q, k[1:2, :2]) / scale,
+            torch.einsum(
+                'bqhd,bkhd->bhqk', j_prefix_q, k[1:2, 2:3]) / scale
+            + math.log(anchor_prior),
+            torch.einsum(
+                'bqhd,bkhd->bhqk', j_prefix_q, k[1:2, 3:4]) / scale
+            + math.log(1.0 - anchor_prior) + math.log(1.0 - alpha),
+            torch.einsum(
+                'bqhd,bkhd->bhqk', j_prefix_q, k[1:2, 4:6]) / scale
+            + math.log(1.0 - alpha),
+            torch.einsum(
+                'bqhd,bkhd->bhqk', j_prefix_q, k[0:1, 3:4]) / scale
+            + math.log(1.0 - anchor_prior) + math.log(alpha),
+            torch.einsum(
+                'bqhd,bkhd->bhqk', j_prefix_q, k[0:1, 4:6]) / scale
+            + math.log(alpha),
+        ], dim=-1)
+        prefix_values = torch.cat([
+            v[1:2, :2], v[1:2, 2:3], v[1:2, 3:4],
+            v[1:2, 4:6], v[0:1, 3:4], v[0:1, 4:6]
+        ], dim=1)
+        expected_prefix = torch.einsum(
+            'bhqk,bkhd->bqhd', prefix_logits.softmax(-1), prefix_values)
+
+        j_suffix_q = q[1:2, 3:6]
+        suffix_logits = torch.cat([
+            torch.einsum(
+                'bqhd,bkhd->bhqk', j_suffix_q, k[1:2, :1]) / scale,
+            torch.einsum(
+                'bqhd,bkhd->bhqk', j_suffix_q, k[1:2, 2:3]) / scale
+            + math.log(anchor_prior),
+            torch.einsum(
+                'bqhd,bkhd->bhqk', j_suffix_q, k[1:2, 1:2]) / scale
+            + math.log(1.0 - anchor_prior),
+            torch.einsum(
+                'bqhd,bkhd->bhqk', j_suffix_q, k[1:2, 3:6]) / scale
+            + math.log(1.0 - alpha),
+            torch.einsum(
+                'bqhd,bkhd->bhqk', j_suffix_q, k[0:1, 3:6]) / scale
+            + math.log(alpha),
+        ], dim=-1)
+        suffix_values = torch.cat([
+            v[1:2, :1], v[1:2, 2:3], v[1:2, 1:2],
+            v[1:2, 3:6], v[0:1, 3:6]
+        ], dim=1)
+        expected_suffix = torch.einsum(
+            'bhqk,bkhd->bqhd', suffix_logits.softmax(-1), suffix_values)
+
+        torch.testing.assert_close(output[1:2, :2], expected_prefix)
+        torch.testing.assert_close(output[0:1, :2], expected_prefix)
+        torch.testing.assert_close(output[1:2, 3:6], expected_suffix)
+        torch.testing.assert_close(output[0:1, 3:6], expected_suffix)
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_guidance_after_stop_keeps_b_suffix_guidance(self):
@@ -232,50 +431,41 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
                 joint_weight=0.5,
                 img2_weight=0.25)
 
-        self.assertEqual(len(calls), 7)
+        self.assertEqual(len(calls), 5)
         # M excludes its anchor from retained Q/K/V.
         self.assertEqual(
             calls[0][1][0, :, 0, 0].tolist(), [20., 21., 23., 24., 25.])
         self.assertEqual(
             calls[0][2][0, :, 0, 0].tolist(), [30., 31., 33., 34., 35.])
-        # J prefix ordinary group excludes the anchor and first suffix frame;
-        # its duplicate group contains exactly those two representations.
+        # J prefix uses one softmax over prefix, shifted anchor, and suffix.
         self.assertEqual(
-            calls[1][1][0, :, 0, 0].tolist(), [0., 1., 4., 5.])
+            calls[1][1][0, :, 0, 0].tolist(),
+            [0., 1., 52., 3., 4., 5.])
         self.assertEqual(
-            calls[1][2][0, :, 0, 0].tolist(), [10., 11., 14., 15.])
+            calls[1][2][0, :, 0, 0].tolist(),
+            [10., 11., 12., 13., 14., 15.])
+        # J suffix likewise uses one softmax with its shifted anchor key.
         self.assertEqual(
             calls[2][1][0, :, 0, 0].tolist(),
-            [52.0, 3.0])
+            [0., 1., -48., 3., 4., 5.])
         self.assertEqual(
             calls[2][2][0, :, 0, 0].tolist(),
-            [12.0, 13.0])
-        # J suffix ordinary group omits the last prefix and anchor; its
-        # duplicate group contains the colocated last-prefix/anchor pair.
-        self.assertEqual(
-            calls[3][1][0, :, 0, 0].tolist(), [0., 3., 4., 5.])
-        self.assertEqual(
-            calls[3][2][0, :, 0, 0].tolist(), [10., 13., 14., 15.])
-        self.assertEqual(
-            calls[4][1][0, :, 0, 0].tolist(), [1., -48.])
-        self.assertEqual(
-            calls[4][2][0, :, 0, 0].tolist(), [11., 12.])
+            [10., 11., 12., 13., 14., 15.])
         # J anchor reads itself and the J suffix; B remains standard.
         self.assertEqual(
-            calls[5][0][0, :, 0, 0].tolist(), [-50.])
+            calls[3][0][0, :, 0, 0].tolist(), [-50.])
         self.assertEqual(
-            calls[5][1][0, :, 0, 0].tolist(), [-48., 3., 4., 5.])
+            calls[3][1][0, :, 0, 0].tolist(), [-48., 3., 4., 5.])
         self.assertEqual(
-            calls[6][1][0, :, 0, 0].tolist(), [40., 41., 42., 43.])
-        # Equal group LSEs become a 1/3 duplicate-group weight after -log(2).
+            calls[4][1][0, :, 0, 0].tolist(), [40., 41., 42., 43.])
         torch.testing.assert_close(
             output[0, :, 0, 0],
-            torch.tensor([5 / 3, 5 / 3, 0., 8 / 3, 8 / 3, 8 / 3]))
+            torch.tensor([1.5, 1.5, 0., 2., 2., 2.]))
         torch.testing.assert_close(
             output[1, :, 0, 0],
-            torch.tensor([7 / 3, 7 / 3, 6., 13 / 3, 13 / 3, 13 / 3]))
+            torch.tensor([2., 2., 4., 3., 3., 3.]))
         self.assertEqual(
-            output[2, :, 0, 0].tolist(), [7., 7., 7., 7., 0., 0.])
+            output[2, :, 0, 0].tolist(), [5., 5., 5., 5., 0., 0.])
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_guidance_scale_must_be_a_convex_weight(self):
@@ -329,47 +519,68 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
             shifted.flatten().tolist(), [0.0, 1.0, -3.0, -7.0, -6.0])
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
-    def test_paired_prefix_uses_joint_proxy_but_regular_frame_velocity(self):
-        q = torch.zeros(3, 4, 1, 2)
+    def test_duplicate_anchor_rope_preserves_native_retained_positions(self):
+        values = torch.arange(6, dtype=torch.float32).view(1, 6, 1, 1)
+
+        def fake_shift(tensor, shift, freqs):
+            return tensor + shift * 10
+
+        with mock.patch.object(
+                attention, '_shift_temporal_rope', side_effect=fake_shift):
+            shifted = attention.duplicate_anchor_rope(
+                values,
+                grid_sizes=torch.tensor([[6, 1, 1]]),
+                freqs=torch.zeros(6, 1),
+                anchor_index=2)
+
+        # Auxiliary frame 2 stays at position 2. The retained frame that was
+        # expanded to slot 3 shifts back to position 2, and its suffix retains
+        # the native timeline positions 3 and 4.
+        self.assertEqual(
+            shifted.flatten().tolist(), [0.0, 1.0, 2.0, -7.0, -6.0, -5.0])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_paired_queries_use_mass_normalized_c_b_suffix_memory(self):
+        q = torch.zeros(2, 4, 1, 2)
         k = torch.zeros_like(q)
         v = torch.zeros_like(q)
+        # B0,B1 and expanded C0,C1,hidden-C2,C3.
         k[0, :2, 0, 0] = torch.tensor([30., 31.])
         v[0, :2, 0, 0] = torch.tensor([40., 41.])
         k[1, :, 0, 0] = torch.tensor([50., 51., 52., 53.])
         v[1, :, 0, 0] = torch.tensor([60., 61., 62., 63.])
-        k[2, 0, 0, 0] = 70.
-        v[2, 0, 0, 0] = 80.
-        for legacy_anchor_flag in (True, False):
-            calls = []
-            def fake_flash(q, k, v, **kwargs):
-                calls.append((q.clone(), k.clone(), v.clone()))
-                return torch.full_like(q, float(len(calls)))
-            with (mock.patch.object(attention, 'flash_attention', fake_flash),
-                  mock.patch.object(attention, '_shift_temporal_rope',
-                                    side_effect=lambda x, shift, f: x + 100 * shift)):
-                output = attention.paired_anchor_attention(
-                    q, k, v, torch.tensor([2, 4, 1]),
-                    torch.tensor([[2, 1, 1], [4, 1, 1], [1, 1, 1]]),
-                    torch.ones(4, 1, dtype=torch.complex64), 2,
-                    stream_weight=0.25, prefix_anchor_active=legacy_anchor_flag)
-            self.assertEqual(len(calls), 3)
-            # Prefix reads C0, C1 and H (shifted to C3's compressed
-            # coordinate). It reads neither transport C2 nor regular C3.
-            self.assertEqual(
-                calls[1][1][0, :, 0, 0].tolist(), [50., 51., 270.])
-            self.assertEqual(
-                calls[1][2][0, :, 0, 0].tolist(), [60., 61., 80.])
-            # C suffix uses ordinary C, including regular C3, and excludes C2.
-            self.assertEqual(
-                calls[2][1][0, :, 0, 0].tolist(), [50., 51., -47.])
-            self.assertEqual(
-                calls[2][2][0, :, 0, 0].tolist(), [60., 61., 63.])
-            self.assertEqual(output.shape, q.shape)
-            # B output=1, C prefix=2, hidden slot=B0=1, C suffix=2.5,
-            # and H receives aligned B1 output=1. H's prediction is discarded
-            # by image2video.py rather than copied into regular C3.
-            self.assertEqual(output[1, :, 0, 0].tolist(), [2., 2., 1., 2.5])
-            self.assertEqual(output[2, 0, 0, 0].item(), 1.)
+        calls = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.clone(), k.clone(), v.clone(), kwargs))
+            result = torch.full_like(q, float(len(calls)))
+            if kwargs.get('return_lse', False):
+                return result, torch.zeros(
+                    q.size(0), q.size(1), q.size(2), dtype=torch.float32)
+            return result
+
+        with (mock.patch.object(attention, 'flash_attention', fake_flash),
+              mock.patch.object(attention, '_shift_temporal_rope',
+                                side_effect=lambda x, shift, f: x + 100 * shift)):
+            output = attention.paired_anchor_attention(
+                q, k, v, torch.tensor([2, 4]),
+                torch.tensor([[2, 1, 1], [4, 1, 1]]),
+                torch.ones(4, 1, dtype=torch.complex64), 2,
+                stream_weight=0.25)
+
+        self.assertEqual(len(calls), 4)
+        # Call 0 is standard B self-attention. The remaining calls use the
+        # same retained C queries for unique prefix, C suffix and B1 memory.
+        self.assertEqual(calls[1][1][0, :, 0, 0].tolist(), [50., 51.])
+        self.assertEqual(calls[2][1][0, :, 0, 0].tolist(), [-47.])
+        self.assertEqual(calls[3][1][0, :, 0, 0].tolist(), [131.])
+        self.assertEqual(calls[2][2][0, :, 0, 0].tolist(), [63.])
+        self.assertEqual(calls[3][2][0, :, 0, 0].tolist(), [41.])
+        self.assertEqual(output.shape, q.shape)
+        # Prefix group LSE=0, C suffix gets log(.75), B suffix gets log(.25).
+        # Fake outputs 2,3,4 therefore merge to 2*.5 + 3*.375 + 4*.125=2.625.
+        torch.testing.assert_close(
+            output[1, :, 0, 0], torch.tensor([2.625, 2.625, 1., 2.625]))
 
 
 if __name__ == '__main__':

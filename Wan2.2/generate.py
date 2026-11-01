@@ -77,27 +77,136 @@ def _validate_args(args):
         args.tts_text = EXAMPLE_PROMPT[args.task]["tts_text"]
 
     if args.task == "i2v-A14B":
-        assert not (args.image_condition_paired_anchor_attention
-                    and args.image_condition_self_attention_guidance), (
-                        "Paired-anchor attention and self-attention guidance "
-                        "are separate ablations and cannot be combined.")
+        enabled_multi_image_modes = sum(bool(value) for value in (
+            args.image_condition_one_way_prompt_guidance,
+            args.image_condition_paired_anchor_attention,
+            args.image_condition_self_attention_guidance,
+        ))
+        assert enabled_multi_image_modes <= 1, (
+            "Multi-image attention ablations are mutually exclusive.")
+        assert 0.0 <= args.image_condition_one_way_prompt_guidance_weight <= 1.0, (
+            "--image_condition_one_way_prompt_guidance_weight must be in "
+            "[0, 1].")
+        if args.image_condition_one_way_prompt_guidance:
+            assert args.image_prompt is not None and len(args.image_prompt) == 2, (
+                "One-way prompt guidance requires exactly two "
+                "--image_prompt arguments.")
+            assert all(value for value in args.image_prompt), (
+                "Each --image_prompt must be non-empty.")
+            assert not args.use_prompt_extend, (
+                "Prompt extension is not supported with per-image prompts.")
+        else:
+            assert args.image_prompt is None, (
+                "--image_prompt is only used by "
+                "--image_condition_one_way_prompt_guidance.")
         assert 0.0 <= args.image_condition_self_attention_guidance_scale <= 1.0, (
             "--image_condition_self_attention_guidance_scale must be "
             "in [0, 1].")
+        if args.image_condition_self_attention_guidance_scale_end is not None:
+            assert args.image_condition_self_attention_guidance, (
+                "--image_condition_self_attention_guidance_scale_end requires "
+                "--image_condition_self_attention_guidance.")
+            assert (0.0 <=
+                    args.image_condition_self_attention_guidance_scale_end <=
+                    args.image_condition_self_attention_guidance_scale), (
+                        "guidance-scale end must be in [0, guidance-scale].")
+        if (args.image_condition_self_attention_guidance_scale_end_step
+                is not None):
+            assert (args.image_condition_self_attention_guidance_scale_end
+                    is not None), (
+                        "--image_condition_self_attention_guidance_scale_end_step "
+                        "requires --image_condition_self_attention_guidance_scale_end.")
+            assert (args.image_condition_self_attention_guidance_scale_end_step
+                    >= 1), (
+                        "--image_condition_self_attention_guidance_scale_end_step "
+                        "must be at least 1.")
         assert 0.0 <= args.image_condition_self_attention_guidance_img2_weight <= 1.0, (
             "--image_condition_self_attention_guidance_img2_weight must be "
             "in [0, 1].")
+        if (args.image_condition_self_attention_guidance_joint_query_single_memory_alpha
+                is not None):
+            assert args.image_condition_self_attention_guidance, (
+                "--image_condition_self_attention_guidance_joint_query_single_memory_alpha "
+                "requires --image_condition_self_attention_guidance.")
+            assert (0.0 <=
+                    args.image_condition_self_attention_guidance_joint_query_single_memory_alpha
+                    <= 1.0), (
+                        "joint-query single-memory alpha must be in [0, 1].")
+        if (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha
+                is not None):
+            assert args.image_condition_self_attention_guidance, (
+                "--image_condition_self_attention_guidance_selective_suffix_memory_alpha "
+                "requires --image_condition_self_attention_guidance.")
+            assert (0.0 <=
+                    args.image_condition_self_attention_guidance_selective_suffix_memory_alpha
+                    <= 1.0), (
+                        "selective suffix-memory alpha must be in [0, 1].")
+        if (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end
+                is not None):
+            assert (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha
+                    is not None), (
+                        "selective suffix-memory alpha end requires the "
+                        "selective suffix-memory mode.")
+            assert (0.0 <=
+                    args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end
+                    <= 1.0), (
+                        "selective suffix-memory alpha end must be in [0, 1].")
+        if (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step
+                is not None):
+            assert (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end
+                    is not None), (
+                        "selective suffix-memory alpha end step requires "
+                        "selective suffix-memory alpha end.")
+            assert (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step
+                    >= 1), (
+                        "selective suffix-memory alpha end step must be at least 1.")
+        assert not (
+            args.image_condition_self_attention_guidance_joint_query_single_memory_alpha
+            is not None
+            and args.image_condition_self_attention_guidance_selective_suffix_memory_alpha
+            is not None), (
+                "full-memory and selective-suffix memory modes are exclusive.")
         assert (args.image_condition_self_attention_guidance_rms_cap is None
                 or args.image_condition_self_attention_guidance_rms_cap > 0), (
             "--image_condition_self_attention_guidance_rms_cap must be "
             "positive.")
+        if args.image_condition_self_attention_guidance_anchor_prior:
+            assert args.image_condition_self_attention_guidance, (
+                "--image_condition_self_attention_guidance_anchor_prior "
+                "requires --image_condition_self_attention_guidance.")
+            assert (0.0 <
+                    args.image_condition_self_attention_guidance_anchor_prior_end
+                    <= args.image_condition_self_attention_guidance_anchor_prior_start
+                    < 1.0), (
+                        "anchor-prior values must satisfy "
+                        "0 < end <= start < 1.")
+        if (args.image_condition_self_attention_guidance_anchor_prior_end_step
+                is not None):
+            assert args.image_condition_self_attention_guidance_anchor_prior, (
+                "--image_condition_self_attention_guidance_anchor_prior_end_step "
+                "requires --image_condition_self_attention_guidance_anchor_prior.")
+            assert (args.image_condition_self_attention_guidance_anchor_prior_end_step
+                    >= 1), (
+                        "--image_condition_self_attention_guidance_anchor_prior_end_step "
+                        "must be at least 1.")
         if args.image_condition_self_attention_guidance_stop_step is not None:
             assert args.image_condition_self_attention_guidance, (
                 "--image_condition_self_attention_guidance_stop_step requires "
                 "--image_condition_self_attention_guidance.")
+        if args.image_condition_self_attention_guidance_post_stop_img2_suffix:
+            assert args.image_condition_self_attention_guidance, (
+                "post-stop Img2 suffix guidance requires "
+                "--image_condition_self_attention_guidance.")
+            assert (args.image_condition_self_attention_guidance_stop_step
+                    is not None), (
+                        "post-stop Img2 suffix guidance requires "
+                        "--image_condition_self_attention_guidance_stop_step.")
         assert args.image is not None, "Please specify the image path for i2v."
         assert 0.0 <= args.image_condition_paired_stream_weight <= 1.0, (
             "--image_condition_paired_stream_weight must be in [0, 1].")
+        assert (args.image_condition_paired_memory_alpha is None
+                or 0.0 <= args.image_condition_paired_memory_alpha <= 1.0), (
+            "--image_condition_paired_memory_alpha must be in [0, 1].")
         assert 0.0 <= args.image_condition_paired_prefix_future_eta <= 1.0, (
             "--image_condition_paired_prefix_future_eta must be in [0, 1].")
         paired_fade_pairs = {
@@ -112,7 +221,16 @@ def _validate_args(args):
             assert ((fade_steps[0] is None) == (fade_steps[1] is None)), (
                 f"Paired {fade_name} fade start and end steps must be "
                 "supplied together.")
-        if (args.image_condition_paired_anchor_attention
+        if args.image_condition_one_way_prompt_guidance:
+            assert all(steps == (None, None)
+                       for steps in paired_fade_pairs.values()), (
+                "Paired-attention fading does not apply to one-way prompt "
+                "guidance.")
+            assert args.image_condition_paired_prefix_route_switch_step is None, (
+                "Paired prefix routing does not apply to one-way prompt "
+                "guidance.")
+        if (args.image_condition_one_way_prompt_guidance
+                or args.image_condition_paired_anchor_attention
                 or args.image_condition_self_attention_guidance):
             assert len(args.image) == 2, (
                 "The selected multi-image ablation requires exactly two "
@@ -148,12 +266,16 @@ def _validate_args(args):
                     or args.image_latent_index == [0]), (
                         "Standard I2V only supports image latent index 0.")
     else:
+        assert not args.image_condition_one_way_prompt_guidance, (
+            "One-way prompt guidance is supported only by i2v-A14B.")
         assert not args.image_condition_paired_anchor_attention, (
             "Paired anchor attention is supported only by i2v-A14B.")
         assert not args.image_condition_self_attention_guidance, (
             "Self-attention guidance is supported only by i2v-A14B.")
         assert args.image_latent_index is None, (
             "--image_latent_index is supported only by paired I2V.")
+        assert args.image_prompt is None, (
+            "--image_prompt is supported only by one-way paired I2V.")
         assert args.image is None or len(args.image) == 1, (
             "Only paired I2V accepts multiple --image arguments.")
 
@@ -180,6 +302,27 @@ def _validate_args(args):
                     args.sample_steps), (
                         "--image_condition_self_attention_guidance_stop_step "
                         "must be in [0, sample_steps).")
+        if (args.image_condition_self_attention_guidance_anchor_prior_end_step
+                is not None):
+            assert (
+                args.image_condition_self_attention_guidance_anchor_prior_end_step
+                < args.sample_steps), (
+                    "--image_condition_self_attention_guidance_anchor_prior_end_step "
+                    "must be in [1, sample_steps).")
+        if (args.image_condition_self_attention_guidance_scale_end_step
+                is not None):
+            assert (
+                args.image_condition_self_attention_guidance_scale_end_step <
+                args.sample_steps), (
+                    "--image_condition_self_attention_guidance_scale_end_step "
+                    "must be in [1, sample_steps).")
+        if (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step
+                is not None):
+            assert (
+                args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step
+                < args.sample_steps), (
+                    "selective suffix-memory alpha end step must be in "
+                    "[1, sample_steps).")
 
     if args.sample_shift is None:
         args.sample_shift = cfg.sample_shift
@@ -190,7 +333,8 @@ def _validate_args(args):
     if args.frame_num is None:
         args.frame_num = cfg.frame_num
 
-    if (args.image_condition_paired_anchor_attention
+    if (args.image_condition_one_way_prompt_guidance
+            or args.image_condition_paired_anchor_attention
             or args.image_condition_self_attention_guidance):
         latent_frame_num = ((args.frame_num - 1) // cfg.vae_stride[0] + 1)
         assert args.image_latent_index[1] < latent_frame_num - 1, (
@@ -312,12 +456,42 @@ def _parse_args():
         help=("Latent index corresponding to each --image in paired anchor "
               "attention; use 0 for Img1 and a positive index for Img2."))
     parser.add_argument(
+        "--image_prompt",
+        type=str,
+        action="append",
+        default=None,
+        help=("Prompt paired positionally with each repeated --image. Used "
+              "only by one-way per-image-prompt guidance."))
+    parser.add_argument(
+        "--image_condition_one_way_prompt_guidance",
+        action="store_true",
+        help=("Run native-length Img1 M and aligned Img2-first B with their "
+              "respective --image_prompt values. Both streams use ordinary "
+              "bidirectional attention. M keeps its full Img1-only timeline "
+              "and adds one auxiliary joint Img1-to-Img2 anchor sharing the "
+              "ordinary anchor's integer RoPE position. Prefix queries use "
+              "the auxiliary anchor key paired with B0's value and do not "
+              "see the ordinary anchor. Ordinary "
+              "anchor/suffix queries see the ordinary anchor but not the "
+              "auxiliary one. The auxiliary anchor uses its own query to "
+              "attend to the prefix plus itself. B0 completely replaces the "
+              "ordinary anchor's self-attention output, while B1: guides only "
+              "the aligned post-anchor suffix. There is no "
+              "M-to-B influence or final velocity replacement."))
+    parser.add_argument(
+        "--image_condition_one_way_prompt_guidance_weight",
+        type=float,
+        default=0.25,
+        help=("Layerwise B1: output weight applied only to M's aligned "
+              "post-anchor suffix; B0 completely replaces M's ordinary "
+              "anchor output regardless of this weight (default: 0.25)."))
+    parser.add_argument(
         "--image_condition_paired_anchor_attention",
         action="store_true",
-        help=("Use Img1-only C, aligned Img2-first B, and a one-frame joint "
-              "proxy H for C's first retained suffix frame. Prefix queries "
-              "use H instead of regular C at that frame; H's final prediction "
-              "is discarded, so the retained velocity comes from regular C."))
+        help=("Use Img1-only C/M and aligned Img2-first B. Every retained C "
+              "query reads C prefix plus aligned C/B1: suffix K/V in one "
+              "mass-normalized attention. B0 is excluded from C memory and "
+              "maintains only the hidden transport state."))
     parser.add_argument(
         "--image_condition_self_attention_guidance",
         action="store_true",
@@ -325,8 +499,9 @@ def _parse_args():
               "Img2-first suffix B in both CFG branches. M's temporary slot "
               "is excluded from attention. Removing J's anchor aligns its "
               "retained attention output with M for M/J guidance. J retained "
-              "queries apply a -log(2) softmax-mass correction to the two "
-              "representations sharing each anchor-adjacent RoPE coordinate. "
+              "queries use one mathematical softmax across every visible key, "
+              "including anchor-adjacent representations sharing a RoPE "
+              "coordinate. "
               "B0 replaces the temporary anchor velocity before CFG."))
     parser.add_argument(
         "--image_condition_self_attention_guidance_scale",
@@ -335,17 +510,100 @@ def _parse_args():
         help=("J output weight used in both prefix and suffix fusion "
               "(default: 0.5)."))
     parser.add_argument(
+        "--image_condition_self_attention_guidance_scale_end",
+        type=float,
+        default=None,
+        help=("Optional final J output weight for a cosine guidance-scale "
+              "schedule. It remains fixed after the end step."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_scale_end_step",
+        type=int,
+        default=None,
+        help=("Zero-based sampling step at which the cosine guidance-scale "
+              "schedule reaches its final value. Defaults to the last step."))
+    parser.add_argument(
         "--image_condition_self_attention_guidance_img2_weight",
         type=float,
         default=0.25,
-        help=("Legacy compatibility option; unused by the self-attention "
-              "guidance ablation, which switches to pure M at stop_step."))
+        help=("B attention-output residual weight for optional post-stop "
+              "Img2 suffix guidance (default: 0.25)."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_post_stop_img2_suffix",
+        action="store_true",
+        help=("After the J stop step, run aligned M and Img2-first B streams. "
+              "B1: layerwise self-attention outputs guide only M frames after "
+              "Img2; the prefix and temporary anchor remain M-only and B0 "
+              "does not replace the anchor velocity."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_joint_query_single_memory_alpha",
+        type=float,
+        default=None,
+        help=("Optional M-memory source prior for J prefix and suffix queries. "
+              "Each J query group attends separately to full J memory and "
+              "retained Img1-only M memory, then combines the groups exactly "
+              "from their FlashAttention log-normalizers. The split results "
+              "directly update M's aligned prefix and suffix without another "
+              "M/J output interpolation. The anchor query remains J-only. "
+              "Zero is J-memory-only and one is M-memory-only."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_selective_suffix_memory_alpha",
+        type=float,
+        default=None,
+        help=("Optional M-source prior for aligned suffix memory only. J "
+              "prefix queries read unique J prefix, the J anchor and paired "
+              "J/M suffix. At the anchor/first-suffix shared RoPE position, "
+              "the anchor prior divides anchor versus neighbour mass and "
+              "alpha divides the neighbour mass between J/M. J suffix "
+              "queries read J prefix, the J anchor and paired J/M suffix. "
+              "The exact LSE-merged "
+              "outputs directly update aligned M/J positions. Zero uses "
+              "J suffix memory only and one uses M suffix memory only."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_selective_suffix_memory_alpha_end",
+        type=float,
+        default=None,
+        help=("Optional final M-suffix prior for a cosine alpha schedule. "
+              "It remains fixed after the end step. Omit this option to keep "
+              "the selective suffix-memory alpha constant."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step",
+        type=int,
+        default=None,
+        help=("Zero-based sampling step at which selective suffix-memory "
+              "alpha reaches its final value. Defaults to the final sampling "
+              "step when alpha-end is supplied."))
     parser.add_argument(
         "--image_condition_self_attention_guidance_rms_cap",
         type=float,
         default=None,
         help=("Optional per-frame, per-head cap on the injected J-M attention "
               "residual RMS, expressed as a fraction of M RMS."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_anchor_prior",
+        action="store_true",
+        help=("Use exact three-group LSE merging for J prefix/suffix shared "
+              "positions. The anchor prior follows a cosine schedule from "
+              "anchor-prior-start to anchor-prior-end, then remains at the "
+              "end value."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_anchor_prior_start",
+        type=float,
+        default=0.8,
+        help=("Anchor share of the shared-position prior at the first "
+              "denoising step (default: 0.8)."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_anchor_prior_end",
+        type=float,
+        default=0.2,
+        help=("Final anchor share reached at anchor-prior-end-step "
+              "(default: 0.2)."))
+    parser.add_argument(
+        "--image_condition_self_attention_guidance_anchor_prior_end_step",
+        type=int,
+        default=None,
+        help=("Zero-based sampling step at which the cosine anchor-prior "
+              "schedule reaches its end value. It remains there afterward. "
+              "By default, it reaches the end value on the final step."))
     parser.add_argument(
         "--image_condition_self_attention_guidance_stop_step",
         type=int,
@@ -356,29 +614,34 @@ def _parse_args():
     parser.add_argument(
         "--image_condition_paired_prefix_future_eta",
         type=float, default=0.0,
-        help=("Prefix future-attention nudge eta in [0, 1]. Always excludes "
-              "the temporary anchor and adjusts future mass by eta*w*(1-w). "
-              "Zero uses ordinary softmax over retained C frames."))
+        help=("Legacy compatibility option; ignored by paired M/B memory "
+              "attention."))
     parser.add_argument(
         "--image_condition_paired_stream_weight",
         type=float,
         default=0.25,
-        help=("Fixed Img2-stream attention-output weight used independently "
-              "for the C/B and D/B suffix fusions; must be in [0, 1] "
-              "(default: 0.25)."))
+        help=("Legacy fallback for paired-memory alpha when the explicit "
+              "paired-memory option is omitted (default: 0.25)."))
+    parser.add_argument(
+        "--image_condition_paired_memory_alpha",
+        type=float,
+        default=None,
+        help=("B-source prior alpha for paired M-query attention over aligned "
+              "M/B suffix K/V. Complementary log priors prevent doubled "
+              "suffix mass. Defaults to --image_condition_paired_stream_weight."))
     parser.add_argument(
         "--image_condition_paired_fade_start_step",
         type=int,
         default=None,
         help=("Optional sampling-step index at which a cosine fade of the "
-              "suffix fusion weight begins. Must be "
+              "paired B-memory alpha begins. Must be "
               "supplied with "
               "--image_condition_paired_fade_end_step."))
     parser.add_argument(
         "--image_condition_paired_fade_end_step",
         type=int,
         default=None,
-        help=("Sampling-step index at which the suffix fusion weight reaches "
+        help=("Sampling-step index at which the paired B-memory alpha reaches "
               "zero."))
     parser.add_argument(
         "--image_condition_paired_suffix_fade_start_step",
@@ -578,7 +841,8 @@ def generate(args):
             Image.open(path).convert("RGB") for path in image_paths
         ]
         img = (opened_images if (
-            args.image_condition_paired_anchor_attention
+            args.image_condition_one_way_prompt_guidance
+            or args.image_condition_paired_anchor_attention
             or args.image_condition_self_attention_guidance)
                else opened_images[0])
         logging.info("Input image(s): %s", image_paths)
@@ -746,12 +1010,19 @@ def generate(args):
             seed=args.base_seed,
             offload_model=args.offload_model,
             image_latent_indices=args.image_latent_index,
+            image_prompts=args.image_prompt,
+            image_condition_one_way_prompt_guidance=(
+                args.image_condition_one_way_prompt_guidance),
+            image_condition_one_way_prompt_guidance_weight=(
+                args.image_condition_one_way_prompt_guidance_weight),
             image_condition_paired_anchor_attention=(
                 args.image_condition_paired_anchor_attention),
             image_condition_paired_prefix_future_eta=(
                 args.image_condition_paired_prefix_future_eta),
             image_condition_paired_stream_weight=(
                 args.image_condition_paired_stream_weight),
+            image_condition_paired_memory_alpha=(
+                args.image_condition_paired_memory_alpha),
             image_condition_paired_fade_start_step=(
                 args.image_condition_paired_fade_start_step),
             image_condition_paired_fade_end_step=(
@@ -766,10 +1037,32 @@ def generate(args):
                 args.image_condition_self_attention_guidance),
             image_condition_self_attention_guidance_scale=(
                 args.image_condition_self_attention_guidance_scale),
+            image_condition_self_attention_guidance_scale_end=(
+                args.image_condition_self_attention_guidance_scale_end),
+            image_condition_self_attention_guidance_scale_end_step=(
+                args.image_condition_self_attention_guidance_scale_end_step),
             image_condition_self_attention_guidance_img2_weight=(
                 args.image_condition_self_attention_guidance_img2_weight),
+            image_condition_self_attention_guidance_post_stop_img2_suffix=(
+                args.image_condition_self_attention_guidance_post_stop_img2_suffix),
+            image_condition_self_attention_guidance_joint_query_single_memory_alpha=(
+                args.image_condition_self_attention_guidance_joint_query_single_memory_alpha),
+            image_condition_self_attention_guidance_selective_suffix_memory_alpha=(
+                args.image_condition_self_attention_guidance_selective_suffix_memory_alpha),
+            image_condition_self_attention_guidance_selective_suffix_memory_alpha_end=(
+                args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end),
+            image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step=(
+                args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step),
             image_condition_self_attention_guidance_rms_cap=(
                 args.image_condition_self_attention_guidance_rms_cap),
+            image_condition_self_attention_guidance_anchor_prior=(
+                args.image_condition_self_attention_guidance_anchor_prior),
+            image_condition_self_attention_guidance_anchor_prior_start=(
+                args.image_condition_self_attention_guidance_anchor_prior_start),
+            image_condition_self_attention_guidance_anchor_prior_end=(
+                args.image_condition_self_attention_guidance_anchor_prior_end),
+            image_condition_self_attention_guidance_anchor_prior_end_step=(
+                args.image_condition_self_attention_guidance_anchor_prior_end_step),
             image_condition_self_attention_guidance_stop_step=(
                 args.image_condition_self_attention_guidance_stop_step))
 

@@ -72,9 +72,14 @@ def sp_dit_forward(
     paired_stream_weight=0.25,
     paired_prefix_anchor_active=True,
     paired_prefix_future_eta=0.0,
+    one_way_img2_anchor_index=None,
+    one_way_img2_weight=0.25,
     self_attention_guidance_scale=None,
     self_attention_guidance_img2_weight=None,
     self_attention_guidance_rms_cap=None,
+    self_attention_guidance_anchor_prior=None,
+    self_attention_guidance_joint_query_single_memory_alpha=None,
+    self_attention_guidance_selective_suffix_memory_alpha=None,
     attention_guidance_anchor_index=None,
 ):
     """
@@ -150,10 +155,18 @@ def sp_dit_forward(
         paired_stream_weight=paired_stream_weight,
         paired_prefix_anchor_active=paired_prefix_anchor_active,
         paired_prefix_future_eta=paired_prefix_future_eta,
+        one_way_img2_anchor_index=one_way_img2_anchor_index,
+        one_way_img2_weight=one_way_img2_weight,
         self_attention_guidance_scale=self_attention_guidance_scale,
         self_attention_guidance_img2_weight=(
             self_attention_guidance_img2_weight),
         self_attention_guidance_rms_cap=self_attention_guidance_rms_cap,
+        self_attention_guidance_anchor_prior=(
+            self_attention_guidance_anchor_prior),
+        self_attention_guidance_joint_query_single_memory_alpha=(
+            self_attention_guidance_joint_query_single_memory_alpha),
+        self_attention_guidance_selective_suffix_memory_alpha=(
+            self_attention_guidance_selective_suffix_memory_alpha),
         attention_guidance_anchor_index=attention_guidance_anchor_index)
 
     for block in self.blocks:
@@ -179,10 +192,15 @@ def sp_attn_forward(self,
                     paired_stream_weight=0.25,
                     paired_prefix_anchor_active=True,
                     paired_prefix_future_eta=0.0,
+                    one_way_img2_anchor_index=None,
+                    one_way_img2_weight=0.25,
                     attention_guidance_anchor_index=None,
                     self_attention_guidance_scale=0.5,
                     self_attention_guidance_img2_weight=0.25,
                     self_attention_guidance_rms_cap=None,
+                    self_attention_guidance_anchor_prior=None,
+                    self_attention_guidance_joint_query_single_memory_alpha=None,
+                    self_attention_guidance_selective_suffix_memory_alpha=None,
                     dtype=torch.bfloat16):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
@@ -213,11 +231,19 @@ def sp_attn_forward(self,
         paired_stream_weight=paired_stream_weight,
         paired_prefix_anchor_active=paired_prefix_anchor_active,
         paired_prefix_future_eta=paired_prefix_future_eta,
+        one_way_img2_anchor_index=one_way_img2_anchor_index,
+        one_way_img2_weight=one_way_img2_weight,
         attention_guidance_anchor_index=attention_guidance_anchor_index,
         self_attention_guidance_scale=self_attention_guidance_scale,
         self_attention_guidance_img2_weight=(
             self_attention_guidance_img2_weight),
         self_attention_guidance_rms_cap=self_attention_guidance_rms_cap,
+        self_attention_guidance_anchor_prior=(
+            self_attention_guidance_anchor_prior),
+        self_attention_guidance_joint_query_single_memory_alpha=(
+            self_attention_guidance_joint_query_single_memory_alpha),
+        self_attention_guidance_selective_suffix_memory_alpha=(
+            self_attention_guidance_selective_suffix_memory_alpha),
     )
 
     # output
