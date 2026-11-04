@@ -77,138 +77,9 @@ def _validate_args(args):
         args.tts_text = EXAMPLE_PROMPT[args.task]["tts_text"]
 
     if args.task == "i2v-A14B":
-        enabled_multi_image_modes = sum(bool(value) for value in (
-            args.image_condition_one_way_prompt_guidance,
-            args.image_condition_paired_anchor_attention,
-            args.image_condition_self_attention_guidance,
-        ))
-        assert enabled_multi_image_modes <= 1, (
-            "Multi-image attention ablations are mutually exclusive.")
-        assert 0.0 <= args.image_condition_one_way_prompt_guidance_weight <= 1.0, (
-            "--image_condition_one_way_prompt_guidance_weight must be in "
-            "[0, 1].")
-        if args.image_condition_one_way_prompt_guidance:
-            assert args.image_prompt is not None and len(args.image_prompt) == 2, (
-                "One-way prompt guidance requires exactly two "
-                "--image_prompt arguments.")
-            assert all(value for value in args.image_prompt), (
-                "Each --image_prompt must be non-empty.")
-            assert not args.use_prompt_extend, (
-                "Prompt extension is not supported with per-image prompts.")
-        else:
-            assert args.image_prompt is None, (
-                "--image_prompt is only used by "
-                "--image_condition_one_way_prompt_guidance.")
-        assert 0.0 <= args.image_condition_self_attention_guidance_scale <= 1.0, (
-            "--image_condition_self_attention_guidance_scale must be "
-            "in [0, 1].")
-        if args.image_condition_self_attention_guidance_scale_end is not None:
-            assert args.image_condition_self_attention_guidance, (
-                "--image_condition_self_attention_guidance_scale_end requires "
-                "--image_condition_self_attention_guidance.")
-            assert (0.0 <=
-                    args.image_condition_self_attention_guidance_scale_end <=
-                    args.image_condition_self_attention_guidance_scale), (
-                        "guidance-scale end must be in [0, guidance-scale].")
-        if (args.image_condition_self_attention_guidance_scale_end_step
-                is not None):
-            assert (args.image_condition_self_attention_guidance_scale_end
-                    is not None), (
-                        "--image_condition_self_attention_guidance_scale_end_step "
-                        "requires --image_condition_self_attention_guidance_scale_end.")
-            assert (args.image_condition_self_attention_guidance_scale_end_step
-                    >= 1), (
-                        "--image_condition_self_attention_guidance_scale_end_step "
-                        "must be at least 1.")
-        assert 0.0 <= args.image_condition_self_attention_guidance_img2_weight <= 1.0, (
-            "--image_condition_self_attention_guidance_img2_weight must be "
-            "in [0, 1].")
-        if (args.image_condition_self_attention_guidance_joint_query_single_memory_alpha
-                is not None):
-            assert args.image_condition_self_attention_guidance, (
-                "--image_condition_self_attention_guidance_joint_query_single_memory_alpha "
-                "requires --image_condition_self_attention_guidance.")
-            assert (0.0 <=
-                    args.image_condition_self_attention_guidance_joint_query_single_memory_alpha
-                    <= 1.0), (
-                        "joint-query single-memory alpha must be in [0, 1].")
-        if (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha
-                is not None):
-            assert args.image_condition_self_attention_guidance, (
-                "--image_condition_self_attention_guidance_selective_suffix_memory_alpha "
-                "requires --image_condition_self_attention_guidance.")
-            assert (0.0 <=
-                    args.image_condition_self_attention_guidance_selective_suffix_memory_alpha
-                    <= 1.0), (
-                        "selective suffix-memory alpha must be in [0, 1].")
-        if (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end
-                is not None):
-            assert (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha
-                    is not None), (
-                        "selective suffix-memory alpha end requires the "
-                        "selective suffix-memory mode.")
-            assert (0.0 <=
-                    args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end
-                    <= 1.0), (
-                        "selective suffix-memory alpha end must be in [0, 1].")
-        if (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step
-                is not None):
-            assert (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end
-                    is not None), (
-                        "selective suffix-memory alpha end step requires "
-                        "selective suffix-memory alpha end.")
-            assert (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step
-                    >= 1), (
-                        "selective suffix-memory alpha end step must be at least 1.")
-        assert not (
-            args.image_condition_self_attention_guidance_joint_query_single_memory_alpha
-            is not None
-            and args.image_condition_self_attention_guidance_selective_suffix_memory_alpha
-            is not None), (
-                "full-memory and selective-suffix memory modes are exclusive.")
-        assert (args.image_condition_self_attention_guidance_rms_cap is None
-                or args.image_condition_self_attention_guidance_rms_cap > 0), (
-            "--image_condition_self_attention_guidance_rms_cap must be "
-            "positive.")
-        if args.image_condition_self_attention_guidance_anchor_prior:
-            assert args.image_condition_self_attention_guidance, (
-                "--image_condition_self_attention_guidance_anchor_prior "
-                "requires --image_condition_self_attention_guidance.")
-            assert (0.0 <
-                    args.image_condition_self_attention_guidance_anchor_prior_end
-                    <= args.image_condition_self_attention_guidance_anchor_prior_start
-                    < 1.0), (
-                        "anchor-prior values must satisfy "
-                        "0 < end <= start < 1.")
-        if (args.image_condition_self_attention_guidance_anchor_prior_end_step
-                is not None):
-            assert args.image_condition_self_attention_guidance_anchor_prior, (
-                "--image_condition_self_attention_guidance_anchor_prior_end_step "
-                "requires --image_condition_self_attention_guidance_anchor_prior.")
-            assert (args.image_condition_self_attention_guidance_anchor_prior_end_step
-                    >= 1), (
-                        "--image_condition_self_attention_guidance_anchor_prior_end_step "
-                        "must be at least 1.")
-        if args.image_condition_self_attention_guidance_stop_step is not None:
-            assert args.image_condition_self_attention_guidance, (
-                "--image_condition_self_attention_guidance_stop_step requires "
-                "--image_condition_self_attention_guidance.")
-        if args.image_condition_self_attention_guidance_post_stop_img2_suffix:
-            assert args.image_condition_self_attention_guidance, (
-                "post-stop Img2 suffix guidance requires "
-                "--image_condition_self_attention_guidance.")
-            assert (args.image_condition_self_attention_guidance_stop_step
-                    is not None), (
-                        "post-stop Img2 suffix guidance requires "
-                        "--image_condition_self_attention_guidance_stop_step.")
         assert args.image is not None, "Please specify the image path for i2v."
         assert 0.0 <= args.image_condition_paired_stream_weight <= 1.0, (
             "--image_condition_paired_stream_weight must be in [0, 1].")
-        assert (args.image_condition_paired_memory_alpha is None
-                or 0.0 <= args.image_condition_paired_memory_alpha <= 1.0), (
-            "--image_condition_paired_memory_alpha must be in [0, 1].")
-        assert 0.0 <= args.image_condition_paired_prefix_future_eta <= 1.0, (
-            "--image_condition_paired_prefix_future_eta must be in [0, 1].")
         paired_fade_pairs = {
             "shared": (
                 args.image_condition_paired_fade_start_step,
@@ -221,36 +92,22 @@ def _validate_args(args):
             assert ((fade_steps[0] is None) == (fade_steps[1] is None)), (
                 f"Paired {fade_name} fade start and end steps must be "
                 "supplied together.")
-        if args.image_condition_one_way_prompt_guidance:
-            assert all(steps == (None, None)
-                       for steps in paired_fade_pairs.values()), (
-                "Paired-attention fading does not apply to one-way prompt "
-                "guidance.")
-            assert args.image_condition_paired_prefix_route_switch_step is None, (
-                "Paired prefix routing does not apply to one-way prompt "
-                "guidance.")
-        if (args.image_condition_one_way_prompt_guidance
-                or args.image_condition_paired_anchor_attention
-                or args.image_condition_self_attention_guidance):
+        if args.image_condition_paired_anchor_attention:
+            assert not args.vr_override, (
+                "--vr_override (Method 1) and paired anchor attention are "
+                "separate methods; use one.")
             assert len(args.image) == 2, (
-                "The selected multi-image ablation requires exactly two "
-                "images.")
+                "Paired anchor attention requires exactly two images.")
+            assert 0.0 < args.vr_mirror_mass_gain, (
+                "--vr_mirror_mass_gain must be positive.")
+            assert 0.0 < args.vr_mass_cap < 1.0, (
+                "--vr_mass_cap must be in (0, 1).")
             assert (args.image_latent_index is not None
                     and len(args.image_latent_index) == 2
                     and args.image_latent_index[0] == 0
                     and args.image_latent_index[1] > 0), (
-                        "The selected multi-image ablation requires image "
-                        "latent "
+                        "Paired anchor attention requires image latent "
                         "indices [0, positive].")
-            if args.image_condition_self_attention_guidance:
-                assert all(steps == (None, None)
-                           for steps in paired_fade_pairs.values()), (
-                    "Paired-attention fading cannot be used with the "
-                    "self-attention-guidance ablation.")
-                assert (args.image_condition_paired_prefix_route_switch_step
-                        is None), (
-                    "Paired prefix routing cannot be used with the "
-                    "self-attention-guidance ablation.")
         else:
             assert all(steps == (None, None)
                        for steps in paired_fade_pairs.values()), (
@@ -259,23 +116,54 @@ def _validate_args(args):
             assert args.image_condition_paired_prefix_route_switch_step is None, (
                 "Prefix routing requires "
                 "--image_condition_paired_anchor_attention.")
-            assert len(args.image) == 1, (
-                "Multiple images require "
+            assert _build_paired_variant(args) is None, (
+                "--vr_anchor_key/--vr_anchor_mirror/--vr_prefix_mass require "
                 "--image_condition_paired_anchor_attention.")
-            assert (args.image_latent_index is None
-                    or args.image_latent_index == [0]), (
-                        "Standard I2V only supports image latent index 0.")
+            assert args.vr_variant_until_step is None, (
+                "--vr_variant_until_step requires "
+                "--image_condition_paired_anchor_attention.")
+            assert not args.vr_suffix_prompt and not args.vr_kg_scale, (
+                "--vr_suffix_prompt and --vr_kg_scale require "
+                "--image_condition_paired_anchor_attention.")
+            assert args.vr_rev_mode == "off" and not args.vr_rev_prompt, (
+                "--vr_rev_mode and --vr_rev_prompt require "
+                "--image_condition_paired_anchor_attention.")
+            if args.vr_override:
+                # Method 1 (round 3): two images, Img2 at an output latent.
+                assert len(args.image) == 2, (
+                    "--vr_override needs exactly two --image arguments.")
+                assert (args.image_latent_index is not None
+                        and len(args.image_latent_index) == 2
+                        and args.image_latent_index[0] == 0
+                        and args.image_latent_index[1] > 0), (
+                            "--vr_override needs image latent indices "
+                            "[0, positive].")
+                assert 0.0 <= args.vr_override_min_weight <= 1.0, (
+                    "--vr_override_min_weight must be in [0, 1].")
+                assert args.vr_override_radius >= 0, (
+                    "--vr_override_radius must be >= 0.")
+                assert not args.vr_override_save_stream2 or (
+                    args.vr_override_latent == "own"), (
+                    "--vr_override_save_stream2 needs --vr_override_latent "
+                    "own.")
+                assert args.vr_stat_streams == "one" or (
+                    args.vr_override_latent == "own"), (
+                    "--vr_stat_streams both needs --vr_override_latent own.")
+                assert 0.0 <= args.vr_stat_strength <= 1.0, (
+                    "--vr_stat_strength must be in [0, 1].")
+            else:
+                assert len(args.image) == 1, (
+                    "Multiple images require "
+                    "--image_condition_paired_anchor_attention or "
+                    "--vr_override.")
+                assert (args.image_latent_index is None
+                        or args.image_latent_index == [0]), (
+                            "Standard I2V only supports image latent index 0.")
     else:
-        assert not args.image_condition_one_way_prompt_guidance, (
-            "One-way prompt guidance is supported only by i2v-A14B.")
         assert not args.image_condition_paired_anchor_attention, (
             "Paired anchor attention is supported only by i2v-A14B.")
-        assert not args.image_condition_self_attention_guidance, (
-            "Self-attention guidance is supported only by i2v-A14B.")
         assert args.image_latent_index is None, (
             "--image_latent_index is supported only by paired I2V.")
-        assert args.image_prompt is None, (
-            "--image_prompt is supported only by one-way paired I2V.")
         assert args.image is None or len(args.image) == 1, (
             "Only paired I2V accepts multiple --image arguments.")
 
@@ -283,6 +171,28 @@ def _validate_args(args):
 
     if args.sample_steps is None:
         args.sample_steps = cfg.sample_steps
+
+    if args.vr_probe_steps is not None:
+        args.vr_probe_steps = sorted({
+            int(value) for value in args.vr_probe_steps.split(',')
+            if value.strip() != ''
+        })
+        assert args.vr_probe_steps and all(
+            0 <= value < args.sample_steps for value in args.vr_probe_steps), (
+                "--vr_probe_steps must list sampling-step indices in "
+                "[0, sample_steps).")
+        assert args.task == "i2v-A14B", (
+            "--vr_probe_steps is supported only by i2v-A14B.")
+    if args.vr_variant_until_step is not None:
+        assert 0 < args.vr_variant_until_step <= args.sample_steps, (
+            "--vr_variant_until_step must be in (0, sample_steps].")
+    assert not args.vr_rev_couple or args.vr_rev_mode == "attn", (
+        "--vr_rev_couple requires --vr_rev_mode attn.")
+    if args.vr_rev_mode != "off":
+        assert 0.0 <= args.vr_rev_strength <= 1.0, (
+            "--vr_rev_strength must be in [0, 1].")
+        assert 0 < args.vr_rev_until_step <= args.sample_steps, (
+            "--vr_rev_until_step must be in (0, sample_steps].")
 
     if args.task == "i2v-A14B":
         for fade_name, fade_steps in paired_fade_pairs.items():
@@ -296,46 +206,230 @@ def _validate_args(args):
                     < args.sample_steps), (
                         "--image_condition_paired_prefix_route_switch_step "
                         "must be in [0, sample_steps).")
-        if args.image_condition_self_attention_guidance_stop_step is not None:
-            assert (0 <=
-                    args.image_condition_self_attention_guidance_stop_step <
-                    args.sample_steps), (
-                        "--image_condition_self_attention_guidance_stop_step "
-                        "must be in [0, sample_steps).")
-        if (args.image_condition_self_attention_guidance_anchor_prior_end_step
-                is not None):
-            assert (
-                args.image_condition_self_attention_guidance_anchor_prior_end_step
-                < args.sample_steps), (
-                    "--image_condition_self_attention_guidance_anchor_prior_end_step "
-                    "must be in [1, sample_steps).")
-        if (args.image_condition_self_attention_guidance_scale_end_step
-                is not None):
-            assert (
-                args.image_condition_self_attention_guidance_scale_end_step <
-                args.sample_steps), (
-                    "--image_condition_self_attention_guidance_scale_end_step "
-                    "must be in [1, sample_steps).")
-        if (args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step
-                is not None):
-            assert (
-                args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step
-                < args.sample_steps), (
-                    "selective suffix-memory alpha end step must be in "
-                    "[1, sample_steps).")
 
     if args.sample_shift is None:
         args.sample_shift = cfg.sample_shift
 
     if args.sample_guide_scale is None:
         args.sample_guide_scale = cfg.sample_guide_scale
+    if args.vr_high_noise_guide_scale is not None:
+        low = (args.sample_guide_scale[0] if isinstance(
+            args.sample_guide_scale, (tuple, list)) else
+               args.sample_guide_scale)
+        # (low-noise, high-noise), as WanI2V.generate reads it.
+        args.sample_guide_scale = (float(low),
+                                   float(args.vr_high_noise_guide_scale))
+    # Round 12: "4,3,2,1" -> (4, 3, 2, 1).
+    if args.vr_img2_span_schedule is not None:
+        parts = [p.strip() for p in args.vr_img2_span_schedule.split(",")]
+        assert (2 <= len(parts) <= args.sample_steps
+                and all(p in ("1", "2", "3", "4") for p in parts)), (
+            "--vr_img2_span_schedule lists 2 to --sample_steps frame counts, "
+            "each 1-4, e.g. 4,3,2,1.")
+        args.vr_img2_span_schedule = tuple(int(p) for p in parts)
+    if not args.vr_override:
+        assert (args.vr_override_img2_span == "latent"
+                and not args.vr_override_save_stream2
+                and args.vr_stat_anchor == "off"
+                and args.vr_override_profile == "damp"
+                and args.vr_override_handover_step is None
+                and args.vr_stream_b_weight is None
+                and args.vr_override_mode == "blend"
+                and args.vr_rerender_from_step is None
+                and args.vr_img2_motion_frames is None
+                and args.vr_img2_context_video is None
+                and args.vr_img2_fill == "img2"
+                and args.vr_img2_code_stats is None
+                and args.vr_img2_release_step is None
+                and args.vr_img2_release_input == "joint"
+                and args.vr_img2_span_schedule is None
+                and args.vr_override_img2_mask is None
+                and args.vr_override_img2_value is None
+                and not args.vr_override_single), (
+            "--vr_override_img2_span/--vr_override_save_stream2/"
+            "--vr_stat_anchor/--vr_override_profile/"
+            "--vr_override_handover_step/--vr_stream_b_weight/"
+            "--vr_override_mode/--vr_rerender_from_step/"
+            "--vr_img2_motion_frames/--vr_img2_context_video/--vr_img2_fill/"
+            "--vr_img2_code_stats/--vr_img2_release_step/"
+            "--vr_img2_release_input/--vr_img2_span_schedule/"
+            "--vr_override_img2_mask/--vr_override_img2_value/"
+            "--vr_override_single require --vr_override.")
+        # Round 7: plain I2V may read a relay prompt from an explicit latent.
+        assert not args.vr_relay_prompt or (
+            not args.image_condition_paired_anchor_attention
+            and args.vr_relay_from_latent is not None), (
+            "--vr_relay_prompt without --vr_override is for plain I2V and "
+            "needs --vr_relay_from_latent.")
+    else:
+        assert args.vr_stream_b_weight is None or (
+            0.0 <= args.vr_stream_b_weight <= 1.0), (
+            "--vr_stream_b_weight must be in [0, 1].")
+        assert ((args.vr_stream_b_fade_start_step is None)
+                == (args.vr_stream_b_fade_end_step is None)), (
+            "Stream B fade start and end steps go together.")
+        assert not (args.vr_override == "fresh"
+                    and args.vr_override_img2_span != "latent"), (
+            "--vr_override fresh fills Img2's whole latent.")
+        assert not (args.vr_override == "clean"
+                    and args.vr_override_img2_span == "frame"), (
+            "--vr_override clean takes --vr_override_img2_span latent, last "
+            "or motion.")
+        assert not (args.vr_override in ("long", "context")
+                    and args.vr_override_img2_span not in ("latent", "last")), (
+            "--vr_override long/context take --vr_override_img2_span latent "
+            "or last.")
+        assert (args.vr_override == "context") == (
+            args.vr_img2_context_video is not None), (
+            "--vr_override context and --vr_img2_context_video go together.")
+        assert args.vr_img2_fill not in ("hold", "video") or (
+            args.vr_override == "context"
+            and args.vr_override_img2_span == "last"), (
+            "--vr_img2_fill hold/video needs --vr_override context with "
+            "--vr_override_img2_span last.")
+        assert args.vr_img2_fill != "grey" or (
+            args.vr_override in ("long", "context")
+            and args.vr_override_img2_span == "last"), (
+            "--vr_img2_fill grey needs --vr_override long or context with "
+            "--vr_override_img2_span last.")
+        assert args.vr_img2_code_stats is None or (
+            args.vr_override_img2_span == "latent"
+            and args.vr_override != "long"), (
+            "--vr_img2_code_stats needs --vr_override_img2_span latent and "
+            "a stream other than long.")
+        assert args.vr_img2_release_step is None or (
+            args.vr_override in ("joint", "splice")
+            and args.vr_override_img2_span == "latent"
+            and args.vr_img2_code_stats is None), (
+            "--vr_img2_release_step needs M1-PR's input: --vr_override joint "
+            "or splice with --vr_override_img2_span latent and no "
+            "--vr_img2_code_stats.")
+        assert args.vr_img2_release_step is None or (
+            0 < args.vr_img2_release_step < args.sample_steps
+            and args.vr_stream_b_weight is None
+            and args.vr_rerender_from_step is None
+            and not args.vr_resample_cycles), (
+            "--vr_img2_release_step must be in (0, --sample_steps) and does "
+            "not combine with Stream B, re-rendering or resampling.")
+        assert (args.vr_img2_release_input == "joint"
+                or args.vr_img2_release_step is not None), (
+            "--vr_img2_release_input own needs --vr_img2_release_step.")
+        assert args.vr_img2_span_schedule is None or (
+            args.vr_override in ("joint", "splice")
+            and args.vr_override_img2_span == "latent"
+            and args.vr_img2_code_stats is None
+            and args.vr_img2_release_step is None
+            and args.vr_stream_b_weight is None
+            and args.vr_rerender_from_step is None
+            and not args.vr_resample_cycles), (
+            "--vr_img2_span_schedule needs M1-PR's input (--vr_override joint "
+            "or splice, --vr_override_img2_span latent, no "
+            "--vr_img2_code_stats) and does "
+            "not combine with the release, Stream B, re-rendering or "
+            "resampling.")
+        assert args.vr_override_img2_value is None or (
+            args.vr_override in ("joint", "splice")
+            and args.vr_override_mode == "blend"
+            and args.vr_stream_b_weight is None
+            and args.vr_rerender_from_step is None
+            and not args.vr_resample_cycles), (
+            "--vr_override_img2_value needs --vr_override joint or splice in "
+            "blend mode, and no --vr_stream_b_weight, re-rendering or "
+            "resampling.")
+        assert not args.vr_override_single or (
+            args.vr_override_mode == "blend"
+            and args.vr_stream_b_weight is None
+            and args.vr_rerender_from_step is None
+            and not args.vr_resample_cycles
+            and args.vr_override_handover_step is None
+            and not args.vr_override_save_stream2
+            and args.vr_stat_anchor == "off"), (
+            "--vr_override_single does not combine with route mode, "
+            "--vr_stream_b_weight, re-rendering, resampling, the handover, "
+            "--vr_override_save_stream2 or the colour anchor.")
+        assert args.vr_override_img2_mask is None or (
+            args.vr_override == "joint"
+            and args.vr_override_img2_span == "latent"
+            and args.vr_img2_release_step is None
+            and args.vr_img2_span_schedule is None
+            and args.vr_rerender_from_step is None), (
+            "--vr_override_img2_mask last needs --vr_override joint with "
+            "--vr_override_img2_span latent, and no release, span schedule or "
+            "re-rendering.")
+        assert (args.vr_override_img2_span == "motion") == (
+            args.vr_img2_motion_frames is not None), (
+            "--vr_override_img2_span motion and --vr_img2_motion_frames go "
+            "together.")
+        assert args.vr_rerender_from_step is None or (
+            args.vr_override_img2_span == "latent"), (
+            "--vr_rerender_from_step needs --vr_override_img2_span latent.")
+        assert args.vr_override_mode == "blend" or (
+            args.vr_override_min_weight == 1.0
+            and args.vr_override_profile == "damp"
+            and args.vr_override_handover_step is None
+            and args.vr_stream_b_weight is None), (
+            "--vr_override_mode route needs a full override (min weight 1, "
+            "damp profile), no handover and no Stream B.")
+        assert args.vr_rerender_from_step is None or (
+            0 < args.vr_rerender_from_step < args.sample_steps
+            and not args.vr_resample_cycles), (
+            "--vr_rerender_from_step must be in (0, --sample_steps) and "
+            "cannot be combined with resampling.")
+    if args.vr_reach_steps is not None:
+        args.vr_reach_steps = sorted({
+            int(value) for value in args.vr_reach_steps.split(',')
+            if value.strip()
+        })
+        assert args.vr_reach_steps and all(
+            0 <= value < args.sample_steps for value in args.vr_reach_steps), (
+                "--vr_reach_steps must list sampling steps in "
+                "[0, sample_steps).")
+        assert not args.vr_override and not (
+            args.image_condition_paired_anchor_attention), (
+            "--vr_reach_steps runs on plain I2V (no --vr_override, not "
+            "paired).")
+        assert args.vr_reach_target is not None and args.vr_reach_target > 0, (
+            "--vr_reach_steps needs --vr_reach_target (Img2's latent).")
+        assert (args.vr_reach_eps > 0 and args.vr_reach_blur >= 0
+                and args.vr_reach_patterns >= 1), (
+            "--vr_reach_eps > 0, --vr_reach_blur >= 0, --vr_reach_patterns "
+            ">= 1.")
+        assert not args.vr_resample_cycles, (
+            "--vr_reach_steps does not take resampling.")
+    assert args.vr_save_head_frames >= 0, "--vr_save_head_frames must be >= 0."
+    if args.vr_resample_cycles:
+        assert not args.image_condition_paired_anchor_attention, (
+            "Resampling is not supported with paired anchor attention.")
+        assert (args.vr_resample_from_step is not None
+                and args.vr_resample_to_step is not None
+                and args.vr_resample_cycles > 0), (
+            "Resampling needs --vr_resample_from_step, --vr_resample_to_step "
+            "and --vr_resample_cycles >= 1.")
 
     if args.frame_num is None:
         args.frame_num = cfg.frame_num
 
-    if (args.image_condition_one_way_prompt_guidance
-            or args.image_condition_paired_anchor_attention
-            or args.image_condition_self_attention_guidance):
+    # Round 10: round 9's decode fix inside the run (<stem>_fix.mp4).
+    assert (args.vr_decode_fix is None) == (args.vr_decode_fix_window is None), (
+        "--vr_decode_fix and --vr_decode_fix_window go together.")
+    if args.vr_decode_fix_window is not None:
+        assert args.task == "i2v-A14B", (
+            "--vr_decode_fix is supported only by i2v-A14B.")
+        parts = args.vr_decode_fix_window.split("-")
+        assert len(parts) == 2 and all(p.strip().isdigit() for p in parts), (
+            "--vr_decode_fix_window takes two latent indices, e.g. 10-11.")
+        args.vr_decode_fix_window = tuple(int(p) for p in parts)
+        out_latents = (args.frame_num - 1) // cfg.vae_stride[0] + 1
+        lo, hi = args.vr_decode_fix_window
+        assert 1 <= lo <= hi < out_latents - 1, (
+            f"--vr_decode_fix_window {lo}-{hi} needs a latent on each side "
+            f"(latents 0..{out_latents - 1}).")
+
+    if args.vr_override:
+        latent_frame_num = ((args.frame_num - 1) // cfg.vae_stride[0] + 1)
+        assert args.image_latent_index[1] < latent_frame_num, (
+            f"Img2 must be an output latent below {latent_frame_num}.")
+    if args.image_condition_paired_anchor_attention:
         latent_frame_num = ((args.frame_num - 1) // cfg.vae_stride[0] + 1)
         assert args.image_latent_index[1] < latent_frame_num - 1, (
             "Img2 must leave at least one latent frame on its right; use an "
@@ -348,6 +442,82 @@ def _validate_args(args):
         assert args.size in SUPPORTED_SIZES[
             args.
             task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
+
+
+def _build_paired_variant(args):
+    """Visual Relay round-1 prefix-route variant, or None for the baseline."""
+    if (args.vr_anchor_key == "A" and not args.vr_anchor_mirror
+            and args.vr_prefix_mass == "natural"
+            and not args.vr_suffix_time_fix):
+        return None
+    return dict(
+        anchor_key=args.vr_anchor_key,
+        mirror=bool(args.vr_anchor_mirror),
+        mass=args.vr_prefix_mass,
+        split_shape=args.vr_split_shape,
+        mirror_gain=float(args.vr_mirror_mass_gain),
+        mass_cap=float(args.vr_mass_cap),
+        suffix_time_fix=bool(args.vr_suffix_time_fix),
+    )
+
+
+def _probe_path(args):
+    if args.vr_probe_steps is None:
+        return None
+    if args.vr_probe_out:
+        return args.vr_probe_out
+    if args.save_file:
+        return os.path.splitext(args.save_file)[0] + "_probe.pt"
+    return f"probe_{args.task}_seed{args.base_seed}.pt"
+
+
+def _reach_test(args):
+    """Round 7: the reach-test settings for WanI2V.generate, or None."""
+    if args.vr_reach_steps is None:
+        return None
+    stem = (os.path.splitext(args.save_file)[0] if args.save_file else
+            f"reach_{args.task}_seed{args.base_seed}")
+    return dict(steps=args.vr_reach_steps, target=args.vr_reach_target,
+                eps=args.vr_reach_eps, blur=args.vr_reach_blur,
+                patterns=args.vr_reach_patterns, seed=1234,
+                path=stem + "_reach.json")
+
+
+def _load_motion_frames(path):
+    """Round 7: frames 1-3 of a <stem>_head.pt file, [3, 3, H, W]."""
+    if path is None:
+        return None
+    head = torch.load(path, map_location="cpu")
+    if (not torch.is_tensor(head) or head.dim() != 4 or head.size(0) != 3
+            or head.size(1) < 4):
+        raise ValueError(f"{path} is not a [3, N >= 4, H, W] frame tensor")
+    return head[:, 1:4].float().clone()
+
+
+def _load_context_video(path):
+    """Round 8: a first-pass video as [3, N, H, W] float in [-1, 1], from an
+    .mp4 (read with OpenCV) or a .pt tensor of that shape."""
+    if path is None:
+        return None
+    if path.endswith(".pt"):
+        video = torch.load(path, map_location="cpu")
+        if not torch.is_tensor(video) or video.dim() != 4 or video.size(0) != 3:
+            raise ValueError(f"{path} is not a [3, N, H, W] frame tensor")
+        return video.float()
+    import cv2
+    import numpy as np
+    capture = cv2.VideoCapture(path)
+    frames = []
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    capture.release()
+    if not frames:
+        raise ValueError(f"could not read any frame from {path}")
+    video = torch.from_numpy(np.stack(frames)).float()  # [N, H, W, 3], 0-255
+    return video.permute(3, 0, 1, 2).div(127.5).sub(1.0).contiguous()
 
 
 def _parse_args():
@@ -456,192 +626,30 @@ def _parse_args():
         help=("Latent index corresponding to each --image in paired anchor "
               "attention; use 0 for Img1 and a positive index for Img2."))
     parser.add_argument(
-        "--image_prompt",
-        type=str,
-        action="append",
-        default=None,
-        help=("Prompt paired positionally with each repeated --image. Used "
-              "only by one-way per-image-prompt guidance."))
-    parser.add_argument(
-        "--image_condition_one_way_prompt_guidance",
-        action="store_true",
-        help=("Run native-length Img1 M and aligned Img2-first B with their "
-              "respective --image_prompt values. Both streams use ordinary "
-              "bidirectional attention. M keeps its full Img1-only timeline "
-              "and adds one auxiliary joint Img1-to-Img2 anchor sharing the "
-              "ordinary anchor's integer RoPE position. Prefix queries use "
-              "the auxiliary anchor key paired with B0's value and do not "
-              "see the ordinary anchor. Ordinary "
-              "anchor/suffix queries see the ordinary anchor but not the "
-              "auxiliary one. The auxiliary anchor uses its own query to "
-              "attend to the prefix plus itself. B0 completely replaces the "
-              "ordinary anchor's self-attention output, while B1: guides only "
-              "the aligned post-anchor suffix. There is no "
-              "M-to-B influence or final velocity replacement."))
-    parser.add_argument(
-        "--image_condition_one_way_prompt_guidance_weight",
-        type=float,
-        default=0.25,
-        help=("Layerwise B1: output weight applied only to M's aligned "
-              "post-anchor suffix; B0 completely replaces M's ordinary "
-              "anchor output regardless of this weight (default: 0.25)."))
-    parser.add_argument(
         "--image_condition_paired_anchor_attention",
         action="store_true",
-        help=("Use Img1-only C/M and aligned Img2-first B. Every retained C "
-              "query reads C prefix plus aligned C/B1: suffix K/V in one "
-              "mass-normalized attention. B0 is excluded from C memory and "
-              "maintains only the hidden transport state."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance",
-        action="store_true",
-        help=("Run expanded Img1-only M, joint Img1/Img2 J, and standard "
-              "Img2-first suffix B in both CFG branches. M's temporary slot "
-              "is excluded from attention. Removing J's anchor aligns its "
-              "retained attention output with M for M/J guidance. J retained "
-              "queries use one mathematical softmax across every visible key, "
-              "including anchor-adjacent representations sharing a RoPE "
-              "coordinate. "
-              "B0 replaces the temporary anchor velocity before CFG."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_scale",
-        type=float,
-        default=0.5,
-        help=("J output weight used in both prefix and suffix fusion "
-              "(default: 0.5)."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_scale_end",
-        type=float,
-        default=None,
-        help=("Optional final J output weight for a cosine guidance-scale "
-              "schedule. It remains fixed after the end step."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_scale_end_step",
-        type=int,
-        default=None,
-        help=("Zero-based sampling step at which the cosine guidance-scale "
-              "schedule reaches its final value. Defaults to the last step."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_img2_weight",
-        type=float,
-        default=0.25,
-        help=("B attention-output residual weight for optional post-stop "
-              "Img2 suffix guidance (default: 0.25)."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_post_stop_img2_suffix",
-        action="store_true",
-        help=("After the J stop step, run aligned M and Img2-first B streams. "
-              "B1: layerwise self-attention outputs guide only M frames after "
-              "Img2; the prefix and temporary anchor remain M-only and B0 "
-              "does not replace the anchor velocity."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_joint_query_single_memory_alpha",
-        type=float,
-        default=None,
-        help=("Optional M-memory source prior for J prefix and suffix queries. "
-              "Each J query group attends separately to full J memory and "
-              "retained Img1-only M memory, then combines the groups exactly "
-              "from their FlashAttention log-normalizers. The split results "
-              "directly update M's aligned prefix and suffix without another "
-              "M/J output interpolation. The anchor query remains J-only. "
-              "Zero is J-memory-only and one is M-memory-only."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_selective_suffix_memory_alpha",
-        type=float,
-        default=None,
-        help=("Optional M-source prior for aligned suffix memory only. J "
-              "prefix queries read unique J prefix, the J anchor and paired "
-              "J/M suffix. At the anchor/first-suffix shared RoPE position, "
-              "the anchor prior divides anchor versus neighbour mass and "
-              "alpha divides the neighbour mass between J/M. J suffix "
-              "queries read J prefix, the J anchor and paired J/M suffix. "
-              "The exact LSE-merged "
-              "outputs directly update aligned M/J positions. Zero uses "
-              "J suffix memory only and one uses M suffix memory only."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_selective_suffix_memory_alpha_end",
-        type=float,
-        default=None,
-        help=("Optional final M-suffix prior for a cosine alpha schedule. "
-              "It remains fixed after the end step. Omit this option to keep "
-              "the selective suffix-memory alpha constant."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step",
-        type=int,
-        default=None,
-        help=("Zero-based sampling step at which selective suffix-memory "
-              "alpha reaches its final value. Defaults to the final sampling "
-              "step when alpha-end is supplied."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_rms_cap",
-        type=float,
-        default=None,
-        help=("Optional per-frame, per-head cap on the injected J-M attention "
-              "residual RMS, expressed as a fraction of M RMS."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_anchor_prior",
-        action="store_true",
-        help=("Use exact three-group LSE merging for J prefix/suffix shared "
-              "positions. The anchor prior follows a cosine schedule from "
-              "anchor-prior-start to anchor-prior-end, then remains at the "
-              "end value."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_anchor_prior_start",
-        type=float,
-        default=0.8,
-        help=("Anchor share of the shared-position prior at the first "
-              "denoising step (default: 0.8)."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_anchor_prior_end",
-        type=float,
-        default=0.2,
-        help=("Final anchor share reached at anchor-prior-end-step "
-              "(default: 0.2)."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_anchor_prior_end_step",
-        type=int,
-        default=None,
-        help=("Zero-based sampling step at which the cosine anchor-prior "
-              "schedule reaches its end value. It remains there afterward. "
-              "By default, it reaches the end value on the final step."))
-    parser.add_argument(
-        "--image_condition_self_attention_guidance_stop_step",
-        type=int,
-        default=None,
-        help=("Optional zero-based sampling step at which J and B stop. "
-              "Afterward both CFG calls use Img1-only M, with no guidance "
-              "or anchor velocity replacement."))
-    parser.add_argument(
-        "--image_condition_paired_prefix_future_eta",
-        type=float, default=0.0,
-        help=("Legacy compatibility option; ignored by paired M/B memory "
-              "attention."))
+        help=("Use a full Img1 I2V stream and an aligned Img2-first suffix. "
+              "Suffix attention outputs from the two streams are fused with "
+              "a fixed user-controlled weight."))
     parser.add_argument(
         "--image_condition_paired_stream_weight",
         type=float,
         default=0.25,
-        help=("Legacy fallback for paired-memory alpha when the explicit "
-              "paired-memory option is omitted (default: 0.25)."))
-    parser.add_argument(
-        "--image_condition_paired_memory_alpha",
-        type=float,
-        default=None,
-        help=("B-source prior alpha for paired M-query attention over aligned "
-              "M/B suffix K/V. Complementary log priors prevent doubled "
-              "suffix mass. Defaults to --image_condition_paired_stream_weight."))
+        help=("Fixed Img2-stream attention-output weight used by paired "
+              "anchor attention; must be in [0, 1] (default: 0.25)."))
     parser.add_argument(
         "--image_condition_paired_fade_start_step",
         type=int,
         default=None,
         help=("Optional sampling-step index at which a cosine fade of the "
-              "paired B-memory alpha begins. Must be "
+              "suffix fusion weight begins. Must be "
               "supplied with "
               "--image_condition_paired_fade_end_step."))
     parser.add_argument(
         "--image_condition_paired_fade_end_step",
         type=int,
         default=None,
-        help=("Sampling-step index at which the paired B-memory alpha reaches "
+        help=("Sampling-step index at which the suffix fusion weight reaches "
               "zero."))
     parser.add_argument(
         "--image_condition_paired_suffix_fade_start_step",
@@ -660,7 +668,456 @@ def _parse_args():
         "--image_condition_paired_prefix_route_switch_step",
         type=int,
         default=None,
-        help="Legacy compatibility option; currently ignored in paired mode.")
+        help=("Optional hard Img2-anchor removal step. Prefix queries always "
+              "attend ordinary Stream-A frames on both sides of the anchor. "
+              "Before this step they additionally attend the shifted "
+              "fresh-cache Stream-B Img2 "
+              "anchor; at and after it only that anchor is removed."))
+    # Visual Relay round 1: prefix -> Img2 anchor route variants and probe.
+    parser.add_argument(
+        "--vr_anchor_key",
+        type=str,
+        default="A",
+        choices=["A", "B"],
+        help=("Key of the Img2 anchor seen by prefix queries: A = "
+              "history-aware Stream-A key (baseline), B = fresh-cache "
+              "Stream-B frame-0 key moved to the anchor's RoPE position."))
+    parser.add_argument(
+        "--vr_anchor_mirror",
+        action="store_true",
+        default=False,
+        help=("Mirror the anchor key's temporal RoPE per prefix frame t "
+              "(position 2t - anchor), so Img2 appears to the query's left "
+              "at its true distance, like a first frame."))
+    parser.add_argument(
+        "--vr_prefix_mass",
+        type=str,
+        default="natural",
+        choices=["natural", "split", "mirror_mass", "img1_fade"],
+        help=("Prefix attention-mass policy: natural softmax (baseline), "
+              "split = keep the natural Img1+anchor mass but give a fraction "
+              "t/anchor of it to the anchor, mirror_mass = anchor mass of "
+              "frame t equals the Img1 mass of frame anchor-t, img1_fade = "
+              "Img1 logit bias log(1 - t/anchor), no extra Img2 pull."))
+    parser.add_argument(
+        "--vr_split_shape",
+        type=str,
+        default="linear",
+        choices=["linear", "cosine"],
+        help=("Shape of the fraction t/anchor used by split and img1_fade "
+              "(cosine = 0.5 - 0.5 cos(pi t/anchor))."))
+    parser.add_argument(
+        "--vr_mirror_mass_gain",
+        type=float,
+        default=1.0,
+        help="Scale of the mirrored anchor mass (mirror_mass policy).")
+    parser.add_argument(
+        "--vr_mass_cap",
+        type=float,
+        default=0.95,
+        help="Upper bound of the mirrored anchor mass (mirror_mass policy).")
+    parser.add_argument(
+        "--vr_variant_until_step",
+        type=int,
+        default=None,
+        help=("Apply the variant only for sampling steps below this index "
+              "(default: while the prefix anchor route is active)."))
+    parser.add_argument(
+        "--vr_suffix_time_fix",
+        action="store_true",
+        default=False,
+        help=("ABLATION of Gordon's offset (not a bug fix): shift Stream-B "
+              "latents 1.. one RoPE unit left so the first suffix latent "
+              "shares Img2's position in Stream B."))
+    parser.add_argument(
+        "--vr_suffix_prompt",
+        type=str,
+        default=None,
+        help="Own prompt for the Img2-first Stream B (default: --prompt).")
+    parser.add_argument(
+        "--vr_kg_scale",
+        type=float,
+        default=0.0,
+        help=("Keyframe guidance k on prefix latents: adds k * (cond - cond "
+              "without Img2); costs one extra forward per guided step."))
+    parser.add_argument(
+        "--vr_kg_until_step",
+        type=int,
+        default=10,
+        help="Keyframe guidance only for sampling steps below this index.")
+    # Visual Relay round 2: Stream R, a reverse Img2-first stream for the prefix.
+    parser.add_argument(
+        "--vr_rev_mode",
+        type=str,
+        default="off",
+        choices=["off", "attn", "pred"],
+        help=("Stream R: an ordinary Img2-first I2V stream running backward "
+              "over the latents before Img2. attn = fuse its attention output "
+              "into prefix latent t at every layer with weight w_t (mirror of "
+              "Stream B); pred = separate guided pass, fuse its prediction "
+              "into prefix latent t with weight w_t."))
+    parser.add_argument(
+        "--vr_rev_strength",
+        type=float,
+        default=1.0,
+        help="Stream R: s in w_t = s * f(t / anchor), in [0, 1].")
+    parser.add_argument(
+        "--vr_rev_shape",
+        type=str,
+        default="linear",
+        choices=["linear", "cosine"],
+        help="Stream R: f = t / anchor (linear) or 0.5 - 0.5 cos(pi t / anchor).")
+    parser.add_argument(
+        "--vr_rev_until_step",
+        type=int,
+        default=10,
+        help="Stream R only for sampling steps below this index.")
+    # Visual Relay round 3: Gordon's Method 1, the self-attention override.
+    parser.add_argument(
+        "--vr_override",
+        type=str,
+        default=None,
+        choices=["joint", "splice", "fresh", "clean", "long", "context"],
+        help=("Method 1: stream 1 (plain I2V of Img1) takes stream 2's "
+              "self-attention output in every layer; stream 2 also has Img2 "
+              "at the second --image_latent_index. joint = stream 2 encoded "
+              "in one causal VAE pass (Img1, zeros, Img2 x4, zeros); splice = "
+              "Img1-only encoding with only the Img2 latent from that pass; "
+              "fresh (round 5) = Img2's latent and the ones after it encoded "
+              "like an Img2-first I2V, as Img1 is in latent 0; clean (round "
+              "6) = joint, but Img2's latent is Img2 held 4 frames and encoded "
+              "on its own (no grey history); long (round 8) = joint, but "
+              "Img2's latent is latent a of Img2 held from frame 0 (encoded "
+              "deep inside a clip, no grey); context (round 8, two-pass) = "
+              "joint, but Img2's latent is latent a of "
+              "--vr_img2_context_video's frames 0..4a-4 followed by Img2's "
+              "latent frames."))
+    parser.add_argument(
+        "--vr_override_min_weight",
+        type=float,
+        default=1.0,
+        help=("Override weight at the Img2 latent, rising linearly to 1 at "
+              "--vr_override_radius latents away (1 = full override)."))
+    parser.add_argument(
+        "--vr_override_radius",
+        type=int,
+        default=3,
+        help="Latents over which the override weight returns to 1.")
+    parser.add_argument(
+        "--vr_override_blend",
+        type=str,
+        default="linear",
+        choices=["linear", "norm"],
+        help=("linear: O1 + w (O2 - O1); norm: same direction with length "
+              "(1 - w)|O1| + w|O2| per token and head."))
+    parser.add_argument(
+        "--vr_override_latent",
+        type=str,
+        default="shared",
+        choices=["shared", "own"],
+        help=("shared: stream 2 reads stream 1's noisy latent every step; "
+              "own: stream 2 starts from the same noise but keeps its own "
+              "latent."))
+    # Visual Relay round 4: fixes on top of Method 1.
+    parser.add_argument(
+        "--vr_override_img2_span",
+        type=str,
+        default="latent",
+        choices=["latent", "frame", "last", "motion"],
+        help=("Stream 2's Img2: latent = all 4 frames of its latent (round 3, "
+              "a 4-frame hold); frame = only the first frame of that latent, "
+              "mask on that frame only; last (round 7) = only the last frame "
+              "of that latent (frame 4a), mask on that frame only; motion "
+              "(round 7) = Img2, then frames 1-3 of --vr_img2_motion_frames, "
+              "mask on all 4."))
+    parser.add_argument(
+        "--vr_override_save_stream2",
+        action="store_true",
+        default=False,
+        help=("With --vr_override_latent own, also save stream 2's video "
+              "(the plain two-keyframe run) as <save_file stem>_s2.mp4."))
+    parser.add_argument(
+        "--vr_relay_prompt",
+        type=str,
+        default=None,
+        help=("Prompt relay: latents from --vr_relay_from_latent on (default: "
+              "the one after Img2) read this prompt in cross-attention, in "
+              "both streams."))
+    parser.add_argument(
+        "--vr_relay_from_latent",
+        type=int,
+        default=None,
+        help="First latent that reads --vr_relay_prompt (default: Img2's + 1).")
+    parser.add_argument(
+        "--vr_stat_anchor",
+        type=str,
+        default="off",
+        choices=["off", "mean", "meanstd"],
+        help=("Colour anchor: every step, move each latent's per-channel mean "
+              "(and std) of stream 1's predicted clean latent toward an Img1 "
+              "-> Img2 interpolation."))
+    parser.add_argument(
+        "--vr_stat_strength",
+        type=float,
+        default=1.0,
+        help="Colour anchor strength in [0, 1].")
+    parser.add_argument(
+        "--vr_stat_streams",
+        type=str,
+        default="one",
+        choices=["one", "both"],
+        help="Anchor stream 1 only, or both streams (own latent only).")
+    parser.add_argument(
+        "--vr_stat_std_from_step",
+        type=int,
+        default=10,
+        help="meanstd: match the std only from this sampling step on.")
+    parser.add_argument(
+        "--vr_resample_from_step",
+        type=int,
+        default=None,
+        help="Resampling: go back to this step's noise level (J).")
+    parser.add_argument(
+        "--vr_resample_to_step",
+        type=int,
+        default=None,
+        help="Resampling: after this step (K).")
+    parser.add_argument(
+        "--vr_resample_cycles",
+        type=int,
+        default=0,
+        help="Resampling: how many times steps J..K are repeated (0 = off).")
+    # Visual Relay round 5.
+    parser.add_argument(
+        "--vr_override_profile",
+        type=str,
+        default="damp",
+        choices=["damp", "local"],
+        help=("damp: w = min weight at Img2, 1 from --vr_override_radius "
+              "away (round 3); local: w = 1 at Img2, 0 from "
+              "--vr_override_radius away."))
+    parser.add_argument(
+        "--vr_override_handover_step",
+        type=int,
+        default=None,
+        help=("From this step on, stream 1 takes stream 2's attention only at "
+              "Img2's latent and finishes as plain I2V elsewhere."))
+    parser.add_argument(
+        "--vr_stream_b_weight",
+        type=float,
+        default=None,
+        help=("Stream B lambda: an Img2-first I2V over Img2's latent and the "
+              "rest, mixed into stream 1's latents after Img2 (paired design's "
+              "suffix). Uses --vr_relay_prompt if set."))
+    parser.add_argument(
+        "--vr_stream_b_fade_start_step",
+        type=int,
+        default=None,
+        help="Stream B lambda fades to 0 from this step ...")
+    parser.add_argument(
+        "--vr_stream_b_fade_end_step",
+        type=int,
+        default=None,
+        help="... to this step (then Stream B leaves the batch).")
+    # Visual Relay round 6.
+    parser.add_argument(
+        "--vr_override_mode",
+        type=str,
+        default="blend",
+        choices=["blend", "route"],
+        help=("blend: stream 1 takes stream 2's attention output (Method 1); "
+              "route: stream 1 attends with stream 2's queries and keys but "
+              "its own values, attn(q2, k2, v1), except at Img2's latent, "
+              "which takes stream 2's output. Needs a full override."))
+    parser.add_argument(
+        "--vr_rerender_from_step",
+        type=int,
+        default=None,
+        help=("Plan, then render: after the override run, re-noise stream "
+              "1's final latent to this (low-noise) step and run the rest as "
+              "plain I2V of Img1, with Img2's latent pinned to Img2 held 4 "
+              "frames. The plan is also saved as <save_file stem>_plan.mp4."))
+    # Visual Relay round 7.
+    parser.add_argument(
+        "--vr_img2_motion_frames",
+        type=str,
+        default=None,
+        help=("A <stem>_head.pt file saved by --vr_save_head_frames from a "
+              "plain I2V run of Img2: its frames 1-3 follow Img2 in Img2's "
+              "latent (--vr_override_img2_span motion)."))
+    # Visual Relay round 8.
+    parser.add_argument(
+        "--vr_img2_context_video",
+        type=str,
+        default=None,
+        help=("--vr_override context: a first-pass video (.mp4, or a .pt "
+              "[3, N, H, W] tensor in -1..1) whose frames 0..4a-4 are encoded "
+              "before Img2's latent frames."))
+    parser.add_argument(
+        "--vr_img2_fill",
+        type=str,
+        default="img2",
+        choices=["img2", "hold", "video", "grey"],
+        help=("--vr_override context with --vr_override_img2_span last: the "
+              "first 3 frames of Img2's latent. img2 = Img2; hold = frame "
+              "4a-4 of the context video held; video = the context video's "
+              "frames 4a-3..4a-1 with their colour means moved onto the line "
+              "from frame 4a-4 to Img2; grey (round 9, also with --vr_override "
+              "long) = grey frames. Frame 4a is Img2 in every case."))
+    parser.add_argument(
+        "--vr_img2_code_stats",
+        type=str,
+        default=None,
+        choices=["mean", "meanstd"],
+        help=("Round 9: Img2's latent in stream 2's input keeps its spatial "
+              "pattern but takes each channel's mean (and std) from the long "
+              "code (Img2 held from frame 0), which decodes at Img2's own "
+              "brightness. With --vr_override_img2_span latent."))
+    parser.add_argument(
+        "--vr_save_latents",
+        action="store_true",
+        default=False,
+        help=("Round 9: also save the final latents (stream 1, stream 2, "
+              "plan; float32) as <save_file stem>_latents.pt, for "
+              "vr_latent_fix.py."))
+    parser.add_argument(
+        "--vr_img2_release_step",
+        type=int,
+        default=None,
+        help=("Round 10: from this sampling step on, stream 2 reads PR-LF's "
+              "input (the joint encoding with Img2 on its latent's last "
+              "frame only) instead of M1-PR's (Img2 on all 4 frames). Needs "
+              "--vr_override joint with --vr_override_img2_span latent."))
+    parser.add_argument(
+        "--vr_img2_release_input",
+        type=str,
+        default="joint",
+        choices=["joint", "own"],
+        help=("Round 12: stream 2's input after --vr_img2_release_step: "
+              "joint (PR-LF's, default) or own (CL-LF's: Img2's latent "
+              "encoded on its own, grey x4 then Img2)."))
+    parser.add_argument(
+        "--vr_img2_span_schedule",
+        type=str,
+        default=None,
+        help=("Round 12: frames of Img2's latent given at each sampling step, "
+              "Img2 on the last k (e.g. 4,3,2,1: all 4 at step 0, frames "
+              "4a-2..4a at step 1, 4a-1..4a at step 2, frame 4a from step 3 "
+              "on; the last entry holds). Joint encoding; needs --vr_override "
+              "joint with --vr_override_img2_span latent."))
+    parser.add_argument(
+        "--vr_override_img2_mask",
+        type=str,
+        default=None,
+        choices=["last"],
+        help=("Round 12: last = Img2's latent keeps M1-PR's code (Img2 on all "
+              "4 frames, joint encoding) but only its last frame is marked, "
+              "as in PR-LF."))
+    parser.add_argument(
+        "--vr_override_img2_value",
+        type=str,
+        default=None,
+        choices=["before", "all"],
+        help=("Round 13, Gordon's K_A12 / V_B0: Stream B (Img2-first I2V on "
+              "stream 2's latents a.., weight 0) runs every step and gives "
+              "the values of Img2's latent to stream 2's queries on latents "
+              "before Img2 (before) or on every other latent (all); keys stay "
+              "stream 2's."))
+    parser.add_argument(
+        "--vr_override_single",
+        action="store_true",
+        default=False,
+        help=("Round 14: run stream 2 alone as the video (no stream 1): its "
+              "input as set by --vr_override and the Img2 options. With "
+              "--vr_override_img2_value, Stream B runs beside it only for the "
+              "clean values. Gives what earlier rounds saved as _s2.mp4."))
+    parser.add_argument(
+        "--vr_decode_fix",
+        type=str,
+        default=None,
+        choices=["mean", "meanstd"],
+        help=("Round 10: round 9's decode fix inside the run. The main "
+              "video's final latents in --vr_decode_fix_window get each "
+              "channel's spatial mean (meanstd: and std) on the line between "
+              "the latents on either side, and are decoded again as <save_file "
+              "stem>_fix.mp4; the main video is saved uncorrected."))
+    parser.add_argument(
+        "--vr_decode_fix_window",
+        type=str,
+        default=None,
+        help=("Round 10: the latents the decode fix corrects, LO-HI (e.g. "
+              "10-11 for FNR, frames 37-44)."))
+    parser.add_argument(
+        "--vr_save_head_frames",
+        type=int,
+        default=0,
+        help=("Also save the first N decoded frames ([3, N, H, W], float, "
+              "-1..1) as <save_file stem>_head.pt (0 = off)."))
+    parser.add_argument(
+        "--vr_reach_steps",
+        type=str,
+        default=None,
+        help=("Forward-only reach test on plain I2V at these sampling steps, "
+              "e.g. '0,5,9': nudge each latent by +- a blurred pattern and "
+              "record how the predicted clean latent changes. Written to "
+              "<save_file stem>_reach.json and _reach.txt."))
+    parser.add_argument(
+        "--vr_reach_target",
+        type=int,
+        default=None,
+        help="Reach test: the latent whose response is read (Img2's latent).")
+    parser.add_argument(
+        "--vr_reach_eps",
+        type=float,
+        default=0.1,
+        help="Reach test: nudge RMS as a fraction of RMS(x_t).")
+    parser.add_argument(
+        "--vr_reach_blur",
+        type=float,
+        default=4.0,
+        help="Reach test: blur of the nudge and the read-out, latent pixels.")
+    parser.add_argument(
+        "--vr_reach_patterns",
+        type=int,
+        default=2,
+        help="Reach test: number of random blurred nudge patterns.")
+    parser.add_argument(
+        "--vr_high_noise_guide_scale",
+        type=float,
+        default=None,
+        help=("CFG scale for the high-noise expert only (steps 0-9); the "
+              "low-noise expert keeps --sample_guide_scale / the default."))
+    parser.add_argument(
+        "--vr_rev_couple",
+        action="store_true",
+        default=False,
+        help=("Round 3, --vr_rev_mode attn only: Stream R frame a - t also "
+              "takes prefix latent t's mixed output, so both streams follow "
+              "one trajectory."))
+    parser.add_argument(
+        "--vr_rev_prompt",
+        type=str,
+        default=None,
+        help=("Stream R prompt: the prefix described played backward from "
+              "Img2 (default: --prompt)."))
+    parser.add_argument(
+        "--vr_probe_steps",
+        type=str,
+        default=None,
+        help=("Comma-separated sampling steps at which the read-only "
+              "attention probe records the conditional pass, e.g. "
+              "'0,2,5,9,14,20,24,30,39'."))
+    parser.add_argument(
+        "--vr_probe_samples",
+        type=int,
+        default=48,
+        help="Spatial positions sampled per query latent frame by the probe.")
+    parser.add_argument(
+        "--vr_probe_out",
+        type=str,
+        default=None,
+        help=("Probe output file (default: <save_file stem>_probe.pt). A "
+              "text summary is written next to it."))
     parser.add_argument(
         "--sample_solver",
         type=str,
@@ -781,6 +1238,10 @@ def generate(args):
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     device = local_rank
     _init_logging(rank)
+    video_stream2 = None  # round 4: stream 2's video when it is saved
+    video_plan = None  # round 6: the plan of a re-rendered run
+    latents_final = None  # round 9: final latents, with --vr_save_latents
+    video_fixed = None  # round 10: the decode-fixed video, with --vr_decode_fix
 
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
@@ -840,11 +1301,8 @@ def generate(args):
         opened_images = [
             Image.open(path).convert("RGB") for path in image_paths
         ]
-        img = (opened_images if (
-            args.image_condition_one_way_prompt_guidance
-            or args.image_condition_paired_anchor_attention
-            or args.image_condition_self_attention_guidance)
-               else opened_images[0])
+        img = (opened_images if (args.image_condition_paired_anchor_attention
+                                 or args.vr_override) else opened_images[0])
         logging.info("Input image(s): %s", image_paths)
 
     # prompt extend
@@ -1010,19 +1468,10 @@ def generate(args):
             seed=args.base_seed,
             offload_model=args.offload_model,
             image_latent_indices=args.image_latent_index,
-            image_prompts=args.image_prompt,
-            image_condition_one_way_prompt_guidance=(
-                args.image_condition_one_way_prompt_guidance),
-            image_condition_one_way_prompt_guidance_weight=(
-                args.image_condition_one_way_prompt_guidance_weight),
             image_condition_paired_anchor_attention=(
                 args.image_condition_paired_anchor_attention),
-            image_condition_paired_prefix_future_eta=(
-                args.image_condition_paired_prefix_future_eta),
             image_condition_paired_stream_weight=(
                 args.image_condition_paired_stream_weight),
-            image_condition_paired_memory_alpha=(
-                args.image_condition_paired_memory_alpha),
             image_condition_paired_fade_start_step=(
                 args.image_condition_paired_fade_start_step),
             image_condition_paired_fade_end_step=(
@@ -1033,38 +1482,62 @@ def generate(args):
                 args.image_condition_paired_suffix_fade_end_step),
             image_condition_paired_prefix_route_switch_step=(
                 args.image_condition_paired_prefix_route_switch_step),
-            image_condition_self_attention_guidance=(
-                args.image_condition_self_attention_guidance),
-            image_condition_self_attention_guidance_scale=(
-                args.image_condition_self_attention_guidance_scale),
-            image_condition_self_attention_guidance_scale_end=(
-                args.image_condition_self_attention_guidance_scale_end),
-            image_condition_self_attention_guidance_scale_end_step=(
-                args.image_condition_self_attention_guidance_scale_end_step),
-            image_condition_self_attention_guidance_img2_weight=(
-                args.image_condition_self_attention_guidance_img2_weight),
-            image_condition_self_attention_guidance_post_stop_img2_suffix=(
-                args.image_condition_self_attention_guidance_post_stop_img2_suffix),
-            image_condition_self_attention_guidance_joint_query_single_memory_alpha=(
-                args.image_condition_self_attention_guidance_joint_query_single_memory_alpha),
-            image_condition_self_attention_guidance_selective_suffix_memory_alpha=(
-                args.image_condition_self_attention_guidance_selective_suffix_memory_alpha),
-            image_condition_self_attention_guidance_selective_suffix_memory_alpha_end=(
-                args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end),
-            image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step=(
-                args.image_condition_self_attention_guidance_selective_suffix_memory_alpha_end_step),
-            image_condition_self_attention_guidance_rms_cap=(
-                args.image_condition_self_attention_guidance_rms_cap),
-            image_condition_self_attention_guidance_anchor_prior=(
-                args.image_condition_self_attention_guidance_anchor_prior),
-            image_condition_self_attention_guidance_anchor_prior_start=(
-                args.image_condition_self_attention_guidance_anchor_prior_start),
-            image_condition_self_attention_guidance_anchor_prior_end=(
-                args.image_condition_self_attention_guidance_anchor_prior_end),
-            image_condition_self_attention_guidance_anchor_prior_end_step=(
-                args.image_condition_self_attention_guidance_anchor_prior_end_step),
-            image_condition_self_attention_guidance_stop_step=(
-                args.image_condition_self_attention_guidance_stop_step))
+            image_condition_paired_variant=_build_paired_variant(args),
+            image_condition_paired_variant_until_step=(
+                args.vr_variant_until_step),
+            probe_steps=args.vr_probe_steps,
+            probe_samples=args.vr_probe_samples,
+            probe_path=_probe_path(args),
+            suffix_prompt=args.vr_suffix_prompt,
+            keyframe_guidance_scale=args.vr_kg_scale,
+            keyframe_guidance_until_step=args.vr_kg_until_step,
+            reverse_prompt=args.vr_rev_prompt,
+            reverse_stream_mode=args.vr_rev_mode,
+            reverse_stream_strength=args.vr_rev_strength,
+            reverse_stream_shape=args.vr_rev_shape,
+            reverse_stream_until_step=args.vr_rev_until_step,
+            reverse_stream_couple=args.vr_rev_couple,
+            override_stream=args.vr_override,
+            override_min_weight=args.vr_override_min_weight,
+            override_radius=args.vr_override_radius,
+            override_blend=args.vr_override_blend,
+            override_latent=args.vr_override_latent,
+            override_img2_span=args.vr_override_img2_span,
+            override_save_stream2=args.vr_override_save_stream2,
+            relay_prompt=args.vr_relay_prompt,
+            relay_from_latent=args.vr_relay_from_latent,
+            stat_anchor=args.vr_stat_anchor,
+            stat_strength=args.vr_stat_strength,
+            stat_streams=args.vr_stat_streams,
+            stat_std_from_step=args.vr_stat_std_from_step,
+            resample_from_step=args.vr_resample_from_step,
+            resample_to_step=args.vr_resample_to_step,
+            resample_cycles=args.vr_resample_cycles,
+            override_profile=args.vr_override_profile,
+            override_handover_step=args.vr_override_handover_step,
+            stream_b_weight=args.vr_stream_b_weight,
+            stream_b_fade_start_step=args.vr_stream_b_fade_start_step,
+            stream_b_fade_end_step=args.vr_stream_b_fade_end_step,
+            override_mode=args.vr_override_mode,
+            rerender_from_step=args.vr_rerender_from_step,
+            img2_motion_frames=_load_motion_frames(args.vr_img2_motion_frames),
+            reach_test=_reach_test(args),
+            img2_context_video=_load_context_video(args.vr_img2_context_video),
+            img2_fill=args.vr_img2_fill,
+            img2_code_stats=args.vr_img2_code_stats,
+            save_latents=args.vr_save_latents,
+            img2_release_step=args.vr_img2_release_step,
+            decode_fix=args.vr_decode_fix,
+            decode_fix_window=args.vr_decode_fix_window,
+            img2_span_schedule=args.vr_img2_span_schedule,
+            img2_release_input=args.vr_img2_release_input,
+            override_img2_mask=args.vr_override_img2_mask,
+            override_img2_value=args.vr_override_img2_value,
+            override_single=args.vr_override_single)
+        latents_final = getattr(wan_i2v, 'last_latents', None)
+        video_fixed = getattr(wan_i2v, 'last_fixed_video', None)
+        video_stream2 = getattr(wan_i2v, 'last_stream2_video', None)
+        video_plan = getattr(wan_i2v, 'last_plan_video', None)
 
     if rank == 0:
         if args.save_file is None:
@@ -1082,12 +1555,56 @@ def generate(args):
             nrow=1,
             normalize=True,
             value_range=(-1, 1))
+        if args.vr_save_head_frames:
+            head_file = os.path.splitext(args.save_file)[0] + "_head.pt"
+            logging.info(f"Saving the first {args.vr_save_head_frames} frames "
+                         f"to {head_file}")
+            torch.save(video[:, :args.vr_save_head_frames].float().cpu()
+                       .clone(), head_file)
+        if args.vr_save_latents and latents_final is not None:
+            latents_file = os.path.splitext(args.save_file)[0] + "_latents.pt"
+            logging.info(f"Saving the final latents to {latents_file}")
+            torch.save(latents_final, latents_file)
+        if video_fixed is not None:
+            fixed_file = os.path.splitext(args.save_file)[0] + "_fix.mp4"
+            logging.info(f"Saving the decode-fixed video ({args.vr_decode_fix}"
+                         f", latents {args.vr_decode_fix_window[0]}-"
+                         f"{args.vr_decode_fix_window[1]}) to {fixed_file}")
+            save_video(
+                tensor=video_fixed[None],
+                save_file=fixed_file,
+                fps=cfg.sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1))
+        if video_stream2 is not None:
+            stream2_file = os.path.splitext(args.save_file)[0] + "_s2.mp4"
+            logging.info(f"Saving stream 2 (two-keyframe) video to "
+                         f"{stream2_file}")
+            save_video(
+                tensor=video_stream2[None],
+                save_file=stream2_file,
+                fps=cfg.sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1))
+        if video_plan is not None:
+            plan_file = os.path.splitext(args.save_file)[0] + "_plan.mp4"
+            logging.info(f"Saving the plan (override run before re-rendering) "
+                         f"to {plan_file}")
+            save_video(
+                tensor=video_plan[None],
+                save_file=plan_file,
+                fps=cfg.sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1))
         if "s2v" in args.task:
             if args.enable_tts is False:
                 merge_video_audio(video_path=args.save_file, audio_path=args.audio)
             else:
                 merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
-    del video
+    del video, video_stream2, video_plan, video_fixed
 
     torch.cuda.synchronize()
     if dist.is_initialized():

@@ -6,11 +6,13 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import (duplicate_anchor_rope, flash_attention,
-                        one_way_img2_attention,
-                        paired_anchor_attention,
-                        self_attention_guidance_attention,
-                        temporary_anchor_rope)
+from .attention import (
+    ATTN_PROBE,
+    flash_attention,
+    override_attention,
+    paired_anchor_attention,
+    probe_plain_self_attention,
+)
 
 __all__ = ['WanModel']
 
@@ -29,6 +31,30 @@ def sinusoidal_embedding_1d(dim, position):
 
 
 @torch.amp.autocast('cuda', enabled=False)
+def relay_local_split(relay_from_frame, grid_sizes, local_start, local_len):
+    """Prompt relay (round 4): index, within this rank's token slice
+    [local_start, local_start + local_len), of the first token that uses the
+    relay prompt. Tokens are frame-major, so latent frames >= relay_from_frame
+    form one contiguous tail of the sequence. All streams share one grid."""
+    grids = grid_sizes.tolist()
+    # Streams may differ in length (Stream B is shorter), not in frame size.
+    if any(g[1:] != grids[0][1:] for g in grids):
+        raise ValueError("prompt relay needs every stream on the same "
+                         "spatial grid")
+    tokens_per_frame = int(grids[0][1] * grids[0][2])
+    start = int(relay_from_frame) * tokens_per_frame
+    return int(min(max(start - int(local_start), 0), int(local_len)))
+
+
+def embed_relay_context(model, relay):
+    """Text-embed the per-stream relay prompts like the main context."""
+    return model.text_embedding(
+        torch.stack([
+            torch.cat([u, u.new_zeros(model.text_len - u.size(0), u.size(1))])
+            for u in relay['context']
+        ]))
+
+
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
@@ -135,16 +161,8 @@ class WanSelfAttention(nn.Module):
                 paired_anchor_index=None,
                 paired_stream_weight=0.25,
                 paired_prefix_anchor_active=True,
-                paired_prefix_future_eta=0.0,
-                one_way_img2_anchor_index=None,
-                one_way_img2_weight=0.25,
-                attention_guidance_anchor_index=None,
-                self_attention_guidance_scale=0.5,
-                self_attention_guidance_img2_weight=0.25,
-                self_attention_guidance_rms_cap=None,
-                self_attention_guidance_anchor_prior=None,
-                self_attention_guidance_joint_query_single_memory_alpha=None,
-                self_attention_guidance_selective_suffix_memory_alpha=None):
+                paired_variant=None,
+                override=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -165,45 +183,25 @@ class WanSelfAttention(nn.Module):
 
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
-        if one_way_img2_anchor_index is not None:
-            # M contains [joint auxiliary anchor, ordinary Img1-only anchor].
-            # Preserve the native M timeline by assigning both the same
-            # integer coordinate. B retains ordinary local Img2-first RoPE.
-            q = torch.cat([
-                duplicate_anchor_rope(
-                    q[:1], grid_sizes[:1], freqs,
-                    one_way_img2_anchor_index), q[1:]
-            ], dim=0)
-            k = torch.cat([
-                duplicate_anchor_rope(
-                    k[:1], grid_sizes[:1], freqs,
-                    one_way_img2_anchor_index), k[1:]
-            ], dim=0)
-        if attention_guidance_anchor_index is not None:
-            # Expanded M/J both contain the temporary slot and use compressed
-            # retained-frame coordinates. B keeps ordinary local RoPE.
-            expanded_count = 2 if q.size(0) >= 3 else 1
-            q = torch.cat([
-                temporary_anchor_rope(
-                    q[:expanded_count], grid_sizes[:expanded_count], freqs,
-                    attention_guidance_anchor_index), q[expanded_count:]
-            ], dim=0)
-            k = torch.cat([
-                temporary_anchor_rope(
-                    k[:expanded_count], grid_sizes[:expanded_count], freqs,
-                    attention_guidance_anchor_index), k[expanded_count:]
-            ], dim=0)
-        if one_way_img2_anchor_index is not None:
-            x = one_way_img2_attention(
+        if override is not None:
+            x = override_attention(
                 q=q,
                 k=k,
                 v=v,
                 seq_lens=seq_lens,
                 grid_sizes=grid_sizes,
-                anchor_index=one_way_img2_anchor_index,
-                img2_weight=one_way_img2_weight,
+                override=override,
                 window_size=self.window_size)
-        elif paired_anchor_index is not None:
+        elif paired_anchor_index is None:
+            x = flash_attention(
+                q=q,
+                k=k,
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.window_size)
+            if ATTN_PROBE.record:
+                probe_plain_self_attention(q, k, grid_sizes)
+        else:
             x = paired_anchor_attention(
                 q=q,
                 k=k,
@@ -214,33 +212,8 @@ class WanSelfAttention(nn.Module):
                 anchor_index=paired_anchor_index,
                 stream_weight=paired_stream_weight,
                 prefix_anchor_active=paired_prefix_anchor_active,
-                prefix_future_eta=paired_prefix_future_eta,
-                window_size=self.window_size)
-        elif attention_guidance_anchor_index is not None:
-            x = self_attention_guidance_attention(
-                q=q,
-                k=k,
-                v=v,
-                seq_lens=seq_lens,
-                grid_sizes=grid_sizes,
-                freqs=freqs,
-                anchor_index=attention_guidance_anchor_index,
-                joint_weight=self_attention_guidance_scale,
-                img2_weight=self_attention_guidance_img2_weight,
-                joint_rms_cap=self_attention_guidance_rms_cap,
-                anchor_prior=self_attention_guidance_anchor_prior,
-                joint_query_single_memory_alpha=(
-                    self_attention_guidance_joint_query_single_memory_alpha),
-                selective_suffix_memory_alpha=(
-                    self_attention_guidance_selective_suffix_memory_alpha),
-                window_size=self.window_size)
-        else:
-            x = flash_attention(
-                q=q,
-                k=k,
-                v=v,
-                k_lens=seq_lens,
-                window_size=self.window_size)
+                window_size=self.window_size,
+                variant=paired_variant)
 
         # output
         x = x.flatten(2)
@@ -321,16 +294,9 @@ class WanAttentionBlock(nn.Module):
         paired_anchor_index=None,
         paired_stream_weight=0.25,
         paired_prefix_anchor_active=True,
-        paired_prefix_future_eta=0.0,
-        one_way_img2_anchor_index=None,
-        one_way_img2_weight=0.25,
-        self_attention_guidance_scale=None,
-        self_attention_guidance_img2_weight=None,
-        self_attention_guidance_rms_cap=None,
-        self_attention_guidance_anchor_prior=None,
-        self_attention_guidance_joint_query_single_memory_alpha=None,
-        self_attention_guidance_selective_suffix_memory_alpha=None,
-        attention_guidance_anchor_index=None,
+        paired_variant=None,
+        override=None,
+        relay=None,
     ):
         r"""
         Args:
@@ -348,36 +314,29 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens=seq_lens,
-            grid_sizes=grid_sizes,
-            freqs=freqs,
-            paired_anchor_index=paired_anchor_index,
-            paired_stream_weight=paired_stream_weight,
-            paired_prefix_anchor_active=paired_prefix_anchor_active,
-            paired_prefix_future_eta=paired_prefix_future_eta,
-            one_way_img2_anchor_index=one_way_img2_anchor_index,
-            one_way_img2_weight=one_way_img2_weight,
-            attention_guidance_anchor_index=attention_guidance_anchor_index,
-            self_attention_guidance_scale=(
-                0.5 if self_attention_guidance_scale is None else
-                self_attention_guidance_scale),
-            self_attention_guidance_img2_weight=(
-                0.25 if self_attention_guidance_img2_weight is None else
-                self_attention_guidance_img2_weight),
-            self_attention_guidance_rms_cap=(
-                self_attention_guidance_rms_cap),
-            self_attention_guidance_anchor_prior=(
-                self_attention_guidance_anchor_prior),
-            self_attention_guidance_joint_query_single_memory_alpha=(
-                self_attention_guidance_joint_query_single_memory_alpha),
-            self_attention_guidance_selective_suffix_memory_alpha=(
-                self_attention_guidance_selective_suffix_memory_alpha))
+            seq_lens, grid_sizes, freqs, paired_anchor_index,
+            paired_stream_weight, paired_prefix_anchor_active,
+            paired_variant, override)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            if relay is None:
+                x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            else:
+                # Prompt relay: tokens before the split keep the main prompt,
+                # the rest (later latent frames) read the relay prompt.
+                relay_context, split = relay
+                xn = self.norm3(x)
+                parts = []
+                if split > 0:
+                    parts.append(self.cross_attn(xn[:, :split], context,
+                                                 context_lens))
+                if split < xn.size(1):
+                    parts.append(self.cross_attn(xn[:, split:], relay_context,
+                                                 context_lens))
+                x = x + (parts[0] if len(parts) == 1 else torch.cat(parts, 1))
             y = self.ffn(
                 self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
             with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -546,16 +505,9 @@ class WanModel(ModelMixin, ConfigMixin):
         paired_anchor_index=None,
         paired_stream_weight=0.25,
         paired_prefix_anchor_active=True,
-        paired_prefix_future_eta=0.0,
-        one_way_img2_anchor_index=None,
-        one_way_img2_weight=0.25,
-        self_attention_guidance_scale=None,
-        self_attention_guidance_img2_weight=None,
-        self_attention_guidance_rms_cap=None,
-        self_attention_guidance_anchor_prior=None,
-        self_attention_guidance_joint_query_single_memory_alpha=None,
-        self_attention_guidance_selective_suffix_memory_alpha=None,
-        attention_guidance_anchor_index=None,
+        paired_variant=None,
+        override=None,
+        relay=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -599,26 +551,17 @@ class WanModel(ModelMixin, ConfigMixin):
         ])
 
         # time embeddings
+        if t.dim() == 1:
+            # Add the token axis before expansion so this supports both the
+            # standard B=1 path and paired streams with B=2.
+            t = t[:, None].expand(-1, seq_len)
         with torch.amp.autocast('cuda', dtype=torch.float32):
-            if t.dim() == 1:
-                # Every token in a sample has the same diffusion timestep.
-                # Compute its modulation once and rely on broadcasting in the
-                # transformer blocks and output head. Expanding before the two
-                # MLPs would materialize B * seq_len * 6 * dim float32 values,
-                # which is several GiB for multi-stream 480p inference.
-                e = self.time_embedding(
-                    sinusoidal_embedding_1d(self.freq_dim, t).float())[:, None]
-                e0 = self.time_projection(e).unflatten(2, (6, self.dim))
-            else:
-                # Preserve support for callers that intentionally provide a
-                # distinct timestep for every token.
-                bt, token_count = t.shape
-                t = t.flatten()
-                e = self.time_embedding(
-                    sinusoidal_embedding_1d(
-                        self.freq_dim, t).unflatten(
-                            0, (bt, token_count)).float())
-                e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+            bt = t.size(0)
+            t = t.flatten()
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim,
+                                        t).unflatten(0, (bt, seq_len)).float())
+            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
@@ -641,21 +584,13 @@ class WanModel(ModelMixin, ConfigMixin):
             paired_anchor_index=paired_anchor_index,
             paired_stream_weight=paired_stream_weight,
             paired_prefix_anchor_active=paired_prefix_anchor_active,
-            paired_prefix_future_eta=paired_prefix_future_eta,
-            one_way_img2_anchor_index=one_way_img2_anchor_index,
-            one_way_img2_weight=one_way_img2_weight,
-            self_attention_guidance_scale=self_attention_guidance_scale,
-            self_attention_guidance_img2_weight=(
-                self_attention_guidance_img2_weight),
-            self_attention_guidance_rms_cap=(
-                self_attention_guidance_rms_cap),
-            self_attention_guidance_anchor_prior=(
-                self_attention_guidance_anchor_prior),
-            self_attention_guidance_joint_query_single_memory_alpha=(
-                self_attention_guidance_joint_query_single_memory_alpha),
-            self_attention_guidance_selective_suffix_memory_alpha=(
-                self_attention_guidance_selective_suffix_memory_alpha),
-            attention_guidance_anchor_index=attention_guidance_anchor_index)
+            paired_variant=paired_variant,
+            override=override)
+        if relay is not None:
+            # relay = dict(context=[per-stream text], from_frame=latent index)
+            kwargs['relay'] = (embed_relay_context(self, relay),
+                               relay_local_split(relay['from_frame'],
+                                                 grid_sizes, 0, x.size(1)))
 
         for block in self.blocks:
             x = block(x, **kwargs)

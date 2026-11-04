@@ -2,12 +2,14 @@
 import torch
 import torch.distributed as dist
 
-from ..modules.attention import (duplicate_anchor_rope, flash_attention,
-                                 one_way_img2_attention,
-                                 paired_anchor_attention,
-                                 self_attention_guidance_attention,
-                                 temporary_anchor_rope)
-from .util import all_to_all
+from ..modules.attention import (
+    ATTN_PROBE,
+    flash_attention,
+    override_attention,
+    paired_anchor_attention,
+    probe_plain_self_attention,
+)
+from .util import all_to_all, get_rank
 
 
 def distributed_attention(
@@ -21,16 +23,8 @@ def distributed_attention(
         paired_anchor_index=None,
         paired_stream_weight=0.25,
         paired_prefix_anchor_active=True,
-        paired_prefix_future_eta=0.0,
-        one_way_img2_anchor_index=None,
-        one_way_img2_weight=0.25,
-        attention_guidance_anchor_index=None,
-        self_attention_guidance_scale=0.5,
-        self_attention_guidance_img2_weight=0.25,
-        self_attention_guidance_rms_cap=None,
-        self_attention_guidance_anchor_prior=None,
-        self_attention_guidance_joint_query_single_memory_alpha=None,
-        self_attention_guidance_selective_suffix_memory_alpha=None,
+        paired_variant=None,
+        override=None,
 ):
     """
     Performs distributed attention based on DeepSpeed Ulysses attention mechanism.
@@ -52,55 +46,37 @@ def distributed_attention(
     k = all_to_all(k, scatter_dim=2, gather_dim=1)
     v = all_to_all(v, scatter_dim=2, gather_dim=1)
 
-    if one_way_img2_anchor_index is not None:
-        if grid_sizes is None or freqs is None:
-            raise ValueError(
-                "one-way Img2 RoPE requires grid sizes and frequencies")
-        q = torch.cat([
-            duplicate_anchor_rope(
-                q[:1], grid_sizes[:1], freqs,
-                one_way_img2_anchor_index), q[1:]
-        ], dim=0)
-        k = torch.cat([
-            duplicate_anchor_rope(
-                k[:1], grid_sizes[:1], freqs,
-                one_way_img2_anchor_index), k[1:]
-        ], dim=0)
-
-    if attention_guidance_anchor_index is not None:
-        if grid_sizes is None or freqs is None:
-            raise ValueError(
-                "attention-guidance RoPE requires grid sizes and frequencies")
-        # Expanded M/J use compressed retained-frame coordinates. Local B
-        # keeps ordinary first-frame RoPE.
-        expanded_count = 2 if q.size(0) >= 3 else 1
-        q = torch.cat([
-            temporary_anchor_rope(
-                q[:expanded_count], grid_sizes[:expanded_count], freqs,
-                attention_guidance_anchor_index), q[expanded_count:]
-        ], dim=0)
-        k = torch.cat([
-            temporary_anchor_rope(
-                k[:expanded_count], grid_sizes[:expanded_count], freqs,
-                attention_guidance_anchor_index), k[expanded_count:]
-        ], dim=0)
+    # After the all-to-all this rank holds the full sequence for one
+    # contiguous block of heads (rank r: heads [r * H_local, (r + 1) * H_local)).
+    probe_head_offset = get_rank() * q.size(2)
 
     # apply attention
-    if one_way_img2_anchor_index is not None:
+    if override is not None:
         if grid_sizes is None:
-            raise ValueError(
-                "one-way Img2 distributed attention requires grid sizes")
-        x = one_way_img2_attention(
-            q=q,
-            k=k,
-            v=v,
-            seq_lens=seq_lens,
-            grid_sizes=grid_sizes,
-            anchor_index=one_way_img2_anchor_index,
-            img2_weight=one_way_img2_weight,
+            raise ValueError("override attention requires grid sizes")
+        x = override_attention(
+            q,
+            k,
+            v,
+            seq_lens,
+            grid_sizes,
+            override,
+            window_size=window_size,
+            probe_head_offset=probe_head_offset,
+            probe_sp=True,
+        )
+    elif paired_anchor_index is None:
+        x = flash_attention(
+            q,
+            k,
+            v,
+            k_lens=seq_lens,
             window_size=window_size,
         )
-    elif paired_anchor_index is not None:
+        if ATTN_PROBE.record and grid_sizes is not None:
+            probe_plain_self_attention(
+                q, k, grid_sizes, head_offset=probe_head_offset, sp=True)
+    else:
         if grid_sizes is None:
             raise ValueError(
                 "paired distributed attention requires grid sizes")
@@ -114,35 +90,10 @@ def distributed_attention(
             anchor_index=paired_anchor_index,
             stream_weight=paired_stream_weight,
             prefix_anchor_active=paired_prefix_anchor_active,
-            prefix_future_eta=paired_prefix_future_eta,
             window_size=window_size,
-        )
-    elif attention_guidance_anchor_index is not None:
-        x = self_attention_guidance_attention(
-            q=q,
-            k=k,
-            v=v,
-            seq_lens=seq_lens,
-            grid_sizes=grid_sizes,
-            freqs=freqs,
-            anchor_index=attention_guidance_anchor_index,
-            joint_weight=self_attention_guidance_scale,
-            img2_weight=self_attention_guidance_img2_weight,
-            joint_rms_cap=self_attention_guidance_rms_cap,
-            anchor_prior=self_attention_guidance_anchor_prior,
-            joint_query_single_memory_alpha=(
-                self_attention_guidance_joint_query_single_memory_alpha),
-            selective_suffix_memory_alpha=(
-                self_attention_guidance_selective_suffix_memory_alpha),
-            window_size=window_size,
-        )
-    else:
-        x = flash_attention(
-            q,
-            k,
-            v,
-            k_lens=seq_lens,
-            window_size=window_size,
+            variant=paired_variant,
+            probe_head_offset=probe_head_offset,
+            probe_sp=True,
         )
 
     # scatter q/k/v sequence

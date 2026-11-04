@@ -2,7 +2,8 @@
 import torch
 import torch.cuda.amp as amp
 
-from ..modules.model import sinusoidal_embedding_1d
+from ..modules.model import (embed_relay_context, relay_local_split,
+                             sinusoidal_embedding_1d)
 from .ulysses import distributed_attention
 from .util import gather_forward, get_rank, get_world_size
 
@@ -71,16 +72,9 @@ def sp_dit_forward(
     paired_anchor_index=None,
     paired_stream_weight=0.25,
     paired_prefix_anchor_active=True,
-    paired_prefix_future_eta=0.0,
-    one_way_img2_anchor_index=None,
-    one_way_img2_weight=0.25,
-    self_attention_guidance_scale=None,
-    self_attention_guidance_img2_weight=None,
-    self_attention_guidance_rms_cap=None,
-    self_attention_guidance_anchor_prior=None,
-    self_attention_guidance_joint_query_single_memory_alpha=None,
-    self_attention_guidance_selective_suffix_memory_alpha=None,
-    attention_guidance_anchor_index=None,
+    paired_variant=None,
+    override=None,
+    relay=None,
 ):
     """
     x:              A list of videos each with shape [C, T, H, W].
@@ -110,23 +104,19 @@ def sp_dit_forward(
     ])
 
     # time embeddings
-    tokenwise_timesteps = t.dim() != 1
+    if t.dim() == 1:
+        # One timestep per sample: keep a token axis of length 1 and let the
+        # blocks broadcast it, instead of a float32 [B, seq_len, 6, dim]
+        # tensor (about 6 GB per GPU with three streams). Same math.
+        t = t[:, None]
     with torch.amp.autocast('cuda', dtype=torch.float32):
-        if not tokenwise_timesteps:
-            # The timestep is constant across every token in a sample. Keep a
-            # singleton token dimension and broadcast it after sequence
-            # sharding instead of constructing a multi-GiB repeated tensor.
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float())[:, None]
-            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
-        else:
-            bt, token_count = t.shape
-            t = t.flatten()
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(
-                    self.freq_dim, t).unflatten(
-                        0, (bt, token_count)).float())
-            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+        bt = t.size(0)
+        t_len = t.size(1)
+        t = t.flatten()
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim,
+                                    t).unflatten(0, (bt, t_len)).float())
+        e0 = self.time_projection(e).unflatten(2, (6, self.dim))
         assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
     # context
@@ -139,7 +129,7 @@ def sp_dit_forward(
 
     # Context Parallel
     x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
-    if tokenwise_timesteps:
+    if e.size(1) > 1:
         e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
         e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
 
@@ -154,20 +144,14 @@ def sp_dit_forward(
         paired_anchor_index=paired_anchor_index,
         paired_stream_weight=paired_stream_weight,
         paired_prefix_anchor_active=paired_prefix_anchor_active,
-        paired_prefix_future_eta=paired_prefix_future_eta,
-        one_way_img2_anchor_index=one_way_img2_anchor_index,
-        one_way_img2_weight=one_way_img2_weight,
-        self_attention_guidance_scale=self_attention_guidance_scale,
-        self_attention_guidance_img2_weight=(
-            self_attention_guidance_img2_weight),
-        self_attention_guidance_rms_cap=self_attention_guidance_rms_cap,
-        self_attention_guidance_anchor_prior=(
-            self_attention_guidance_anchor_prior),
-        self_attention_guidance_joint_query_single_memory_alpha=(
-            self_attention_guidance_joint_query_single_memory_alpha),
-        self_attention_guidance_selective_suffix_memory_alpha=(
-            self_attention_guidance_selective_suffix_memory_alpha),
-        attention_guidance_anchor_index=attention_guidance_anchor_index)
+        paired_variant=paired_variant,
+        override=override)
+    if relay is not None:
+        # This rank holds tokens [rank * L_local, (rank + 1) * L_local).
+        kwargs['relay'] = (embed_relay_context(self, relay),
+                           relay_local_split(relay['from_frame'], grid_sizes,
+                                             get_rank() * x.size(1),
+                                             x.size(1)))
 
     for block in self.blocks:
         x = block(x, **kwargs)
@@ -191,16 +175,8 @@ def sp_attn_forward(self,
                     paired_anchor_index=None,
                     paired_stream_weight=0.25,
                     paired_prefix_anchor_active=True,
-                    paired_prefix_future_eta=0.0,
-                    one_way_img2_anchor_index=None,
-                    one_way_img2_weight=0.25,
-                    attention_guidance_anchor_index=None,
-                    self_attention_guidance_scale=0.5,
-                    self_attention_guidance_img2_weight=0.25,
-                    self_attention_guidance_rms_cap=None,
-                    self_attention_guidance_anchor_prior=None,
-                    self_attention_guidance_joint_query_single_memory_alpha=None,
-                    self_attention_guidance_selective_suffix_memory_alpha=None,
+                    paired_variant=None,
+                    override=None,
                     dtype=torch.bfloat16):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
@@ -230,20 +206,8 @@ def sp_attn_forward(self,
         paired_anchor_index=paired_anchor_index,
         paired_stream_weight=paired_stream_weight,
         paired_prefix_anchor_active=paired_prefix_anchor_active,
-        paired_prefix_future_eta=paired_prefix_future_eta,
-        one_way_img2_anchor_index=one_way_img2_anchor_index,
-        one_way_img2_weight=one_way_img2_weight,
-        attention_guidance_anchor_index=attention_guidance_anchor_index,
-        self_attention_guidance_scale=self_attention_guidance_scale,
-        self_attention_guidance_img2_weight=(
-            self_attention_guidance_img2_weight),
-        self_attention_guidance_rms_cap=self_attention_guidance_rms_cap,
-        self_attention_guidance_anchor_prior=(
-            self_attention_guidance_anchor_prior),
-        self_attention_guidance_joint_query_single_memory_alpha=(
-            self_attention_guidance_joint_query_single_memory_alpha),
-        self_attention_guidance_selective_suffix_memory_alpha=(
-            self_attention_guidance_selective_suffix_memory_alpha),
+        paired_variant=paired_variant,
+        override=override,
     )
 
     # output
