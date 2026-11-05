@@ -74,6 +74,17 @@ def sp_dit_forward(
     paired_prefix_future_eta=0.0,
     one_way_img2_anchor_index=None,
     one_way_img2_weight=0.25,
+    one_way_prefix_reads_aux_anchor=True,
+    one_way_aux_anchor_prior=0.5,
+    one_way_guided_frames=None,
+    one_way_shared_anchor_update=False,
+    joint_img2_guidance_anchor_index=None,
+    joint_img2_guidance_weight=0.25,
+    joint_img2_guidance_rope_compression=False,
+    cross_tail_bridge_anchor_index=None,
+    cross_tail_bridge_tail_frames=4,
+    cross_tail_bridge_memory_prior=0.2,
+    cross_tail_bridge_control_memory_mass=True,
     self_attention_guidance_scale=None,
     self_attention_guidance_img2_weight=None,
     self_attention_guidance_rms_cap=None,
@@ -81,6 +92,7 @@ def sp_dit_forward(
     self_attention_guidance_joint_query_single_memory_alpha=None,
     self_attention_guidance_selective_suffix_memory_alpha=None,
     attention_guidance_anchor_index=None,
+    temporal_prompt_relay=None,
 ):
     """
     x:              A list of videos each with shape [C, T, H, W].
@@ -139,6 +151,10 @@ def sp_dit_forward(
 
     # Context Parallel
     x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
+    if temporal_prompt_relay is not None:
+        temporal_prompt_relay = dict(temporal_prompt_relay)
+        temporal_prompt_relay['query_token_offset'] = (
+            get_rank() * x.size(1))
     if tokenwise_timesteps:
         e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
         e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
@@ -157,6 +173,19 @@ def sp_dit_forward(
         paired_prefix_future_eta=paired_prefix_future_eta,
         one_way_img2_anchor_index=one_way_img2_anchor_index,
         one_way_img2_weight=one_way_img2_weight,
+        one_way_prefix_reads_aux_anchor=one_way_prefix_reads_aux_anchor,
+        one_way_aux_anchor_prior=one_way_aux_anchor_prior,
+        one_way_guided_frames=one_way_guided_frames,
+        one_way_shared_anchor_update=one_way_shared_anchor_update,
+        joint_img2_guidance_anchor_index=joint_img2_guidance_anchor_index,
+        joint_img2_guidance_weight=joint_img2_guidance_weight,
+        joint_img2_guidance_rope_compression=(
+            joint_img2_guidance_rope_compression),
+        cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
+        cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,
+        cross_tail_bridge_memory_prior=cross_tail_bridge_memory_prior,
+        cross_tail_bridge_control_memory_mass=(
+            cross_tail_bridge_control_memory_mass),
         self_attention_guidance_scale=self_attention_guidance_scale,
         self_attention_guidance_img2_weight=(
             self_attention_guidance_img2_weight),
@@ -167,7 +196,8 @@ def sp_dit_forward(
             self_attention_guidance_joint_query_single_memory_alpha),
         self_attention_guidance_selective_suffix_memory_alpha=(
             self_attention_guidance_selective_suffix_memory_alpha),
-        attention_guidance_anchor_index=attention_guidance_anchor_index)
+        attention_guidance_anchor_index=attention_guidance_anchor_index,
+        temporal_prompt_relay=temporal_prompt_relay)
 
     for block in self.blocks:
         x = block(x, **kwargs)
@@ -194,6 +224,17 @@ def sp_attn_forward(self,
                     paired_prefix_future_eta=0.0,
                     one_way_img2_anchor_index=None,
                     one_way_img2_weight=0.25,
+                    one_way_prefix_reads_aux_anchor=True,
+                    one_way_aux_anchor_prior=0.5,
+                    one_way_guided_frames=None,
+                    one_way_shared_anchor_update=False,
+                    joint_img2_guidance_anchor_index=None,
+                    joint_img2_guidance_weight=0.25,
+                    joint_img2_guidance_rope_compression=False,
+                    cross_tail_bridge_anchor_index=None,
+                    cross_tail_bridge_tail_frames=4,
+                    cross_tail_bridge_memory_prior=0.2,
+                    cross_tail_bridge_control_memory_mass=True,
                     attention_guidance_anchor_index=None,
                     self_attention_guidance_scale=0.5,
                     self_attention_guidance_img2_weight=0.25,
@@ -233,6 +274,19 @@ def sp_attn_forward(self,
         paired_prefix_future_eta=paired_prefix_future_eta,
         one_way_img2_anchor_index=one_way_img2_anchor_index,
         one_way_img2_weight=one_way_img2_weight,
+        one_way_prefix_reads_aux_anchor=one_way_prefix_reads_aux_anchor,
+        one_way_aux_anchor_prior=one_way_aux_anchor_prior,
+        one_way_guided_frames=one_way_guided_frames,
+        one_way_shared_anchor_update=one_way_shared_anchor_update,
+        joint_img2_guidance_anchor_index=joint_img2_guidance_anchor_index,
+        joint_img2_guidance_weight=joint_img2_guidance_weight,
+        joint_img2_guidance_rope_compression=(
+            joint_img2_guidance_rope_compression),
+        cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
+        cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,
+        cross_tail_bridge_memory_prior=cross_tail_bridge_memory_prior,
+        cross_tail_bridge_control_memory_mass=(
+            cross_tail_bridge_control_memory_mass),
         attention_guidance_anchor_index=attention_guidance_anchor_index,
         self_attention_guidance_scale=self_attention_guidance_scale,
         self_attention_guidance_img2_weight=(

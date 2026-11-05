@@ -67,6 +67,264 @@ class PairedAnchorCliTest(unittest.TestCase):
         self.assertEqual(
             args.image_condition_one_way_prompt_guidance_weight, 0.3)
 
+    def test_one_way_prefix_m10_only_flag_is_scoped(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'begin from img1',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'continue from img2',
+            '--image_condition_one_way_prompt_guidance',
+            '--image_condition_one_way_prompt_guidance_prefix_m10_only')
+        self.assertTrue(
+            args.image_condition_one_way_prompt_guidance_prefix_m10_only)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png',
+                '--image_condition_one_way_prompt_guidance_prefix_m10_only')
+
+    def test_one_way_auxiliary_anchor_prior_is_configurable(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'begin from img1',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'continue from img2',
+            '--image_condition_one_way_prompt_guidance',
+            '--image_condition_one_way_prompt_guidance_aux_anchor_prior',
+            '0.7')
+        self.assertEqual(
+            args.image_condition_one_way_prompt_guidance_aux_anchor_prior,
+            0.7)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image_prompt', 'begin from img1',
+                '--image', 'img2.png', '--image_latent_index', '10',
+                '--image_prompt', 'continue from img2',
+                '--image_condition_one_way_prompt_guidance',
+                '--image_condition_one_way_prompt_guidance_aux_anchor_prior',
+                '1.0')
+
+    def test_one_way_full_img2_stream_flag_is_scoped(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'begin from img1',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'continue from img2',
+            '--image_condition_one_way_prompt_guidance',
+            '--image_condition_one_way_prompt_guidance_full_img2_stream')
+        self.assertTrue(
+            args.image_condition_one_way_prompt_guidance_full_img2_stream)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png',
+                '--image_condition_one_way_prompt_guidance_full_img2_stream')
+
+    def test_one_way_guided_frames_is_scoped_and_positive(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'begin from img1',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'continue from img2',
+            '--image_condition_one_way_prompt_guidance',
+            '--image_condition_one_way_prompt_guidance_guided_frames', '3')
+        self.assertEqual(
+            args.image_condition_one_way_prompt_guidance_guided_frames, 3)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png',
+                '--image_condition_one_way_prompt_guidance_guided_frames', '3')
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image_prompt', 'begin from img1',
+                '--image', 'img2.png', '--image_latent_index', '10',
+                '--image_prompt', 'continue from img2',
+                '--image_condition_one_way_prompt_guidance',
+                '--image_condition_one_way_prompt_guidance_guided_frames', '0')
+
+    def test_one_way_shared_anchor_update_flag_is_scoped(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'begin from img1',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'continue from img2',
+            '--image_condition_one_way_prompt_guidance',
+            '--image_condition_one_way_prompt_guidance_shared_anchor_update')
+        self.assertTrue(
+            args.image_condition_one_way_prompt_guidance_shared_anchor_update)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png',
+                '--image_condition_one_way_prompt_guidance_shared_anchor_update')
+
+    def test_joint_img2_guidance_accepts_aligned_images(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation',
+            '--image_condition_joint_img2_guidance',
+            '--image_condition_joint_img2_guidance_weight', '0.3')
+        self.assertTrue(args.image_condition_joint_img2_guidance)
+        self.assertEqual(args.image_condition_joint_img2_guidance_weight, 0.3)
+        self.assertFalse(args.image_condition_self_attention_guidance)
+
+    def test_joint_img2_guidance_accepts_shifted_anchor_view(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation',
+            '--image_condition_joint_img2_guidance',
+            '--image_condition_joint_img2_guidance_shifted_anchor')
+        self.assertTrue(
+            args.image_condition_joint_img2_guidance_shifted_anchor)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png',
+                '--image_condition_joint_img2_guidance_shifted_anchor')
+
+    def test_joint_img2_guidance_rope_compression_is_opt_in_and_scoped(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation',
+            '--image_condition_joint_img2_guidance',
+            '--image_condition_joint_img2_guidance_shifted_anchor',
+            '--image_condition_joint_img2_guidance_rope_compression')
+        self.assertTrue(
+            args.image_condition_joint_img2_guidance_rope_compression)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image_prompt', 'full trajectory',
+                '--image', 'img2.png', '--image_latent_index', '10',
+                '--image_prompt', 'Img2 continuation',
+                '--image_condition_joint_img2_guidance',
+                '--image_condition_joint_img2_guidance_rope_compression')
+
+    def test_joint_img2_guidance_static_b_prompt_is_scoped(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation',
+            '--image_condition_joint_img2_guidance',
+            '--image_condition_joint_img2_guidance_static_b_prompt')
+        self.assertTrue(
+            args.image_condition_joint_img2_guidance_static_b_prompt)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png',
+                '--image_condition_joint_img2_guidance_static_b_prompt')
+
+    def test_joint_img2_guidance_persistent_b_is_shifted_only(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation',
+            '--image_condition_joint_img2_guidance',
+            '--image_condition_joint_img2_guidance_shifted_anchor',
+            '--image_condition_joint_img2_guidance_persistent_b')
+        self.assertTrue(args.image_condition_joint_img2_guidance_persistent_b)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image_prompt', 'full trajectory',
+                '--image', 'img2.png', '--image_latent_index', '10',
+                '--image_prompt', 'Img2 continuation',
+                '--image_condition_joint_img2_guidance',
+                '--image_condition_joint_img2_guidance_persistent_b')
+
+    def test_joint_img2_guidance_save_b_video_requires_persistent_b(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation',
+            '--image_condition_joint_img2_guidance',
+            '--image_condition_joint_img2_guidance_shifted_anchor',
+            '--image_condition_joint_img2_guidance_persistent_b',
+            '--image_condition_joint_img2_guidance_save_b_video')
+        self.assertTrue(
+            args.image_condition_joint_img2_guidance_save_b_video)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image_prompt', 'full trajectory',
+                '--image', 'img2.png', '--image_latent_index', '10',
+                '--image_prompt', 'Img2 continuation',
+                '--image_condition_joint_img2_guidance',
+                '--image_condition_joint_img2_guidance_shifted_anchor',
+                '--image_condition_joint_img2_guidance_save_b_video')
+
+    def test_joint_img2_guidance_is_isolated(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image_prompt', 'full trajectory',
+                '--image', 'img2.png', '--image_latent_index', '10',
+                '--image_prompt', 'Img2 continuation',
+                '--image_condition_joint_img2_guidance',
+                '--image_condition_self_attention_guidance')
+
+    def test_joint_img2_guidance_requires_two_prompts(self):
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image', 'img2.png', '--image_latent_index', '10',
+                '--image_prompt', 'only one prompt',
+                '--image_condition_joint_img2_guidance')
+
+    def test_cross_tail_bridge_accepts_prompts_and_controls(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'prompt one',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'prompt two',
+            '--image_condition_cross_tail_bridge',
+            '--image_condition_cross_tail_bridge_tail_frames', '3',
+            '--image_condition_cross_tail_bridge_memory_prior', '0.15')
+        self.assertTrue(args.image_condition_cross_tail_bridge)
+        self.assertEqual(args.image_condition_cross_tail_bridge_tail_frames, 3)
+        self.assertEqual(
+            args.image_condition_cross_tail_bridge_memory_prior, 0.15)
+
+    def test_cross_tail_bridge_is_isolated_and_validated(self):
+        common = (
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'prompt one',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'prompt two',
+            '--image_condition_cross_tail_bridge')
+        with self.assertRaises(AssertionError):
+            self.parse(*common, '--image_condition_joint_img2_guidance')
+        with self.assertRaises(AssertionError):
+            self.parse(
+                *common,
+                '--image_condition_cross_tail_bridge_tail_frames', '21')
+        with self.assertRaises(AssertionError):
+            self.parse(
+                *common,
+                '--image_condition_cross_tail_bridge_memory_prior', '1.1')
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png',
+                '--image_condition_cross_tail_bridge_uncontrolled_mass')
+
+    def test_cross_tail_bridge_can_disable_mass_control(self):
+        args = self.parse(
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'prompt one',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'prompt two',
+            '--image_condition_cross_tail_bridge',
+            '--image_condition_cross_tail_bridge_uncontrolled_mass')
+        self.assertTrue(
+            args.image_condition_cross_tail_bridge_uncontrolled_mass)
+
     def test_one_way_prompt_guidance_requires_two_prompts(self):
         with self.assertRaises(AssertionError):
             self.parse(

@@ -79,6 +79,8 @@ def _validate_args(args):
     if args.task == "i2v-A14B":
         enabled_multi_image_modes = sum(bool(value) for value in (
             args.image_condition_one_way_prompt_guidance,
+            args.image_condition_joint_img2_guidance,
+            args.image_condition_cross_tail_bridge,
             args.image_condition_paired_anchor_attention,
             args.image_condition_self_attention_guidance,
         ))
@@ -87,9 +89,71 @@ def _validate_args(args):
         assert 0.0 <= args.image_condition_one_way_prompt_guidance_weight <= 1.0, (
             "--image_condition_one_way_prompt_guidance_weight must be in "
             "[0, 1].")
-        if args.image_condition_one_way_prompt_guidance:
+        assert (0.0 <
+                args.image_condition_one_way_prompt_guidance_aux_anchor_prior
+                < 1.0), (
+                    "--image_condition_one_way_prompt_guidance_aux_anchor_prior "
+                    "must be strictly between 0 and 1.")
+        if args.image_condition_one_way_prompt_guidance_prefix_m10_only:
+            assert args.image_condition_one_way_prompt_guidance, (
+                "--image_condition_one_way_prompt_guidance_prefix_m10_only "
+                "requires --image_condition_one_way_prompt_guidance.")
+        if args.image_condition_one_way_prompt_guidance_full_img2_stream:
+            assert args.image_condition_one_way_prompt_guidance, (
+                "--image_condition_one_way_prompt_guidance_full_img2_stream "
+                "requires --image_condition_one_way_prompt_guidance.")
+        if args.image_condition_one_way_prompt_guidance_shared_anchor_update:
+            assert args.image_condition_one_way_prompt_guidance, (
+                "--image_condition_one_way_prompt_guidance_shared_anchor_update "
+                "requires --image_condition_one_way_prompt_guidance.")
+        if args.image_condition_one_way_prompt_guidance_guided_frames is not None:
+            assert args.image_condition_one_way_prompt_guidance, (
+                "--image_condition_one_way_prompt_guidance_guided_frames "
+                "requires --image_condition_one_way_prompt_guidance.")
+            assert args.image_condition_one_way_prompt_guidance_guided_frames >= 1, (
+                "--image_condition_one_way_prompt_guidance_guided_frames "
+                "must be at least 1.")
+        assert 0.0 <= args.image_condition_joint_img2_guidance_weight <= 1.0, (
+            "--image_condition_joint_img2_guidance_weight must be in "
+            "[0, 1].")
+        if args.image_condition_joint_img2_guidance_shifted_anchor:
+            assert args.image_condition_joint_img2_guidance, (
+                "--image_condition_joint_img2_guidance_shifted_anchor "
+                "requires --image_condition_joint_img2_guidance.")
+        if args.image_condition_joint_img2_guidance_rope_compression:
+            assert args.image_condition_joint_img2_guidance_shifted_anchor, (
+                "--image_condition_joint_img2_guidance_rope_compression "
+                "requires --image_condition_joint_img2_guidance_shifted_anchor.")
+        if args.image_condition_joint_img2_guidance_static_b_prompt:
+            assert args.image_condition_joint_img2_guidance, (
+                "--image_condition_joint_img2_guidance_static_b_prompt "
+                "requires --image_condition_joint_img2_guidance.")
+        if args.image_condition_joint_img2_guidance_persistent_b:
+            assert args.image_condition_joint_img2_guidance_shifted_anchor, (
+                "--image_condition_joint_img2_guidance_persistent_b "
+                "requires --image_condition_joint_img2_guidance_shifted_anchor.")
+        if args.image_condition_joint_img2_guidance_save_b_video:
+            assert args.image_condition_joint_img2_guidance_persistent_b, (
+                "--image_condition_joint_img2_guidance_save_b_video "
+                "requires --image_condition_joint_img2_guidance_persistent_b.")
+        if args.image_condition_cross_tail_bridge:
+            assert args.image_condition_cross_tail_bridge_tail_frames >= 1, (
+                "--image_condition_cross_tail_bridge_tail_frames must be "
+                "at least 1.")
+            assert (0.0 <=
+                    args.image_condition_cross_tail_bridge_memory_prior <=
+                    1.0), (
+                        "--image_condition_cross_tail_bridge_memory_prior "
+                        "must be in [0, 1].")
+        if args.image_condition_cross_tail_bridge_uncontrolled_mass:
+            assert args.image_condition_cross_tail_bridge, (
+                "--image_condition_cross_tail_bridge_uncontrolled_mass "
+                "requires --image_condition_cross_tail_bridge.")
+        if (args.image_condition_one_way_prompt_guidance
+                or args.image_condition_joint_img2_guidance
+                or args.image_condition_cross_tail_bridge):
             assert args.image_prompt is not None and len(args.image_prompt) == 2, (
-                "One-way prompt guidance requires exactly two "
+                "Per-stream prompt guidance requires exactly two "
                 "--image_prompt arguments.")
             assert all(value for value in args.image_prompt), (
                 "Each --image_prompt must be non-empty.")
@@ -97,8 +161,8 @@ def _validate_args(args):
                 "Prompt extension is not supported with per-image prompts.")
         else:
             assert args.image_prompt is None, (
-                "--image_prompt is only used by "
-                "--image_condition_one_way_prompt_guidance.")
+                "--image_prompt is only used by a per-stream prompt-guidance "
+                "ablation.")
         assert 0.0 <= args.image_condition_self_attention_guidance_scale <= 1.0, (
             "--image_condition_self_attention_guidance_scale must be "
             "in [0, 1].")
@@ -230,6 +294,8 @@ def _validate_args(args):
                 "Paired prefix routing does not apply to one-way prompt "
                 "guidance.")
         if (args.image_condition_one_way_prompt_guidance
+                or args.image_condition_joint_img2_guidance
+                or args.image_condition_cross_tail_bridge
                 or args.image_condition_paired_anchor_attention
                 or args.image_condition_self_attention_guidance):
             assert len(args.image) == 2, (
@@ -268,6 +334,10 @@ def _validate_args(args):
     else:
         assert not args.image_condition_one_way_prompt_guidance, (
             "One-way prompt guidance is supported only by i2v-A14B.")
+        assert not args.image_condition_joint_img2_guidance, (
+            "Joint Img2 guidance is supported only by i2v-A14B.")
+        assert not args.image_condition_cross_tail_bridge, (
+            "Cross-tail bridge is supported only by i2v-A14B.")
         assert not args.image_condition_paired_anchor_attention, (
             "Paired anchor attention is supported only by i2v-A14B.")
         assert not args.image_condition_self_attention_guidance, (
@@ -334,12 +404,33 @@ def _validate_args(args):
         args.frame_num = cfg.frame_num
 
     if (args.image_condition_one_way_prompt_guidance
+            or args.image_condition_joint_img2_guidance
+            or args.image_condition_cross_tail_bridge
             or args.image_condition_paired_anchor_attention
             or args.image_condition_self_attention_guidance):
         latent_frame_num = ((args.frame_num - 1) // cfg.vae_stride[0] + 1)
         assert args.image_latent_index[1] < latent_frame_num - 1, (
             "Img2 must leave at least one latent frame on its right; use an "
             f"index below {latent_frame_num - 1}.")
+        if args.image_condition_cross_tail_bridge:
+            img2_to_end_frames = (
+                latent_frame_num - args.image_latent_index[1])
+            assert (args.image_condition_cross_tail_bridge_tail_frames <
+                    img2_to_end_frames), (
+                        "--image_condition_cross_tail_bridge_tail_frames "
+                        "is the overlap count and must be smaller than the "
+                        "Img2-to-end window "
+                        f"({img2_to_end_frames} latent frames).")
+        if (args.image_condition_one_way_prompt_guidance_guided_frames
+                is not None):
+            retained_overlap_frames = (
+                latent_frame_num - args.image_latent_index[1])
+            assert (
+                args.image_condition_one_way_prompt_guidance_guided_frames
+                <= retained_overlap_frames), (
+                    "--image_condition_one_way_prompt_guidance_guided_frames "
+                    "cannot exceed the retained anchor-to-end overlap "
+                    f"({retained_overlap_frames} latent frames).")
 
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
         0, sys.maxsize)
@@ -460,31 +551,168 @@ def _parse_args():
         type=str,
         action="append",
         default=None,
-        help=("Prompt paired positionally with each repeated --image. Used "
-              "only by one-way per-image-prompt guidance."))
+        help=("Prompt paired positionally with each repeated --image. In "
+              "one-way prompt guidance and joint Img2 guidance these are "
+              "local prompt 1 and local prompt 2, while --prompt is the "
+              "global prompt."))
     parser.add_argument(
         "--image_condition_one_way_prompt_guidance",
         action="store_true",
-        help=("Run native-length Img1 M and aligned Img2-first B with their "
-              "respective --image_prompt values. Both streams use ordinary "
+        help=("Run native-length Img1 M and aligned Img2-first B. M uses "
+              "--prompt as a global prompt plus both --image_prompt values "
+              "as temporally relayed local prompts. B uses the global prompt "
+              "plus local prompt 2 for its entire sequence. Both streams use ordinary "
               "bidirectional attention. M keeps its full Img1-only timeline "
               "and adds one auxiliary joint Img1-to-Img2 anchor sharing the "
               "ordinary anchor's integer RoPE position. Prefix queries use "
-              "the auxiliary anchor key paired with B0's value and do not "
-              "see the ordinary anchor. Ordinary "
+              "both the auxiliary anchor and ordinary anchor with a neutral "
+              "shared-position prior, so together they receive one frame's "
+              "evidence rather than an automatic factor-of-two advantage. Ordinary "
               "anchor/suffix queries see the ordinary anchor but not the "
               "auxiliary one. The auxiliary anchor uses its own query to "
-              "attend to the prefix plus itself. B0 completely replaces the "
-              "ordinary anchor's self-attention output, while B1: guides only "
-              "the aligned post-anchor suffix. There is no "
-              "M-to-B influence or final velocity replacement."))
+              "attend to the prefix plus itself. The ordinary anchor keeps "
+              "its own M-stream self-attention output, while B1: guides only "
+              "the aligned post-anchor suffix; B0 does not update M. There is no "
+              "M-to-B influence. Before CFG, conditional B0 replaces the "
+              "conditional ordinary-anchor velocity; the unconditional "
+              "pass is one ordinary retained Img1-only M stream with no "
+              "auxiliary anchor, B stream, or prompt relay."))
     parser.add_argument(
         "--image_condition_one_way_prompt_guidance_weight",
         type=float,
         default=0.25,
         help=("Layerwise B1: output weight applied only to M's aligned "
-              "post-anchor suffix; B0 completely replaces M's ordinary "
-              "anchor output regardless of this weight (default: 0.25)."))
+              "post-anchor suffix; M's ordinary anchor keeps its own "
+              "self-attention output (default: 0.25)."))
+    parser.add_argument(
+        "--image_condition_one_way_prompt_guidance_prefix_m10_only",
+        action="store_true",
+        help=("One-way prompt-guidance ablation: prefix queries exclude the "
+              "auxiliary joint A10 and attend to retained ordinary M10. "
+              "Omit this flag to retain the default shared A10/M10 route."))
+    parser.add_argument(
+        "--image_condition_one_way_prompt_guidance_aux_anchor_prior",
+        type=float,
+        default=0.5,
+        help=("A10's prior within the shared-position A10/M10 group read by "
+              "prefix queries; M10 receives the complementary 1-prior. "
+              "This controls group evidence before the final softmax, not "
+              "an absolute fraction of total attention (default: 0.5)."))
+    parser.add_argument(
+        "--image_condition_one_way_prompt_guidance_full_img2_stream",
+        action="store_true",
+        help=("Denoise B as a full native-length Img2-first video regardless "
+              "of anchor position. B uses its complete timeline internally, "
+              "but only B0 and the aligned overlapping B suffix outputs can "
+              "affect M."))
+    parser.add_argument(
+        "--image_condition_one_way_prompt_guidance_guided_frames",
+        type=int,
+        default=None,
+        help=("Optional number of aligned latent frames, counted from the "
+              "retained anchor, that receive layerwise B guidance. For "
+              "example, 3 applies B0:B2 to the retained anchor and its next "
+              "two frames. Omit this option to retain the legacy route where "
+              "B1: guides every post-anchor frame and B0 does not guide the "
+              "anchor layerwise."))
+    parser.add_argument(
+        "--image_condition_one_way_prompt_guidance_shared_anchor_update",
+        action="store_true",
+        help=("Make auxiliary A10 and retained M10 receive the exact same "
+              "completed self-attention output at every DiT layer. When "
+              "--image_condition_one_way_prompt_guidance_guided_frames is "
+              "set, this is the M10/B0 interpolated anchor output. Their "
+              "residual states, cross-attention, and FFNs remain separate."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance",
+        action="store_true",
+        help=("Run a native 21-latent jointly Img1/Img2 VAE-conditioned J "
+              "stream and an aligned standard Img2-first B suffix. J uses "
+              "--prompt globally plus both --image_prompt values with "
+              "temporal Prompt Relay; B uses the global prompt plus local "
+              "prompt 2. J uses ordinary bidirectional attention except "
+              "that its anchor query reads only itself and its suffix. B "
+              "uses ordinary bidirectional attention; both retain ordinary "
+              "RoPE. At every "
+              "DiT layer B0 and B1: attention outputs guide J's anchor and "
+              "suffix respectively; J's prefix is unchanged. After the DiT, "
+              "B0 replaces J's anchor velocity in each CFG branch before "
+              "the scheduler step."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_weight",
+        type=float,
+        default=0.25,
+        help=("Layerwise B attention-output weight applied to J's aligned "
+              "anchor and suffix (default: 0.25)."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_shifted_anchor",
+        action="store_true",
+        help=("Shift the auxiliary standard Img2-first B view one latent "
+              "earlier, so B1 aligns with J's Img2 anchor. J and B retain "
+              "independent ordinary bidirectional self-attention. After the "
+              "DiT, B1 "
+              "replaces J's aligned anchor velocity. B is rebuilt from J "
+              "noise each step and is never scheduled independently."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_rope_compression",
+        action="store_true",
+        help=("Opt-in query-dependent RoPE compression for shifted-anchor J. "
+              "Prefix queries see the first suffix frame compressed onto the "
+              "Img2 anchor coordinate; suffix queries see the anchor "
+              "compressed onto the preceding frame coordinate while suffix "
+              "queries/keys shift consistently. The anchor reads only itself "
+              "and future frames. "
+              "The anchor is discarded before decoding. B keeps ordinary "
+              "RoPE."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_static_b_prompt",
+        action="store_true",
+        help=("Condition B on the global --prompt followed by 'No motion in "
+              "the video occurs.' instead of global prompt plus local image "
+              "prompt 2. J and its Prompt Relay are unchanged."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_persistent_b",
+        action="store_true",
+        help=("Initialize shifted B once from J[anchor-1:] and evolve it with "
+              "a separate identically configured scheduler using B's own "
+              "CFG-combined prediction. B1 and J's anchor start from the "
+              "same noise, and B1 continues to supply J's anchor velocity."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_save_b_video",
+        action="store_true",
+        help=("Decode and save the final persistent B stream beside the main "
+              "video using an _B filename suffix."))
+    parser.add_argument(
+        "--image_condition_cross_tail_bridge",
+        action="store_true",
+        help=("Run overlapping Img1 and Img2 temporal windows with "
+              "simultaneous crossed self-attention memory. M spans frame 0 "
+              "through T-1 frames after the Img2 anchor; B spans Img2 "
+              "through the output end. M's final T and B's first T frames "
+              "are aligned and start from identical noise. Every query also "
+              "reads its complete native stream. The decoded video keeps M "
+              "and appends B only after the overlap; B's CFG-combined "
+              "velocity replaces M's aligned overlap velocity before every "
+              "scheduler step."))
+    parser.add_argument(
+        "--image_condition_cross_tail_bridge_tail_frames",
+        type=int,
+        default=4,
+        help=("Number T of aligned overlap latents, including the Img2 "
+              "anchor (default: 4)."))
+    parser.add_argument(
+        "--image_condition_cross_tail_bridge_memory_prior",
+        type=float,
+        default=0.2,
+        help=("Cross-stream source prior in each length-normalized native + "
+              "cross-memory softmax (default: 0.2)."))
+    parser.add_argument(
+        "--image_condition_cross_tail_bridge_uncontrolled_mass",
+        action="store_true",
+        help=("Disable cross-tail source priors and length normalization. "
+              "Each route directly concatenates native and cross K/V in one "
+              "ordinary softmax, so attention mass is determined only by "
+              "token count and QK logits."))
     parser.add_argument(
         "--image_condition_paired_anchor_attention",
         action="store_true",
@@ -842,6 +1070,8 @@ def generate(args):
         ]
         img = (opened_images if (
             args.image_condition_one_way_prompt_guidance
+            or args.image_condition_joint_img2_guidance
+            or args.image_condition_cross_tail_bridge
             or args.image_condition_paired_anchor_attention
             or args.image_condition_self_attention_guidance)
                else opened_images[0])
@@ -1015,6 +1245,38 @@ def generate(args):
                 args.image_condition_one_way_prompt_guidance),
             image_condition_one_way_prompt_guidance_weight=(
                 args.image_condition_one_way_prompt_guidance_weight),
+            image_condition_one_way_prompt_guidance_prefix_m10_only=(
+                args.image_condition_one_way_prompt_guidance_prefix_m10_only),
+            image_condition_one_way_prompt_guidance_aux_anchor_prior=(
+                args.image_condition_one_way_prompt_guidance_aux_anchor_prior),
+            image_condition_one_way_prompt_guidance_full_img2_stream=(
+                args.image_condition_one_way_prompt_guidance_full_img2_stream),
+            image_condition_one_way_prompt_guidance_guided_frames=(
+                args.image_condition_one_way_prompt_guidance_guided_frames),
+            image_condition_one_way_prompt_guidance_shared_anchor_update=(
+                args.image_condition_one_way_prompt_guidance_shared_anchor_update),
+            image_condition_joint_img2_guidance=(
+                args.image_condition_joint_img2_guidance),
+            image_condition_joint_img2_guidance_weight=(
+                args.image_condition_joint_img2_guidance_weight),
+            image_condition_joint_img2_guidance_shifted_anchor=(
+                args.image_condition_joint_img2_guidance_shifted_anchor),
+            image_condition_joint_img2_guidance_rope_compression=(
+                args.image_condition_joint_img2_guidance_rope_compression),
+            image_condition_joint_img2_guidance_static_b_prompt=(
+                args.image_condition_joint_img2_guidance_static_b_prompt),
+            image_condition_joint_img2_guidance_persistent_b=(
+                args.image_condition_joint_img2_guidance_persistent_b),
+            return_persistent_b_video=(
+                args.image_condition_joint_img2_guidance_save_b_video),
+            image_condition_cross_tail_bridge=(
+                args.image_condition_cross_tail_bridge),
+            image_condition_cross_tail_bridge_tail_frames=(
+                args.image_condition_cross_tail_bridge_tail_frames),
+            image_condition_cross_tail_bridge_memory_prior=(
+                args.image_condition_cross_tail_bridge_memory_prior),
+            image_condition_cross_tail_bridge_uncontrolled_mass=(
+                args.image_condition_cross_tail_bridge_uncontrolled_mass),
             image_condition_paired_anchor_attention=(
                 args.image_condition_paired_anchor_attention),
             image_condition_paired_prefix_future_eta=(
@@ -1067,6 +1329,9 @@ def generate(args):
                 args.image_condition_self_attention_guidance_stop_step))
 
     if rank == 0:
+        b_video = None
+        if args.image_condition_joint_img2_guidance_save_b_video:
+            video, b_video = video
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             formatted_prompt = args.prompt.replace(" ", "_").replace("/",
@@ -1082,12 +1347,25 @@ def generate(args):
             nrow=1,
             normalize=True,
             value_range=(-1, 1))
+        if b_video is not None:
+            save_root, save_ext = os.path.splitext(args.save_file)
+            b_save_file = save_root + "_B" + (save_ext or ".mp4")
+            logging.info("Saving persistent B video to %s", b_save_file)
+            save_video(
+                tensor=b_video[None],
+                save_file=b_save_file,
+                fps=cfg.sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1))
         if "s2v" in args.task:
             if args.enable_tts is False:
                 merge_video_audio(video_path=args.save_file, audio_path=args.audio)
             else:
                 merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
     del video
+    if rank == 0 and b_video is not None:
+        del b_video
 
     torch.cuda.synchronize()
     if dist.is_initialized():

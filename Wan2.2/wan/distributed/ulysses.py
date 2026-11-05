@@ -2,7 +2,10 @@
 import torch
 import torch.distributed as dist
 
-from ..modules.attention import (duplicate_anchor_rope, flash_attention,
+from ..modules.attention import (cross_tail_bridge_attention,
+                                 cross_tail_bridge_rope,
+                                 duplicate_anchor_rope, flash_attention,
+                                 joint_img2_guidance_attention,
                                  one_way_img2_attention,
                                  paired_anchor_attention,
                                  self_attention_guidance_attention,
@@ -24,6 +27,17 @@ def distributed_attention(
         paired_prefix_future_eta=0.0,
         one_way_img2_anchor_index=None,
         one_way_img2_weight=0.25,
+        one_way_prefix_reads_aux_anchor=True,
+        one_way_aux_anchor_prior=0.5,
+        one_way_guided_frames=None,
+        one_way_shared_anchor_update=False,
+        joint_img2_guidance_anchor_index=None,
+        joint_img2_guidance_weight=0.25,
+        joint_img2_guidance_rope_compression=False,
+        cross_tail_bridge_anchor_index=None,
+        cross_tail_bridge_tail_frames=4,
+        cross_tail_bridge_memory_prior=0.2,
+        cross_tail_bridge_control_memory_mass=True,
         attention_guidance_anchor_index=None,
         self_attention_guidance_scale=0.5,
         self_attention_guidance_img2_weight=0.25,
@@ -85,8 +99,48 @@ def distributed_attention(
                 attention_guidance_anchor_index), k[expanded_count:]
         ], dim=0)
 
+    if cross_tail_bridge_anchor_index is not None:
+        if grid_sizes is None or freqs is None:
+            raise ValueError(
+                "cross-tail bridge RoPE requires grid sizes and frequencies")
+        q = cross_tail_bridge_rope(
+            q, grid_sizes, freqs, cross_tail_bridge_anchor_index)
+        k = cross_tail_bridge_rope(
+            k, grid_sizes, freqs, cross_tail_bridge_anchor_index)
+
     # apply attention
-    if one_way_img2_anchor_index is not None:
+    if cross_tail_bridge_anchor_index is not None:
+        if grid_sizes is None:
+            raise ValueError(
+                "cross-tail distributed attention requires grid sizes")
+        x = cross_tail_bridge_attention(
+            q=q,
+            k=k,
+            v=v,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            tail_frames=cross_tail_bridge_tail_frames,
+            cross_memory_prior=cross_tail_bridge_memory_prior,
+            control_memory_mass=cross_tail_bridge_control_memory_mass,
+            window_size=window_size,
+        )
+    elif joint_img2_guidance_anchor_index is not None:
+        if grid_sizes is None:
+            raise ValueError(
+                "joint Img2 distributed attention requires grid sizes")
+        x = joint_img2_guidance_attention(
+            q=q,
+            k=k,
+            v=v,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            anchor_index=joint_img2_guidance_anchor_index,
+            img2_weight=joint_img2_guidance_weight,
+            rope_compression=joint_img2_guidance_rope_compression,
+            freqs=freqs,
+            window_size=window_size,
+        )
+    elif one_way_img2_anchor_index is not None:
         if grid_sizes is None:
             raise ValueError(
                 "one-way Img2 distributed attention requires grid sizes")
@@ -98,6 +152,10 @@ def distributed_attention(
             grid_sizes=grid_sizes,
             anchor_index=one_way_img2_anchor_index,
             img2_weight=one_way_img2_weight,
+            prefix_reads_aux_anchor=one_way_prefix_reads_aux_anchor,
+            aux_anchor_prior=one_way_aux_anchor_prior,
+            guided_frames=one_way_guided_frames,
+            shared_anchor_update=one_way_shared_anchor_update,
             window_size=window_size,
         )
     elif paired_anchor_index is not None:

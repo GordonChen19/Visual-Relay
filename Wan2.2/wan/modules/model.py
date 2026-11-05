@@ -6,8 +6,9 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import (duplicate_anchor_rope, flash_attention,
-                        one_way_img2_attention,
+from .attention import (cross_tail_bridge_attention, cross_tail_bridge_rope,
+                        duplicate_anchor_rope, flash_attention,
+                        joint_img2_guidance_attention, one_way_img2_attention,
                         paired_anchor_attention,
                         self_attention_guidance_attention,
                         temporary_anchor_rope)
@@ -138,6 +139,17 @@ class WanSelfAttention(nn.Module):
                 paired_prefix_future_eta=0.0,
                 one_way_img2_anchor_index=None,
                 one_way_img2_weight=0.25,
+                one_way_prefix_reads_aux_anchor=True,
+                one_way_aux_anchor_prior=0.5,
+                one_way_guided_frames=None,
+                one_way_shared_anchor_update=False,
+                joint_img2_guidance_anchor_index=None,
+                joint_img2_guidance_weight=0.25,
+                joint_img2_guidance_rope_compression=False,
+                cross_tail_bridge_anchor_index=None,
+                cross_tail_bridge_tail_frames=4,
+                cross_tail_bridge_memory_prior=0.2,
+                cross_tail_bridge_control_memory_mass=True,
                 attention_guidance_anchor_index=None,
                 self_attention_guidance_scale=0.5,
                 self_attention_guidance_img2_weight=0.25,
@@ -193,7 +205,35 @@ class WanSelfAttention(nn.Module):
                     k[:expanded_count], grid_sizes[:expanded_count], freqs,
                     attention_guidance_anchor_index), k[expanded_count:]
             ], dim=0)
-        if one_way_img2_anchor_index is not None:
+        if cross_tail_bridge_anchor_index is not None:
+            q = cross_tail_bridge_rope(
+                q, grid_sizes, freqs, cross_tail_bridge_anchor_index)
+            k = cross_tail_bridge_rope(
+                k, grid_sizes, freqs, cross_tail_bridge_anchor_index)
+        if cross_tail_bridge_anchor_index is not None:
+            x = cross_tail_bridge_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                tail_frames=cross_tail_bridge_tail_frames,
+                cross_memory_prior=cross_tail_bridge_memory_prior,
+                control_memory_mass=cross_tail_bridge_control_memory_mass,
+                window_size=self.window_size)
+        elif joint_img2_guidance_anchor_index is not None:
+            x = joint_img2_guidance_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                anchor_index=joint_img2_guidance_anchor_index,
+                img2_weight=joint_img2_guidance_weight,
+                rope_compression=joint_img2_guidance_rope_compression,
+                freqs=freqs,
+                window_size=self.window_size)
+        elif one_way_img2_anchor_index is not None:
             x = one_way_img2_attention(
                 q=q,
                 k=k,
@@ -202,6 +242,10 @@ class WanSelfAttention(nn.Module):
                 grid_sizes=grid_sizes,
                 anchor_index=one_way_img2_anchor_index,
                 img2_weight=one_way_img2_weight,
+                prefix_reads_aux_anchor=one_way_prefix_reads_aux_anchor,
+                aux_anchor_prior=one_way_aux_anchor_prior,
+                guided_frames=one_way_guided_frames,
+                shared_anchor_update=one_way_shared_anchor_update,
                 window_size=self.window_size)
         elif paired_anchor_index is not None:
             x = paired_anchor_attention(
@@ -250,7 +294,74 @@ class WanSelfAttention(nn.Module):
 
 class WanCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens):
+    @staticmethod
+    def _relay_query_frames(query_indices, relay_config):
+        """Map flattened video-token indices to retained latent-frame indices."""
+        tokens_per_frame = int(relay_config['tokens_per_frame'])
+        frames = torch.div(
+            query_indices, tokens_per_frame, rounding_mode='floor')
+        duplicate_index = relay_config.get('duplicate_frame_index')
+        if duplicate_index is not None:
+            duplicate_index = int(duplicate_index)
+            # Expanded one-way M is [..., A10, M10, M11, ...]. A10 and M10
+            # both represent retained frame 10; later expanded positions are
+            # shifted back by one retained frame.
+            frames = torch.where(frames > duplicate_index, frames - 1,
+                                 frames)
+        return frames.float()
+
+    def _temporal_relay_attention(self, q, k, v, relay_config,
+                                  chunk_size=16):
+        """Cross-attention with Prompt-Relay costs on local-prompt tokens."""
+        batch, query_len, heads, dim = q.shape
+        if batch != 1:
+            raise ValueError("temporal relay attention expects one stream")
+        key_len = k.size(1)
+        scale = dim**-0.5
+        query_offset = int(relay_config.get('query_token_offset', 0))
+        segments = relay_config.get('segments', ())
+        output = torch.empty_like(q)
+
+        q_heads = q.transpose(1, 2)
+        k_heads = k.transpose(1, 2)
+        v_heads = v.transpose(1, 2)
+        k_transposed = k_heads.transpose(-2, -1)
+        for start in range(0, query_len, chunk_size):
+            end = min(start + chunk_size, query_len)
+            logits = torch.matmul(
+                q_heads[:, :, start:end].float(),
+                k_transposed.float()) * scale
+            query_indices = torch.arange(
+                query_offset + start,
+                query_offset + end,
+                device=q.device,
+                dtype=torch.long)
+            query_frames = self._relay_query_frames(query_indices,
+                                                     relay_config)
+            for segment in segments:
+                token_start = int(segment['token_start'])
+                token_end = min(int(segment['token_end']), key_len)
+                if token_start >= token_end:
+                    continue
+                midpoint = float(segment['midpoint'])
+                window = float(segment['window'])
+                sigma = float(segment['sigma'])
+                distance = (query_frames - midpoint).abs()
+                cost = torch.relu(distance - window).square().div_(
+                    2.0 * sigma * sigma)
+                logits[:, :, :, token_start:token_end].sub_(
+                    cost[None, None, :, None])
+            probabilities = torch.softmax(logits, dim=-1)
+            chunk = torch.matmul(probabilities, v_heads.float())
+            output[:, start:end].copy_(
+                chunk.transpose(1, 2).to(dtype=output.dtype))
+        return output
+
+    def forward(self,
+                x,
+                context,
+                context_lens,
+                temporal_prompt_relay=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -264,8 +375,27 @@ class WanCrossAttention(WanSelfAttention):
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
 
-        # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        # Compute ordinary cross-attention for every stream except the single
+        # M stream selected by the optional Prompt-Relay configuration.
+        if temporal_prompt_relay is None:
+            x = flash_attention(q, k, v, k_lens=context_lens)
+        else:
+            stream_index = int(temporal_prompt_relay.get('stream_index', 0))
+            if not 0 <= stream_index < b:
+                raise ValueError("temporal relay stream index is out of range")
+            outputs = []
+            for index in range(b):
+                if index == stream_index:
+                    outputs.append(self._temporal_relay_attention(
+                        q[index:index + 1], k[index:index + 1],
+                        v[index:index + 1], temporal_prompt_relay))
+                else:
+                    outputs.append(flash_attention(
+                        q[index:index + 1],
+                        k[index:index + 1],
+                        v[index:index + 1],
+                        k_lens=None))
+            x = torch.cat(outputs, dim=0)
 
         # output
         x = x.flatten(2)
@@ -324,6 +454,17 @@ class WanAttentionBlock(nn.Module):
         paired_prefix_future_eta=0.0,
         one_way_img2_anchor_index=None,
         one_way_img2_weight=0.25,
+        one_way_prefix_reads_aux_anchor=True,
+        one_way_aux_anchor_prior=0.5,
+        one_way_guided_frames=None,
+        one_way_shared_anchor_update=False,
+        joint_img2_guidance_anchor_index=None,
+        joint_img2_guidance_weight=0.25,
+        joint_img2_guidance_rope_compression=False,
+        cross_tail_bridge_anchor_index=None,
+        cross_tail_bridge_tail_frames=4,
+        cross_tail_bridge_memory_prior=0.2,
+        cross_tail_bridge_control_memory_mass=True,
         self_attention_guidance_scale=None,
         self_attention_guidance_img2_weight=None,
         self_attention_guidance_rms_cap=None,
@@ -331,6 +472,7 @@ class WanAttentionBlock(nn.Module):
         self_attention_guidance_joint_query_single_memory_alpha=None,
         self_attention_guidance_selective_suffix_memory_alpha=None,
         attention_guidance_anchor_index=None,
+        temporal_prompt_relay=None,
     ):
         r"""
         Args:
@@ -357,6 +499,21 @@ class WanAttentionBlock(nn.Module):
             paired_prefix_future_eta=paired_prefix_future_eta,
             one_way_img2_anchor_index=one_way_img2_anchor_index,
             one_way_img2_weight=one_way_img2_weight,
+            one_way_prefix_reads_aux_anchor=(
+                one_way_prefix_reads_aux_anchor),
+            one_way_aux_anchor_prior=one_way_aux_anchor_prior,
+            one_way_guided_frames=one_way_guided_frames,
+            one_way_shared_anchor_update=one_way_shared_anchor_update,
+            joint_img2_guidance_anchor_index=(
+                joint_img2_guidance_anchor_index),
+            joint_img2_guidance_weight=joint_img2_guidance_weight,
+            joint_img2_guidance_rope_compression=(
+                joint_img2_guidance_rope_compression),
+            cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
+            cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,
+            cross_tail_bridge_memory_prior=cross_tail_bridge_memory_prior,
+            cross_tail_bridge_control_memory_mass=(
+                cross_tail_bridge_control_memory_mass),
             attention_guidance_anchor_index=attention_guidance_anchor_index,
             self_attention_guidance_scale=(
                 0.5 if self_attention_guidance_scale is None else
@@ -377,7 +534,11 @@ class WanAttentionBlock(nn.Module):
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            x = x + self.cross_attn(
+                self.norm3(x),
+                context,
+                context_lens,
+                temporal_prompt_relay=temporal_prompt_relay)
             y = self.ffn(
                 self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
             with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -549,6 +710,17 @@ class WanModel(ModelMixin, ConfigMixin):
         paired_prefix_future_eta=0.0,
         one_way_img2_anchor_index=None,
         one_way_img2_weight=0.25,
+        one_way_prefix_reads_aux_anchor=True,
+        one_way_aux_anchor_prior=0.5,
+        one_way_guided_frames=None,
+        one_way_shared_anchor_update=False,
+        joint_img2_guidance_anchor_index=None,
+        joint_img2_guidance_weight=0.25,
+        joint_img2_guidance_rope_compression=False,
+        cross_tail_bridge_anchor_index=None,
+        cross_tail_bridge_tail_frames=4,
+        cross_tail_bridge_memory_prior=0.2,
+        cross_tail_bridge_control_memory_mass=True,
         self_attention_guidance_scale=None,
         self_attention_guidance_img2_weight=None,
         self_attention_guidance_rms_cap=None,
@@ -556,6 +728,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self_attention_guidance_joint_query_single_memory_alpha=None,
         self_attention_guidance_selective_suffix_memory_alpha=None,
         attention_guidance_anchor_index=None,
+        temporal_prompt_relay=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -644,6 +817,21 @@ class WanModel(ModelMixin, ConfigMixin):
             paired_prefix_future_eta=paired_prefix_future_eta,
             one_way_img2_anchor_index=one_way_img2_anchor_index,
             one_way_img2_weight=one_way_img2_weight,
+            one_way_prefix_reads_aux_anchor=(
+                one_way_prefix_reads_aux_anchor),
+            one_way_aux_anchor_prior=one_way_aux_anchor_prior,
+            one_way_guided_frames=one_way_guided_frames,
+            one_way_shared_anchor_update=one_way_shared_anchor_update,
+            joint_img2_guidance_anchor_index=(
+                joint_img2_guidance_anchor_index),
+            joint_img2_guidance_weight=joint_img2_guidance_weight,
+            joint_img2_guidance_rope_compression=(
+                joint_img2_guidance_rope_compression),
+            cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
+            cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,
+            cross_tail_bridge_memory_prior=cross_tail_bridge_memory_prior,
+            cross_tail_bridge_control_memory_mass=(
+                cross_tail_bridge_control_memory_mass),
             self_attention_guidance_scale=self_attention_guidance_scale,
             self_attention_guidance_img2_weight=(
                 self_attention_guidance_img2_weight),
@@ -655,7 +843,8 @@ class WanModel(ModelMixin, ConfigMixin):
                 self_attention_guidance_joint_query_single_memory_alpha),
             self_attention_guidance_selective_suffix_memory_alpha=(
                 self_attention_guidance_selective_suffix_memory_alpha),
-            attention_guidance_anchor_index=attention_guidance_anchor_index)
+            attention_guidance_anchor_index=attention_guidance_anchor_index,
+            temporal_prompt_relay=temporal_prompt_relay)
 
         for block in self.blocks:
             x = block(x, **kwargs)

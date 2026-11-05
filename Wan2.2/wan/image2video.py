@@ -253,6 +253,22 @@ class WanI2V:
                  image_prompts=None,
                  image_condition_one_way_prompt_guidance=False,
                  image_condition_one_way_prompt_guidance_weight=0.25,
+                 image_condition_one_way_prompt_guidance_prefix_m10_only=False,
+                 image_condition_one_way_prompt_guidance_aux_anchor_prior=0.5,
+                 image_condition_one_way_prompt_guidance_full_img2_stream=False,
+                 image_condition_one_way_prompt_guidance_guided_frames=None,
+                 image_condition_one_way_prompt_guidance_shared_anchor_update=False,
+                 image_condition_joint_img2_guidance=False,
+                 image_condition_joint_img2_guidance_weight=0.25,
+                 image_condition_joint_img2_guidance_shifted_anchor=False,
+                 image_condition_joint_img2_guidance_rope_compression=False,
+                 image_condition_joint_img2_guidance_static_b_prompt=False,
+                 image_condition_joint_img2_guidance_persistent_b=False,
+                 return_persistent_b_video=False,
+                 image_condition_cross_tail_bridge=False,
+                 image_condition_cross_tail_bridge_tail_frames=4,
+                 image_condition_cross_tail_bridge_memory_prior=0.2,
+                 image_condition_cross_tail_bridge_uncontrolled_mass=False,
                  image_condition_paired_anchor_attention=False,
                  image_condition_paired_stream_weight=0.25,
                  image_condition_paired_memory_alpha=None,
@@ -316,6 +332,41 @@ class WanI2V:
                 queries use C prefix plus aligned C/B1: suffix K/V in one
                 source-prior-normalized attention. B0 is excluded from C
                 memory and maintains only the hidden transport state.
+            image_condition_joint_img2_guidance (`bool`, *optional*):
+                Run one native-length joint Img1/Img2 stream plus an aligned
+                Img2-first suffix. B's completed self-attention outputs guide
+                J's anchor and suffix at every layer. B0 also replaces J's
+                anchor velocity independently in each CFG branch before CFG.
+                J and B use the first and second image prompts respectively.
+            image_condition_one_way_prompt_guidance_guided_frames (`int`, *optional*):
+                Number of aligned frames, including the retained anchor, that
+                receive layerwise B output guidance. ``None`` preserves the
+                legacy B1-to-post-anchor-suffix route.
+            image_condition_one_way_prompt_guidance_aux_anchor_prior (`float`, *optional*):
+                A10's source prior inside the shared-position A10/M10 group
+                read by prefix queries. M10 receives the complementary prior.
+            image_condition_one_way_prompt_guidance_shared_anchor_update (`bool`, *optional*):
+                Give the auxiliary joint anchor and retained ordinary anchor
+                the exact same completed self-attention output at every DiT
+                layer. Later residual, cross-attention, and FFN updates remain
+                independent.
+            image_condition_joint_img2_guidance_weight (`float`, *optional*):
+                Layerwise B-output interpolation weight for J's aligned anchor
+                and suffix.
+            image_condition_joint_img2_guidance_shifted_anchor (`bool`, *optional*):
+                Rebuild B from J starting one latent before Img2 so B1 aligns
+                with J's anchor, then replace only that anchor's predicted
+                velocity with B1. B is never scheduled.
+            image_condition_cross_tail_bridge (`bool`, *optional*):
+                Run overlapping Img1 and Img2-first views of one canonical
+                full-video latent state with crossed K/V memory. M begins at
+                Img1 and ends after the configured overlap; B begins at Img2
+                and ends with the video. One scheduler advances the canonical
+                prediction formed from M's pre-anchor prefix and all of B.
+            image_condition_cross_tail_bridge_tail_frames (`int`, *optional*):
+                Number of aligned overlap latents, including the Img2 anchor.
+            image_condition_cross_tail_bridge_memory_prior (`float`, *optional*):
+                Cross-stream source prior used by every crossed memory route.
             image_condition_paired_stream_weight (`float`, *optional*):
                 Legacy fallback for paired-memory alpha.
             image_condition_paired_memory_alpha (`float`, *optional*):
@@ -410,6 +461,8 @@ class WanI2V:
             guide_scale, float) else guide_scale
         enabled_multi_image_modes = sum(bool(value) for value in (
             image_condition_one_way_prompt_guidance,
+            image_condition_joint_img2_guidance,
+            image_condition_cross_tail_bridge,
             image_condition_paired_anchor_attention,
             image_condition_self_attention_guidance,
         ))
@@ -418,6 +471,43 @@ class WanI2V:
                 "multi-image attention ablations are mutually exclusive")
         if not 0 <= image_condition_one_way_prompt_guidance_weight <= 1:
             raise ValueError("one-way Img2 guidance weight must be in [0, 1]")
+        if not 0 < image_condition_one_way_prompt_guidance_aux_anchor_prior < 1:
+            raise ValueError(
+                "one-way auxiliary-anchor prior must be between zero and one")
+        if (image_condition_one_way_prompt_guidance_guided_frames is not None
+                and image_condition_one_way_prompt_guidance_guided_frames < 1):
+            raise ValueError(
+                "one-way guided-frame count must be at least one")
+        if (image_condition_one_way_prompt_guidance_shared_anchor_update
+                and not image_condition_one_way_prompt_guidance):
+            raise ValueError(
+                "shared one-way anchor update requires one-way prompt guidance")
+        if not 0 <= image_condition_joint_img2_guidance_weight <= 1:
+            raise ValueError("joint Img2 guidance weight must be in [0, 1]")
+        if (image_condition_joint_img2_guidance_rope_compression
+                and not image_condition_joint_img2_guidance_shifted_anchor):
+            raise ValueError(
+                "joint Img2 RoPE compression requires shifted-anchor guidance")
+        if (image_condition_joint_img2_guidance_static_b_prompt
+                and not image_condition_joint_img2_guidance):
+            raise ValueError(
+                "static B prompt requires joint Img2 guidance")
+        if (image_condition_joint_img2_guidance_persistent_b
+                and not image_condition_joint_img2_guidance_shifted_anchor):
+            raise ValueError(
+                "persistent B requires shifted-anchor joint Img2 guidance")
+        if (return_persistent_b_video
+                and not image_condition_joint_img2_guidance_persistent_b):
+            raise ValueError(
+                "returning B video requires persistent B guidance")
+        if image_condition_cross_tail_bridge_tail_frames < 1:
+            raise ValueError("cross-tail bridge needs at least one tail frame")
+        if not 0 <= image_condition_cross_tail_bridge_memory_prior <= 1:
+            raise ValueError("cross-tail bridge memory prior must be in [0, 1]")
+        if (image_condition_cross_tail_bridge_uncontrolled_mass
+                and not image_condition_cross_tail_bridge):
+            raise ValueError(
+                "uncontrolled cross-tail mass requires cross-tail bridge")
         if not 0 <= image_condition_self_attention_guidance_scale <= 1:
             raise ValueError(
                 "self-attention guidance scale must be in [0, 1]")
@@ -536,7 +626,9 @@ class WanI2V:
                     "self-attention guidance stop step must be in "
                     "[0, sampling_steps)")
         if (image_condition_self_attention_guidance
-                or image_condition_one_way_prompt_guidance) and any(
+                or image_condition_one_way_prompt_guidance
+                or image_condition_joint_img2_guidance
+                or image_condition_cross_tail_bridge) and any(
                 value is not None for value in (
                     image_condition_paired_fade_start_step,
                     image_condition_paired_fade_end_step,
@@ -549,7 +641,9 @@ class WanI2V:
         temporary_anchor_mode = (image_condition_paired_anchor_attention
                                  or image_condition_self_attention_guidance)
         multi_stream_mode = (temporary_anchor_mode
-                             or image_condition_one_way_prompt_guidance)
+                             or image_condition_one_way_prompt_guidance
+                             or image_condition_joint_img2_guidance
+                             or image_condition_cross_tail_bridge)
         if image_condition_paired_anchor_attention:
             if not 0.0 <= image_condition_paired_stream_weight <= 1.0:
                 raise ValueError(
@@ -603,13 +697,15 @@ class WanI2V:
                 for value in img
             ]
             anchor_index = int(image_latent_indices[1])
-            if image_condition_one_way_prompt_guidance:
+            if (image_condition_one_way_prompt_guidance
+                    or image_condition_joint_img2_guidance
+                    or image_condition_cross_tail_bridge):
                 if (not isinstance(image_prompts, (list, tuple))
                         or len(image_prompts) != 2
                         or not all(isinstance(value, str) and value
                                    for value in image_prompts)):
                     raise ValueError(
-                        "one-way prompt guidance requires two non-empty "
+                        "per-stream prompt guidance requires two non-empty "
                         "image prompts")
         else:
             if isinstance(img, (list, tuple)):
@@ -638,6 +734,19 @@ class WanI2V:
             raise ValueError(
                 "paired Img2 anchor must have at least one latent frame on "
                 "its right")
+        cross_tail_overlap_frames = None
+        cross_tail_m_frame_num = None
+        cross_tail_b_frame_num = None
+        if image_condition_cross_tail_bridge:
+            cross_tail_overlap_frames = int(
+                image_condition_cross_tail_bridge_tail_frames)
+            cross_tail_b_frame_num = latent_frame_num - anchor_index
+            if cross_tail_overlap_frames >= cross_tail_b_frame_num:
+                raise ValueError(
+                    "cross-tail overlap must be smaller than the Img2-to-end "
+                    f"window ({cross_tail_b_frame_num} latent frames)")
+            cross_tail_m_frame_num = (
+                anchor_index + cross_tail_overlap_frames)
         # Legacy paired modes insert Img2 as a temporary diffusion latent instead of
         # replacing an output latent. It is removed before VAE decoding, so an
         # 81-frame request still decodes 21 retained latents.
@@ -661,6 +770,49 @@ class WanI2V:
             dtype=torch.float32,
             generator=seed_g,
             device=self.device)
+        one_way_b_latent = None
+        joint_guidance_b_latent = None
+        if image_condition_joint_img2_guidance_persistent_b:
+            joint_guidance_b_latent = noise[:, anchor_index - 1:].clone()
+            if not torch.equal(
+                    joint_guidance_b_latent[:, 1:2],
+                    noise[:, anchor_index:anchor_index + 1]):
+                raise RuntimeError("persistent B1 and J anchor noise differ")
+            logging.info(
+                "Persistent shifted B enabled: B is initialized once from "
+                "J%d:J-end, B1 and J%d share initial noise, B advances with "
+                "its own identically configured scheduler and CFG-combined "
+                "prediction, and J%d is synchronized to scheduled B1 after "
+                "each step",
+                anchor_index - 1, anchor_index, anchor_index)
+        if (image_condition_one_way_prompt_guidance
+                and image_condition_one_way_prompt_guidance_full_img2_stream):
+            overlap_frames = latent_frame_num - anchor_index
+            extra_frames = latent_frame_num - overlap_frames
+            extra_noise = torch.randn(
+                16,
+                extra_frames,
+                lat_h,
+                lat_w,
+                dtype=torch.float32,
+                generator=seed_g,
+                device=self.device)
+            one_way_b_latent = torch.cat([
+                noise[:, anchor_index:], extra_noise
+            ], dim=1)
+        if image_condition_cross_tail_bridge:
+            # Keep one canonical full-video state. M and B are overlapping
+            # views derived from it at every model call, so aligned positions
+            # are identical by construction rather than synchronized through
+            # separate scheduler instances.
+            if noise.size(1) != latent_frame_num:
+                raise RuntimeError(
+                    "cross-tail canonical noise has the wrong frame count")
+            # D begins from the same anchor/suffix noise as the canonical
+            # state, then evolves independently as standard Img2-first I2V.
+            cross_tail_d_latent = noise[:, anchor_index:].clone()
+        else:
+            cross_tail_d_latent = None
 
         def first_frame_mask(pixel_frames):
             mask = torch.ones(
@@ -685,10 +837,102 @@ class WanI2V:
             n_prompt = self.sample_neg_prompt
 
         # preprocess
-        text_prompts = (list(image_prompts)
-                        if image_condition_one_way_prompt_guidance else
-                        [input_prompt])
-        null_prompts = [n_prompt] * len(text_prompts)
+        temporal_prompt_relay = None
+        if (image_condition_one_way_prompt_guidance
+                or image_condition_joint_img2_guidance
+                or image_condition_cross_tail_bridge):
+            global_prompt = input_prompt.strip()
+            local_prompts = [value.strip() for value in image_prompts]
+
+            def join_prompt(*parts):
+                return ' '.join(part for part in parts if part)
+
+            main_text_prompt = join_prompt(global_prompt, *local_prompts)
+            img2_text_prompt = (
+                join_prompt(global_prompt, "No motion in the video occurs.")
+                if (image_condition_joint_img2_guidance
+                    and image_condition_joint_img2_guidance_static_b_prompt)
+                else join_prompt(global_prompt, local_prompts[1]))
+            text_prompts = [main_text_prompt, img2_text_prompt]
+            if image_condition_cross_tail_bridge:
+                # B and D share prompt 2. B has joint Img1->Img2 VAE context;
+                # D is the independent standard Img2-first reference stream.
+                text_prompts.append(img2_text_prompt)
+
+            tokenizer = self.text_encoder.tokenizer
+            full_ids = tokenizer(
+                main_text_prompt,
+                add_special_tokens=True,
+                padding=False)[0].tolist()
+
+            def find_token_span(text, search_start):
+                token_ids = tokenizer(
+                    text,
+                    add_special_tokens=False,
+                    padding=False)[0].tolist()
+                for start in range(search_start,
+                                   len(full_ids) - len(token_ids) + 1):
+                    if full_ids[start:start + len(token_ids)] == token_ids:
+                        return start, start + len(token_ids)
+                # SentencePiece may encode the leading boundary differently
+                # when a clause is tokenized alone. Retry without constraining
+                # the search, matching Prompt Relay's reference behavior.
+                for start in range(len(full_ids) - len(token_ids) + 1):
+                    if full_ids[start:start + len(token_ids)] == token_ids:
+                        return start, start + len(token_ids)
+                raise ValueError(
+                    "local image prompt was not found in the combined main "
+                    "prompt")
+
+            spans = []
+            search_start = 0
+            for local_prompt in local_prompts:
+                span = find_token_span(local_prompt, search_start)
+                spans.append(span)
+                search_start = span[1]
+
+            tokens_per_frame = (
+                lat_h // self.patch_size[1]
+                * lat_w // self.patch_size[2])
+            main_prompt_frame_num = (
+                cross_tail_m_frame_num
+                if image_condition_cross_tail_bridge else latent_frame_num)
+            frame_intervals = ((0, anchor_index),
+                               (anchor_index, main_prompt_frame_num))
+            segments = []
+            for (frame_start, frame_end), (token_start,
+                                           token_end) in zip(
+                                               frame_intervals, spans):
+                segment_length = frame_end - frame_start
+                minimum_segment_frames = (
+                    1 if image_condition_cross_tail_bridge else 4)
+                if segment_length < minimum_segment_frames:
+                    raise ValueError(
+                        "temporal prompt relay requires each local prompt "
+                        "segment to contain at least "
+                        f"{minimum_segment_frames} latent frame(s)")
+                segments.append({
+                    'token_start': token_start,
+                    'token_end': token_end,
+                    'midpoint': (frame_start + frame_end) // 2,
+                    'window': max(0, segment_length // 2 - 2),
+                    'sigma': 0.1448,
+                })
+            temporal_prompt_relay = {
+                'stream_index': 0,
+                'tokens_per_frame': tokens_per_frame,
+                # One-way M inserts an auxiliary anchor before its retained
+                # anchor. Native joint J has no duplicate temporal position.
+                'duplicate_frame_index': (
+                    anchor_index
+                    if image_condition_one_way_prompt_guidance else None),
+                'segments': segments,
+            }
+        else:
+            text_prompts = [input_prompt]
+        null_prompt_count = (1 if image_condition_one_way_prompt_guidance
+                             else len(text_prompts))
+        null_prompts = [n_prompt] * null_prompt_count
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder(text_prompts, self.device)
@@ -732,8 +976,149 @@ class WanI2V:
 
         if not 0.0 <= image_condition_paired_prefix_future_eta <= 1.0:
             raise ValueError("paired prefix future eta must be in [0, 1]")
-        if image_condition_one_way_prompt_guidance:
-            suffix_latent_frame_num = latent_frame_num - anchor_index
+        if image_condition_cross_tail_bridge:
+            m_pixel_frames = (1 + self.vae_stride[0]
+                              * (cross_tail_m_frame_num - 1))
+            b_pixel_frames = (1 + self.vae_stride[0]
+                              * (cross_tail_b_frame_num - 1))
+            encoded = self.vae.encode([
+                conditioning_video(imgs[0], m_pixel_frames),
+                joint_anchor_conditioning_video(
+                    imgs[0], imgs[1], F, anchor_index),
+                conditioning_video(imgs[1], b_pixel_frames),
+            ])
+            if (encoded[0].size(1) != cross_tail_m_frame_num
+                    or encoded[1].size(1) != latent_frame_num
+                    or encoded[2].size(1) != cross_tail_b_frame_num):
+                raise RuntimeError(
+                    "cross-tail bridge conditioning lengths do not align")
+            # Every B position, including B0, uses the anchor-aligned slice
+            # from the full causal joint Img1-to-Img2 encode.
+            cross_tail_b_encoded = encoded[1][:, anchor_index:]
+            if cross_tail_b_encoded.size(1) != cross_tail_b_frame_num:
+                raise RuntimeError(
+                    "hybrid cross-tail B conditioning has the wrong length")
+            cross_tail_m_y = torch.concat([
+                first_frame_mask(m_pixel_frames), encoded[0]
+            ])
+            cross_tail_b_y = torch.concat([
+                first_frame_mask(b_pixel_frames), cross_tail_b_encoded
+            ])
+            cross_tail_d_y = torch.concat([
+                first_frame_mask(b_pixel_frames), encoded[2]
+            ])
+            del encoded, cross_tail_b_encoded
+            overlap_frames = cross_tail_overlap_frames
+            logging.info(
+                "Cross-tail bridge: M spans global latents 0:%d and B spans "
+                "%d:%d. Their %d-frame overlap is M%d:M%d = B0:B%d and "
+                "is one shared canonical state. Safe cross-stream distance "
+                "s=%d: every query reads its complete native stream. M "
+                "queries read a B key when query/key global distance >= s or "
+                "the key's distance from B0 >= s; B0 is therefore visible to "
+                "all sufficiently distant M queries, including M0. B overlap "
+                "queries B0:B%d read native B only; B%d: read all native B "
+                "plus only the pre-anchor M prefix M0:M%d. "
+                "%s B0 has global RoPE coordinate %d; no temporal "
+                "compression is used. M uses the global prompt plus Gaussian "
+                "Prompt Relay between local prompts 1 and 2 at latent %d. B "
+                "uses global plus local prompt 2 throughout. All B positions, "
+                "including B0, use the anchor-aligned slice from the causal "
+                "joint Img1-to-Img2 encode. At every sampling "
+                "step M and B are overlapping views of one 21-latent state. "
+                "An independent standard Img2-first D stream uses native-only "
+                "attention and its own scheduler. The canonical prediction "
+                "[M0:M%d, D0, B1:B%d] takes one scheduler step and is decoded "
+                "directly.",
+                cross_tail_m_frame_num - 1, anchor_index,
+                latent_frame_num - 1, overlap_frames, anchor_index,
+                cross_tail_m_frame_num - 1, overlap_frames - 1,
+                overlap_frames, overlap_frames - 1, overlap_frames,
+                anchor_index - 1,
+                ("Native/cross K/V are directly concatenated with no mass "
+                 "control."
+                 if image_condition_cross_tail_bridge_uncontrolled_mass else
+                 "Cross-memory prior %.3f is length-normalized inside each "
+                 "mathematical softmax." %
+                 image_condition_cross_tail_bridge_memory_prior), anchor_index,
+                anchor_index, anchor_index - 1,
+                cross_tail_b_frame_num - 1)
+        elif image_condition_joint_img2_guidance:
+            suffix_latent_frame_num = (
+                latent_frame_num - anchor_index
+                + int(image_condition_joint_img2_guidance_shifted_anchor))
+            suffix_frame_num = (1 + self.vae_stride[0]
+                                * (suffix_latent_frame_num - 1))
+            encoded = self.vae.encode([
+                joint_anchor_conditioning_video(
+                    imgs[0], imgs[1], F, anchor_index),
+                conditioning_video(imgs[1], suffix_frame_num),
+            ])
+            if (encoded[0].size(1) != latent_frame_num
+                    or encoded[1].size(1) != suffix_latent_frame_num):
+                raise RuntimeError(
+                    "joint Img2-guidance conditioning lengths do not align")
+            joint_mask = first_frame_mask(F)
+            joint_mask[:, anchor_index:anchor_index + 1].fill_(1)
+            joint_y = torch.concat([joint_mask, encoded[0]])
+            guidance_local_y = torch.concat([
+                first_frame_mask(suffix_frame_num), encoded[1]
+            ])
+            del encoded, joint_mask
+            if image_condition_joint_img2_guidance_shifted_anchor:
+                logging.info(
+                    "Shifted joint Img2 guidance: native %d-latent J is "
+                    "jointly VAE-conditioned with Img1 at the beginning and "
+                    "Img2 repeated across all four pixel frames of the "
+                    "interior anchor interval. "
+                    "A standard "
+                    "%d-latent Img2-first B view is rebuilt from J%d:J-end "
+                    "at every denoising step, so B1 aligns with J%d. Every "
+                    "J and B query uses %s, with no "
+                    "layerwise cross-stream injection. After "
+                    "the DiT, B1 replaces J%d's predicted velocity in each "
+                    "CFG branch; only the resulting J prediction enters the "
+                    "scheduler.%s B conditional text is %s",
+                    latent_frame_num, suffix_latent_frame_num,
+                    anchor_index - 1, anchor_index,
+                    ("query-dependent compressed J RoPE (prefix colocates "
+                     "J%d/J%d, suffix colocates J%d/J%d while shifting its "
+                     "queries consistently, and the anchor reads only "
+                     "itself/future) and ordinary B RoPE" %
+                     (anchor_index, anchor_index + 1,
+                      anchor_index - 1, anchor_index)
+                     if image_condition_joint_img2_guidance_rope_compression
+                     else "ordinary bidirectional attention and local RoPE"),
+                    anchor_index,
+                    (" The J anchor is discarded before decoding."
+                     if image_condition_joint_img2_guidance_rope_compression
+                     else ""),
+                    ("global prompt plus the static-motion sentence."
+                     if image_condition_joint_img2_guidance_static_b_prompt
+                     else "global prompt plus local prompt 2."))
+            else:
+                logging.info(
+                "Joint Img2-guidance ablation: native %d-latent J is VAE "
+                "conditioned jointly by Img1 at frame 0 and Img2x4 at latent "
+                "%d and uses the global prompt plus temporally relayed local "
+                "prompts 1 and 2. J uses ordinary bidirectional attention "
+                "except that its anchor query reads only itself and its "
+                "suffix. Ordinary RoPE is retained. Standard "
+                "%d-latent Img2-first B uses the global prompt plus local "
+                "prompt 2 and evolves independently. At every DiT layer "
+                "B0:B-end attention outputs "
+                "are aligned with J%d:J-end and blended at weight %.3f; J's "
+                "prefix is unchanged. After all DiT layers, B0 replaces "
+                "J%d's predicted velocity independently in both CFG passes "
+                "before the scheduler step.",
+                latent_frame_num, anchor_index, suffix_latent_frame_num,
+                anchor_index, image_condition_joint_img2_guidance_weight,
+                anchor_index)
+        elif image_condition_one_way_prompt_guidance:
+            suffix_latent_frame_num = (
+                latent_frame_num
+                if image_condition_one_way_prompt_guidance_full_img2_stream
+                else latent_frame_num - anchor_index)
             suffix_frame_num = (1 + self.vae_stride[0]
                                 * (suffix_latent_frame_num - 1))
             encoded = self.vae.encode([
@@ -758,33 +1143,76 @@ class WanI2V:
             primary_encoded[:, anchor_index:anchor_index + 1].copy_(
                 encoded[1][:, anchor_index:anchor_index + 1])
             primary_y = torch.concat([primary_mask, primary_encoded])
+            # The unconditional CFG reference is deliberately a standard
+            # retained 21-latent Img1 I2V stream: no auxiliary A10, no B, and
+            # no one-way attention routing.
+            ordinary_uncond_y = torch.concat([msk, encoded[0]])
             suffix_y = torch.concat([
                 first_frame_mask(suffix_frame_num), encoded[2]
             ])
             del encoded, primary_mask, primary_encoded
+            if image_condition_one_way_prompt_guidance_guided_frames is None:
+                layerwise_guidance_description = (
+                    "ordinary M%d keeps its own M-stream attention output, "
+                    "and B1: updates only M%d: at weight %.3f" % (
+                        anchor_index, anchor_index + 1,
+                        image_condition_one_way_prompt_guidance_weight))
+            else:
+                guided_frame_count = int(
+                    image_condition_one_way_prompt_guidance_guided_frames)
+                retained_overlap_frames = latent_frame_num - anchor_index
+                if guided_frame_count > retained_overlap_frames:
+                    raise ValueError(
+                        "one-way guided-frame count exceeds the retained "
+                        "anchor/suffix overlap")
+                layerwise_guidance_description = (
+                    "B0:B%d updates only M%d:M%d at weight %.3f; later "
+                    "retained M frames keep their own attention outputs" % (
+                        guided_frame_count - 1, anchor_index,
+                        anchor_index + guided_frame_count - 1,
+                        image_condition_one_way_prompt_guidance_weight))
             logging.info(
-                "One-way per-image-prompt guidance: expanded %d-latent "
-                "main stream M uses prompt 1 and full bidirectional attention. "
+                "One-way relayed-prompt guidance: expanded %d-latent main "
+                "stream M uses --prompt globally and the two --image_prompt "
+                "clauses as Gaussian-relayed local prompts split at latent "
+                "%d. "
                 "It retains the ordinary Img1-only M%d anchor and adds one "
                 "auxiliary joint Img1-to-Img2 anchor at the same integer RoPE "
-                "position. Standard %d-latent Img2-first B uses prompt 2 "
-                "and evolves independently. Prefix queries read the auxiliary "
-                "anchor key paired with B0's value but not ordinary M%d; "
+                "position. %s %d-latent Img2-first B uses the global "
+                "prompt plus local prompt 2 for its whole sequence and "
+                "evolves independently. Prefix queries %s; "
                 "ordinary anchor/suffix queries "
                 "read ordinary M%d but not the auxiliary anchor. At every "
                 "DiT layer the auxiliary anchor uses its own query to attend "
-                "to the prefix plus itself; B0 completely replaces ordinary "
-                "M%d's attention output, and B1: updates only M%d: at weight "
-                "%.3f. "
+                "to the prefix plus itself; %s; %s. "
                 "The auxiliary anchor is "
-                "discarded before the scheduler, and the retained M velocity "
-                "is used without B0 replacement. At the next denoising step "
+                "discarded before the scheduler. Before CFG, conditional "
+                "B0 replaces conditional M%d's predicted velocity. The "
+                "unconditional pass is a standard retained Img1-only M "
+                "stream with M%d, no A10, no B, and no prompt relay. At the "
+                "next denoising step "
                 "the auxiliary anchor is recreated from M%d's current noisy "
                 "latent. Information flows only B -> M and retained M "
                 "positions are not compressed",
-                model_latent_frame_num, anchor_index, suffix_latent_frame_num,
-                anchor_index, anchor_index, anchor_index, anchor_index + 1,
-                image_condition_one_way_prompt_guidance_weight, anchor_index)
+                model_latent_frame_num, anchor_index, anchor_index,
+                ("Full native-length" if
+                 image_condition_one_way_prompt_guidance_full_img2_stream
+                 else "Anchor-to-end"), suffix_latent_frame_num,
+                ("exclude auxiliary A%d and read retained M%d only" %
+                 (anchor_index, anchor_index)
+                 if image_condition_one_way_prompt_guidance_prefix_m10_only
+                 else "read auxiliary A%d and retained M%d with A prior "
+                      "%.3f and M prior %.3f" %
+                      (anchor_index, anchor_index,
+                       image_condition_one_way_prompt_guidance_aux_anchor_prior,
+                       1.0 - image_condition_one_way_prompt_guidance_aux_anchor_prior)),
+                anchor_index, layerwise_guidance_description,
+                ("the resulting retained-anchor attention output also "
+                 "replaces the auxiliary anchor's attention output"
+                 if image_condition_one_way_prompt_guidance_shared_anchor_update
+                 else "the auxiliary and retained anchors keep distinct "
+                      "attention outputs"), anchor_index,
+                anchor_index, anchor_index)
         elif image_condition_paired_anchor_attention:
             suffix_latent_frame_num = model_latent_frame_num - anchor_index
             suffix_frame_num = (1 + self.vae_stride[0]
@@ -968,6 +1396,27 @@ class WanI2V:
                 sample_scheduler.set_timesteps(
                     sampling_steps, device=self.device, shift=shift)
                 timesteps = sample_scheduler.timesteps
+                if one_way_b_latent is not None:
+                    one_way_b_scheduler = FlowUniPCMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=1,
+                        use_dynamic_shifting=False)
+                    one_way_b_scheduler.set_timesteps(
+                        sampling_steps, device=self.device, shift=shift)
+                if joint_guidance_b_latent is not None:
+                    joint_guidance_b_scheduler = FlowUniPCMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=1,
+                        use_dynamic_shifting=False)
+                    joint_guidance_b_scheduler.set_timesteps(
+                        sampling_steps, device=self.device, shift=shift)
+                if cross_tail_d_latent is not None:
+                    cross_tail_d_scheduler = FlowUniPCMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=1,
+                        use_dynamic_shifting=False)
+                    cross_tail_d_scheduler.set_timesteps(
+                        sampling_steps, device=self.device, shift=shift)
             elif sample_solver == 'dpm++':
                 sample_scheduler = FlowDPMSolverMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
@@ -978,6 +1427,33 @@ class WanI2V:
                     sample_scheduler,
                     device=self.device,
                     sigmas=sampling_sigmas)
+                if one_way_b_latent is not None:
+                    one_way_b_scheduler = FlowDPMSolverMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=1,
+                        use_dynamic_shifting=False)
+                    retrieve_timesteps(
+                        one_way_b_scheduler,
+                        device=self.device,
+                        sigmas=sampling_sigmas)
+                if joint_guidance_b_latent is not None:
+                    joint_guidance_b_scheduler = FlowDPMSolverMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=1,
+                        use_dynamic_shifting=False)
+                    retrieve_timesteps(
+                        joint_guidance_b_scheduler,
+                        device=self.device,
+                        sigmas=sampling_sigmas)
+                if cross_tail_d_latent is not None:
+                    cross_tail_d_scheduler = FlowDPMSolverMultistepScheduler(
+                        num_train_timesteps=self.num_train_timesteps,
+                        shift=1,
+                        use_dynamic_shifting=False)
+                    retrieve_timesteps(
+                        cross_tail_d_scheduler,
+                        device=self.device,
+                        sigmas=sampling_sigmas)
             else:
                 raise NotImplementedError("Unsupported solver.")
 
@@ -1000,7 +1476,56 @@ class WanI2V:
             # sample videos
             latent = noise
 
-            if image_condition_one_way_prompt_guidance:
+            if image_condition_cross_tail_bridge:
+                arg_c = {
+                    'context': [context[0], context[1], context[2]],
+                    'seq_len': max_seq_len,
+                    'y': [cross_tail_m_y, cross_tail_b_y, cross_tail_d_y],
+                    'cross_tail_bridge_anchor_index': anchor_index,
+                    'cross_tail_bridge_tail_frames':
+                    image_condition_cross_tail_bridge_tail_frames,
+                    'cross_tail_bridge_memory_prior':
+                    image_condition_cross_tail_bridge_memory_prior,
+                    'cross_tail_bridge_control_memory_mass': not (
+                        image_condition_cross_tail_bridge_uncontrolled_mass),
+                    'temporal_prompt_relay': temporal_prompt_relay,
+                }
+                arg_null = {
+                    'context': [context_null[0], context_null[1],
+                                context_null[2]],
+                    'seq_len': max_seq_len,
+                    'y': [cross_tail_m_y, cross_tail_b_y, cross_tail_d_y],
+                    'cross_tail_bridge_anchor_index': anchor_index,
+                    'cross_tail_bridge_tail_frames':
+                    image_condition_cross_tail_bridge_tail_frames,
+                    'cross_tail_bridge_memory_prior':
+                    image_condition_cross_tail_bridge_memory_prior,
+                    'cross_tail_bridge_control_memory_mass': not (
+                        image_condition_cross_tail_bridge_uncontrolled_mass),
+                }
+            elif image_condition_joint_img2_guidance:
+                arg_c = {
+                    'context': [context[0], context[1]],
+                    'seq_len': max_seq_len,
+                    'y': [joint_y, guidance_local_y],
+                    'joint_img2_guidance_anchor_index': anchor_index,
+                    'joint_img2_guidance_weight':
+                    image_condition_joint_img2_guidance_weight,
+                    'joint_img2_guidance_rope_compression':
+                    image_condition_joint_img2_guidance_rope_compression,
+                    'temporal_prompt_relay': temporal_prompt_relay,
+                }
+                arg_null = {
+                    'context': [context_null[0], context_null[0]],
+                    'seq_len': max_seq_len,
+                    'y': [joint_y, guidance_local_y],
+                    'joint_img2_guidance_anchor_index': anchor_index,
+                    'joint_img2_guidance_weight':
+                    image_condition_joint_img2_guidance_weight,
+                    'joint_img2_guidance_rope_compression':
+                    image_condition_joint_img2_guidance_rope_compression,
+                }
+            elif image_condition_one_way_prompt_guidance:
                 arg_c = {
                     'context': [context[0], context[1]],
                     'seq_len': max_seq_len,
@@ -1008,14 +1533,20 @@ class WanI2V:
                     'one_way_img2_anchor_index': anchor_index,
                     'one_way_img2_weight':
                     image_condition_one_way_prompt_guidance_weight,
+                    'one_way_prefix_reads_aux_anchor': not (
+                        image_condition_one_way_prompt_guidance_prefix_m10_only),
+                    'one_way_aux_anchor_prior':
+                    image_condition_one_way_prompt_guidance_aux_anchor_prior,
+                    'one_way_guided_frames':
+                    image_condition_one_way_prompt_guidance_guided_frames,
+                    'one_way_shared_anchor_update':
+                    image_condition_one_way_prompt_guidance_shared_anchor_update,
+                    'temporal_prompt_relay': temporal_prompt_relay,
                 }
                 arg_null = {
-                    'context': [context_null[0], context_null[1]],
+                    'context': [context_null[0]],
                     'seq_len': max_seq_len,
-                    'y': [primary_y, suffix_y],
-                    'one_way_img2_anchor_index': anchor_index,
-                    'one_way_img2_weight':
-                    image_condition_one_way_prompt_guidance_weight,
+                    'y': [ordinary_uncond_y],
                 }
             elif image_condition_paired_anchor_attention:
                 arg_c = {
@@ -1200,15 +1731,40 @@ class WanI2V:
             for sampling_step, t in enumerate(tqdm(timesteps)):
                 current_arg_c = arg_c
                 current_arg_null = arg_null
+                latent_model_input_uncond = None
+                timestep_uncond = None
                 self_attention_guidance_active = False
                 post_stop_img2_suffix_active = False
-                if image_condition_one_way_prompt_guidance:
+                if image_condition_cross_tail_bridge:
+                    current_latent = latent.to(self.device)
+                    latent_model_input = [
+                        current_latent[:, :cross_tail_m_frame_num],
+                        current_latent[:, anchor_index:],
+                        cross_tail_d_latent.to(self.device),
+                    ]
+                    timestep = [t, t, t]
+                elif image_condition_joint_img2_guidance:
+                    current_latent = latent.to(self.device)
+                    latent_model_input = [
+                        current_latent,
+                        (joint_guidance_b_latent.to(self.device)
+                         if joint_guidance_b_latent is not None else
+                         current_latent[:,
+                                        (anchor_index - 1
+                                         if image_condition_joint_img2_guidance_shifted_anchor
+                                         else anchor_index):]),
+                    ]
+                    timestep = [t, t]
+                elif image_condition_one_way_prompt_guidance:
                     current_latent = latent.to(self.device)
                     latent_model_input = [
                         insert_latent_slot(current_latent, anchor_index),
-                        current_latent[:, anchor_index:],
+                        (one_way_b_latent if one_way_b_latent is not None else
+                         current_latent[:, anchor_index:]),
                     ]
                     timestep = [t, t]
+                    latent_model_input_uncond = [current_latent]
+                    timestep_uncond = [t]
                 elif image_condition_paired_anchor_attention:
                     suffix_fade_factor = paired_fade_factor(
                         sampling_step, suffix_fade_start_step,
@@ -1350,7 +1906,11 @@ class WanI2V:
                     latent_model_input = [latent.to(self.device)]
                     timestep = [t]
 
+                if latent_model_input_uncond is None:
+                    latent_model_input_uncond = latent_model_input
+                    timestep_uncond = timestep
                 timestep = torch.stack(timestep).to(self.device)
+                timestep_uncond = torch.stack(timestep_uncond).to(self.device)
 
                 model = self._prepare_model_for_timestep(
                     t,
@@ -1363,7 +1923,47 @@ class WanI2V:
 
                 predictions_cond = model(
                     latent_model_input, t=timestep, **current_arg_c)
-                if image_condition_one_way_prompt_guidance:
+                if image_condition_cross_tail_bridge:
+                    if (len(predictions_cond) != 3
+                            or predictions_cond[0].size(1) !=
+                            cross_tail_m_frame_num
+                            or predictions_cond[1].size(1) !=
+                            cross_tail_b_frame_num
+                            or predictions_cond[2].size(1) !=
+                            cross_tail_b_frame_num):
+                        raise RuntimeError(
+                            "cross-tail conditional predictions have "
+                            "incorrect lengths")
+                    noise_pred_cond = predictions_cond[0]
+                    cross_tail_b_pred_cond = predictions_cond[1]
+                    cross_tail_d_pred_cond = predictions_cond[2]
+                    del predictions_cond
+                elif image_condition_joint_img2_guidance:
+                    if (len(predictions_cond) != 2
+                            or predictions_cond[0].size(1) != latent_frame_num
+                            or predictions_cond[1].size(1) !=
+                            suffix_latent_frame_num):
+                        raise RuntimeError(
+                            "joint Img2-guidance conditional predictions "
+                            "have incorrect lengths")
+                    noise_pred_cond = predictions_cond[0]
+                    if joint_guidance_b_latent is not None:
+                        joint_guidance_b_pred_cond = predictions_cond[1]
+                    if image_condition_joint_img2_guidance_shifted_anchor:
+                        noise_pred_cond = noise_pred_cond.clone()
+                        noise_pred_cond[:,
+                                        anchor_index:anchor_index + 1].copy_(
+                                            predictions_cond[1][:, 1:2])
+                    else:
+                        # Legacy aligned mode also uses B0 as final anchor
+                        # velocity. Shifted mode deliberately discards B's
+                        # prediction after its layerwise B1 -> J-anchor update.
+                        noise_pred_cond = noise_pred_cond.clone()
+                        noise_pred_cond[:,
+                                        anchor_index:anchor_index + 1].copy_(
+                                            predictions_cond[1][:, :1])
+                    del predictions_cond
+                elif image_condition_one_way_prompt_guidance:
                     if len(predictions_cond) != 2:
                         raise RuntimeError(
                             "one-way prompt guidance returned the wrong "
@@ -1379,13 +1979,18 @@ class WanI2V:
                         raise RuntimeError(
                             "one-way Img2 conditional prediction has the "
                             "wrong temporal length")
-                    # Remove only the auxiliary joint anchor. The retained
-                    # Img1-only M anchor/suffix already received B's layerwise
-                    # attention guidance; do not replace any final velocity.
+                    one_way_b_prediction_cond = predictions_cond[1]
+                    # Remove the auxiliary joint anchor, then make the retained
+                    # conditional M10 prediction use B0's Img2-first velocity.
+                    # The unconditional branch deliberately keeps its own M10
+                    # prediction, so this is conditional-only guidance.
                     noise_pred_cond = torch.cat([
                         expanded_prediction_cond[:, :anchor_index],
                         expanded_prediction_cond[:, anchor_index + 1:]
                     ], dim=1)
+                    noise_pred_cond[:,
+                                    anchor_index:anchor_index + 1].copy_(
+                                        predictions_cond[1][:, :1])
                     del predictions_cond
                 elif image_condition_paired_anchor_attention:
                     noise_pred_cond = assemble_paired_prediction(
@@ -1427,27 +2032,57 @@ class WanI2V:
                 if offload_model:
                     torch.cuda.empty_cache()
                 predictions_uncond = model(
-                    latent_model_input, t=timestep, **current_arg_null)
-                if image_condition_one_way_prompt_guidance:
-                    if len(predictions_uncond) != 2:
+                    latent_model_input_uncond,
+                    t=timestep_uncond,
+                    **current_arg_null)
+                if image_condition_cross_tail_bridge:
+                    if (len(predictions_uncond) != 3
+                            or predictions_uncond[0].size(1) !=
+                            cross_tail_m_frame_num
+                            or predictions_uncond[1].size(1) !=
+                            cross_tail_b_frame_num
+                            or predictions_uncond[2].size(1) !=
+                            cross_tail_b_frame_num):
+                        raise RuntimeError(
+                            "cross-tail unconditional predictions have "
+                            "incorrect lengths")
+                    noise_pred_uncond = predictions_uncond[0]
+                    cross_tail_b_pred_uncond = predictions_uncond[1]
+                    cross_tail_d_pred_uncond = predictions_uncond[2]
+                    del predictions_uncond
+                elif image_condition_joint_img2_guidance:
+                    if (len(predictions_uncond) != 2
+                            or predictions_uncond[0].size(1) !=
+                            latent_frame_num
+                            or predictions_uncond[1].size(1) !=
+                            suffix_latent_frame_num):
+                        raise RuntimeError(
+                            "joint Img2-guidance unconditional predictions "
+                            "have incorrect lengths")
+                    noise_pred_uncond = predictions_uncond[0]
+                    if joint_guidance_b_latent is not None:
+                        joint_guidance_b_pred_uncond = predictions_uncond[1]
+                    if image_condition_joint_img2_guidance_shifted_anchor:
+                        noise_pred_uncond = noise_pred_uncond.clone()
+                        noise_pred_uncond[:,
+                                          anchor_index:anchor_index + 1].copy_(
+                                              predictions_uncond[1][:, 1:2])
+                    else:
+                        noise_pred_uncond = noise_pred_uncond.clone()
+                        noise_pred_uncond[:,
+                                          anchor_index:anchor_index + 1].copy_(
+                                              predictions_uncond[1][:, :1])
+                    del predictions_uncond
+                elif image_condition_one_way_prompt_guidance:
+                    if len(predictions_uncond) != 1:
                         raise RuntimeError(
                             "one-way prompt guidance returned the wrong "
                             "number of unconditional predictions")
-                    expanded_prediction_uncond = predictions_uncond[0]
-                    if (expanded_prediction_uncond.size(1) !=
-                            model_latent_frame_num):
+                    noise_pred_uncond = predictions_uncond[0]
+                    if noise_pred_uncond.size(1) != latent_frame_num:
                         raise RuntimeError(
-                            "one-way M unconditional prediction has the "
-                            "wrong expanded temporal length")
-                    if (predictions_uncond[1].size(1) !=
-                            suffix_latent_frame_num):
-                        raise RuntimeError(
-                            "one-way Img2 unconditional prediction has the "
+                            "one-way M-only unconditional prediction has the "
                             "wrong temporal length")
-                    noise_pred_uncond = torch.cat([
-                        expanded_prediction_uncond[:, :anchor_index],
-                        expanded_prediction_uncond[:, anchor_index + 1:]
-                    ], dim=1)
                     del predictions_uncond
                 elif image_condition_paired_anchor_attention:
                     noise_pred_uncond = assemble_paired_prediction(
@@ -1493,6 +2128,35 @@ class WanI2V:
                     torch.cuda.empty_cache()
                 noise_pred = noise_pred_uncond + sample_guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
+                if joint_guidance_b_latent is not None:
+                    joint_guidance_b_noise_pred = (
+                        joint_guidance_b_pred_uncond
+                        + sample_guide_scale * (
+                            joint_guidance_b_pred_cond
+                            - joint_guidance_b_pred_uncond))
+                if image_condition_cross_tail_bridge:
+                    cross_tail_b_noise_pred = (
+                        cross_tail_b_pred_uncond
+                        + sample_guide_scale * (
+                            cross_tail_b_pred_cond
+                            - cross_tail_b_pred_uncond))
+                    cross_tail_d_noise_pred = (
+                        cross_tail_d_pred_uncond
+                        + sample_guide_scale * (
+                            cross_tail_d_pred_cond
+                            - cross_tail_d_pred_uncond))
+                    # M owns the prefix, independent standard-I2V D0 owns the
+                    # anchor velocity, and joint-context B1: owns the rest of
+                    # the suffix. M overlap and B0 remain attention context.
+                    noise_pred = torch.cat([
+                        noise_pred[:, :anchor_index],
+                        cross_tail_d_noise_pred[:, :1],
+                        cross_tail_b_noise_pred[:, 1:],
+                    ], dim=1)
+                    if noise_pred.size(1) != latent_frame_num:
+                        raise RuntimeError(
+                            "cross-tail canonical prediction has the wrong "
+                            "frame count")
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
@@ -1503,11 +2167,51 @@ class WanI2V:
                 del noise_pred_cond, noise_pred_uncond, noise_pred
                 latent = temp_x0.squeeze(0)
                 del temp_x0
+                if joint_guidance_b_latent is not None:
+                    b_temp_x0 = joint_guidance_b_scheduler.step(
+                        joint_guidance_b_noise_pred.unsqueeze(0),
+                        t,
+                        joint_guidance_b_latent.unsqueeze(0),
+                        return_dict=False,
+                        generator=seed_g)[0]
+                    joint_guidance_b_latent = b_temp_x0.squeeze(0)
+                    # Both positions began from identical noise and received
+                    # the same CFG-combined B1 velocity. Synchronize the
+                    # canonical J anchor after the two independent scheduler
+                    # calls to eliminate any solver/numerical drift.
+                    latent[:, anchor_index:anchor_index + 1].copy_(
+                        joint_guidance_b_latent[:, 1:2])
+                    del (b_temp_x0, joint_guidance_b_noise_pred,
+                         joint_guidance_b_pred_cond,
+                         joint_guidance_b_pred_uncond)
+                if image_condition_cross_tail_bridge:
+                    d_temp_x0 = cross_tail_d_scheduler.step(
+                        cross_tail_d_noise_pred.unsqueeze(0),
+                        t,
+                        cross_tail_d_latent.unsqueeze(0),
+                        return_dict=False,
+                        generator=seed_g)[0]
+                    cross_tail_d_latent = d_temp_x0.squeeze(0)
+                    del d_temp_x0
+                    del (cross_tail_b_noise_pred, cross_tail_b_pred_cond,
+                         cross_tail_b_pred_uncond, cross_tail_d_noise_pred,
+                         cross_tail_d_pred_cond, cross_tail_d_pred_uncond)
+                if one_way_b_latent is not None:
+                    b_temp_x0 = one_way_b_scheduler.step(
+                        one_way_b_prediction_cond.unsqueeze(0),
+                        t,
+                        one_way_b_latent.unsqueeze(0),
+                        return_dict=False,
+                        generator=seed_g)[0]
+                    one_way_b_latent = b_temp_x0.squeeze(0)
+                    del b_temp_x0, one_way_b_prediction_cond
 
                 x0 = [latent]
                 del latent_model_input, timestep
                 if (image_condition_self_attention_guidance
-                        or image_condition_one_way_prompt_guidance):
+                        or image_condition_one_way_prompt_guidance
+                        or image_condition_joint_img2_guidance
+                        or image_condition_cross_tail_bridge):
                     del current_latent
 
             if offload_model:
@@ -1517,26 +2221,51 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
-                if temporary_anchor_mode:
+                persistent_b_video = None
+                if image_condition_cross_tail_bridge:
+                    if x0[0].size(1) != latent_frame_num:
+                        raise RuntimeError(
+                            "cross-tail canonical state has the wrong number "
+                            "of output latents")
+                    videos = self.vae.decode(x0)
+                elif (temporary_anchor_mode
+                      or (image_condition_joint_img2_guidance
+                          and image_condition_joint_img2_guidance_rope_compression)):
                     retained_x0 = torch.cat([
                         x0[0][:, :anchor_index],
                         x0[0][:, anchor_index + 1:]
                     ], dim=1)
-                    if retained_x0.size(1) != latent_frame_num:
+                    expected_retained_frames = (
+                        latent_frame_num if temporary_anchor_mode else
+                        latent_frame_num - 1)
+                    if retained_x0.size(1) != expected_retained_frames:
                         raise RuntimeError(
-                            "discarding the paired anchor produced the wrong "
+                            "discarding the interior anchor produced the wrong "
                             "number of output latents")
                     videos = self.vae.decode([retained_x0])
                     del retained_x0
                 else:
                     videos = self.vae.decode(x0)
+                if return_persistent_b_video:
+                    persistent_b_video = self.vae.decode(
+                        [joint_guidance_b_latent])[0]
 
         del noise, latent, x0
         del sample_scheduler
+        if one_way_b_latent is not None:
+            del one_way_b_latent, one_way_b_scheduler
+        if joint_guidance_b_latent is not None:
+            del joint_guidance_b_latent, joint_guidance_b_scheduler
+        if cross_tail_d_latent is not None:
+            del cross_tail_d_latent, cross_tail_d_scheduler
         if offload_model:
             gc.collect()
             torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
 
-        return videos[0] if self.rank == 0 else None
+        if self.rank != 0:
+            return None
+        if return_persistent_b_video:
+            return videos[0], persistent_b_video
+        return videos[0]

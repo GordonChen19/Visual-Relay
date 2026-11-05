@@ -14,6 +14,193 @@ if torch is not None:
 class PairedAnchorAttentionRoutingTest(unittest.TestCase):
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_cross_tail_bridge_uses_safe_distance_routes(self):
+        q = torch.zeros(3, 6, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        calls = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1)))
+            result = torch.full_like(q, float(len(calls)))
+            if kwargs.get('return_lse', False):
+                # Equal token logits have log-sum-exp log(memory length).
+                lse = torch.full(
+                    (q.size(0), q.size(1), q.size(2)),
+                    math.log(k.size(1)), dtype=torch.float32)
+                return result, lse
+            return result
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash):
+            output = attention.cross_tail_bridge_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([5, 6, 6]),
+                grid_sizes=torch.tensor(
+                    [[5, 1, 1], [6, 1, 1], [6, 1, 1]]),
+                tail_frames=2,
+                cross_memory_prior=0.2)
+
+        self.assertEqual(calls, [
+            (2, 5), (2, 6),  # M0:1: all M + B0:5
+            (1, 5), (1, 5),  # M2: all M + B1:5
+            (2, 5), (2, 4),  # M3:4: all M + B2:5
+            (2, 6),          # B0:1 overlap: native B only
+            (4, 6), (4, 3),  # B2:5 tail: all B + pre-anchor M0:2
+            (6, 6),          # D0:5: independent native D only
+        ])
+        self.assertTrue(torch.allclose(
+            output[0, :2, 0, 0], torch.full((2,), 1.2)))
+        self.assertTrue(torch.allclose(
+            output[0, 2:3, 0, 0], torch.full((1,), 3.2)))
+        self.assertTrue(torch.allclose(
+            output[0, 3:5, 0, 0], torch.full((2,), 5.2)))
+        self.assertEqual(output[0, 5, 0, 0].item(), 0.0)
+        self.assertTrue(torch.allclose(
+            output[1, :2, 0, 0], torch.full((2,), 7.0)))
+        self.assertTrue(torch.allclose(
+            output[1, 2:, 0, 0], torch.full((4,), 8.2)))
+        self.assertTrue(torch.allclose(
+            output[2, :, 0, 0], torch.full((6,), 10.0)))
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_cross_tail_bridge_can_disable_mass_control(self):
+        q = torch.zeros(3, 6, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        calls = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1),
+                          kwargs.get('return_lse', False)))
+            return torch.full_like(q, float(len(calls)))
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash):
+            output = attention.cross_tail_bridge_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([5, 6, 6]),
+                grid_sizes=torch.tensor(
+                    [[5, 1, 1], [6, 1, 1], [6, 1, 1]]),
+                tail_frames=2,
+                cross_memory_prior=0.2,
+                control_memory_mass=False)
+
+        self.assertEqual(calls, [
+            (2, 11, False),  # M0:1: all M + B0:5
+            (1, 10, False),  # M2: all M + B1:5
+            (2, 9, False),   # M3:4: all M + B2:5
+            (2, 6, False),  # B0:1 overlap: native B only
+            (4, 9, False),  # B2:5 tail: all B + pre-anchor M0:2
+            (6, 6, False),  # D0:5: independent native D only
+        ])
+        self.assertEqual(output[0, :, 0, 0].tolist(),
+                         [1.0, 1.0, 2.0, 3.0, 3.0, 0.0])
+        self.assertEqual(output[1, :, 0, 0].tolist(),
+                         [4.0, 4.0, 5.0, 5.0, 5.0, 5.0])
+        self.assertEqual(output[2, :, 0, 0].tolist(), [6.0] * 6)
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_joint_img2_guidance_updates_anchor_and_suffix_only(self):
+        q = torch.zeros(2, 5, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        calls = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1)))
+            return torch.full_like(q, float(len(calls)))
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash):
+            output = attention.joint_img2_guidance_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([5, 3]),
+                grid_sizes=torch.tensor([[5, 1, 1], [3, 1, 1]]),
+                anchor_index=2,
+                img2_weight=0.25)
+
+        # Full J attention, suffix-only J-anchor attention, then full B.
+        self.assertEqual(calls, [(5, 5), (1, 3), (3, 3)])
+        self.assertEqual(output[0, :, 0, 0].tolist(),
+                         [1.0, 1.0, 2.25, 1.5, 1.5])
+        self.assertEqual(output[1, :3, 0, 0].tolist(), [3.0, 3.0, 3.0])
+        self.assertEqual(output[1, 3:, 0, 0].tolist(), [0.0, 0.0])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_shifted_joint_guidance_keeps_attention_streams_independent(self):
+        q = torch.zeros(2, 5, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        calls = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1)))
+            result = torch.zeros_like(q)
+            result[:, :, :, 0] = torch.arange(
+                q.size(1), dtype=q.dtype)[None, :, None]
+            if len(calls) == 2:
+                result[:, :, :, 0] += 10
+            return result
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash):
+            output = attention.joint_img2_guidance_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([5, 4]),
+                grid_sizes=torch.tensor([[5, 1, 1], [4, 1, 1]]),
+                anchor_index=2,
+                img2_weight=0.25)
+
+        self.assertEqual(calls, [(5, 5), (4, 4)])
+        self.assertEqual(output[0, :, 0, 0].tolist(),
+                         [0.0, 1.0, 2.0, 3.0, 4.0])
+        self.assertEqual(output[1, :4, 0, 0].tolist(),
+                         [10.0, 11.0, 12.0, 13.0])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_shifted_joint_rope_compression_is_query_dependent(self):
+        q = torch.zeros(2, 5, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        calls = []
+        shifts = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1)))
+            return torch.full_like(q, float(len(calls)))
+
+        def fake_shift(x, delta, freqs):
+            shifts.append((x.size(1), delta))
+            return x
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash), \
+             mock.patch.object(attention, '_shift_temporal_rope', fake_shift):
+            output = attention.joint_img2_guidance_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([5, 4]),
+                grid_sizes=torch.tensor([[5, 1, 1], [4, 1, 1]]),
+                anchor_index=2,
+                rope_compression=True,
+                freqs=torch.ones(2, 1))
+
+        # Prefix shifts J3:J4, while suffix attention shifts Q3:J4 and
+        # K2:J4. With anchor=2 this produces J2/J3@2 for prefix queries and
+        # J1/J2@1 for suffix queries without disturbing suffix self-offsets.
+        self.assertEqual(shifts, [(2, -1), (2, -1), (3, -1)])
+        # Prefix reads all J memory, anchor reads itself/future only, suffix
+        # reads all J memory, and B retains one ordinary attention call.
+        self.assertEqual(calls, [(2, 5), (1, 3), (2, 5), (4, 4)])
+        self.assertEqual(output[0, :, 0, 0].tolist(),
+                         [1.0, 1.0, 2.0, 3.0, 3.0])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_one_way_img2_guidance_updates_only_aligned_main_outputs(self):
         q = torch.zeros(2, 6, 1, 2)
         k = torch.zeros_like(q)
@@ -26,7 +213,11 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
         def fake_flash(q, k, v, **kwargs):
             calls.append((q.size(1), k.size(1)))
             value_calls.append(v.clone())
-            return torch.full_like(q, float(len(calls)))
+            result = torch.full_like(q, float(len(calls)))
+            if kwargs.get('return_lse', False):
+                return result, torch.zeros(
+                    q.size(0), q.size(1), q.size(2), dtype=torch.float32)
+            return result
 
         with mock.patch.object(attention, 'flash_attention', fake_flash):
             output = attention.one_way_img2_attention(
@@ -38,13 +229,167 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
                 anchor_index=2,
                 img2_weight=0.25)
 
-        self.assertEqual(calls, [(2, 5), (3, 5), (1, 3), (3, 3)])
+        self.assertEqual(
+            calls,
+            [(2, 4), (2, 1), (2, 1), (3, 5), (1, 3), (3, 3)])
         self.assertEqual(value_calls[0][0, :, 0, 0].tolist(),
-                         [10.0, 11.0, 20.0, 14.0, 15.0])
+                         [10.0, 11.0, 14.0, 15.0])
+        self.assertEqual(value_calls[1][0, :, 0, 0].tolist(), [12.0])
+        self.assertEqual(value_calls[2][0, :, 0, 0].tolist(), [13.0])
         self.assertEqual(output[0, :, 0, 0].tolist(),
-                         [1.0, 1.0, 3.0, 4.0, 2.5, 2.5])
-        self.assertEqual(output[1, :3, 0, 0].tolist(), [4.0, 4.0, 4.0])
+                         [1.75, 1.75, 5.0, 4.0, 4.5, 4.5])
+        self.assertEqual(output[1, :3, 0, 0].tolist(), [6.0, 6.0, 6.0])
         self.assertEqual(output[1, 3:, 0, 0].tolist(), [0.0, 0.0, 0.0])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_one_way_prefix_uses_configurable_auxiliary_anchor_prior(self):
+        q = torch.zeros(2, 6, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        calls = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1)))
+            result = torch.full_like(q, float(len(calls)))
+            if kwargs.get('return_lse', False):
+                return result, torch.zeros(
+                    q.size(0), q.size(1), q.size(2), dtype=torch.float32)
+            return result
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash):
+            output = attention.one_way_img2_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([6, 3]),
+                grid_sizes=torch.tensor([[6, 1, 1], [3, 1, 1]]),
+                anchor_index=2,
+                img2_weight=0.25,
+                aux_anchor_prior=0.75)
+
+        # Equal group log-normalizers give 0.5 ordinary mass, then split the
+        # remaining 0.5 as 0.75 A and 0.25 M: 0.5*1 + .375*2 + .125*3.
+        self.assertEqual(output[0, :2, 0, 0].tolist(), [1.625, 1.625])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_one_way_prefix_can_exclude_auxiliary_anchor(self):
+        q = torch.zeros(2, 6, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        calls = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1)))
+            return torch.full_like(q, float(len(calls)))
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash):
+            output = attention.one_way_img2_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([6, 3]),
+                grid_sizes=torch.tensor([[6, 1, 1], [3, 1, 1]]),
+                anchor_index=2,
+                img2_weight=0.25,
+                prefix_reads_aux_anchor=False)
+
+        self.assertEqual(calls, [(2, 5), (3, 5), (1, 3), (3, 3)])
+        self.assertEqual(output[0, :, 0, 0].tolist(),
+                         [1.0, 1.0, 3.0, 2.0, 2.5, 2.5])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_one_way_full_b_uses_only_overlapping_outputs(self):
+        q = torch.zeros(2, 7, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        calls = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1)))
+            result = torch.full_like(q, float(len(calls)))
+            if kwargs.get('return_lse', False):
+                return result, torch.zeros(
+                    q.size(0), q.size(1), q.size(2), dtype=torch.float32)
+            return result
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash):
+            output = attention.one_way_img2_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([6, 7]),
+                grid_sizes=torch.tensor([[6, 1, 1], [7, 1, 1]]),
+                anchor_index=2,
+                img2_weight=0.25,
+                prefix_reads_aux_anchor=False)
+
+        self.assertEqual(calls, [(2, 5), (3, 5), (1, 3), (7, 7)])
+        # Only B1:B2 overlap the two retained M suffix frames. B3:B6 remain
+        # internal B context and cannot add output positions to M.
+        self.assertEqual(output[0, :, 0, 0].tolist(),
+                         [1.0, 1.0, 3.0, 2.0, 2.5, 2.5, 0.0])
+        self.assertEqual(output[1, :, 0, 0].tolist(), [4.0] * 7)
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_one_way_guided_frames_localizes_anchor_suffix_updates(self):
+        q = torch.zeros(2, 7, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        calls = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1)))
+            return torch.full_like(q, float(len(calls)))
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash):
+            output = attention.one_way_img2_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([7, 7]),
+                grid_sizes=torch.tensor([[7, 1, 1], [7, 1, 1]]),
+                anchor_index=2,
+                img2_weight=0.25,
+                prefix_reads_aux_anchor=False,
+                guided_frames=3)
+
+        self.assertEqual(calls, [(2, 6), (4, 6), (1, 3), (7, 7)])
+        # B0:B2 guide the retained anchor and next two frames. The final
+        # retained M frame keeps its own output from call 2.
+        self.assertEqual(output[0, :, 0, 0].tolist(),
+                         [1.0, 1.0, 3.0, 2.5, 2.5, 2.5, 2.0])
+        self.assertEqual(output[1, :, 0, 0].tolist(), [4.0] * 7)
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_one_way_shared_anchor_uses_guided_retained_anchor_output(self):
+        q = torch.zeros(2, 7, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        calls = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1)))
+            return torch.full_like(q, float(len(calls)))
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash):
+            output = attention.one_way_img2_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([7, 7]),
+                grid_sizes=torch.tensor([[7, 1, 1], [7, 1, 1]]),
+                anchor_index=2,
+                img2_weight=0.25,
+                prefix_reads_aux_anchor=False,
+                guided_frames=3,
+                shared_anchor_update=True)
+
+        self.assertEqual(calls, [(2, 6), (4, 6), (1, 3), (7, 7)])
+        # A2 and retained M2 both receive the same interpolated anchor output:
+        # 0.75 * call-2 M output + 0.25 * call-4 B0 output = 2.5.
+        self.assertEqual(output[0, :, 0, 0].tolist(),
+                         [1.0, 1.0, 2.5, 2.5, 2.5, 2.5, 2.0])
+        self.assertEqual(output[1, :, 0, 0].tolist(), [4.0] * 7)
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_shared_position_prior_matches_one_biased_softmax(self):
