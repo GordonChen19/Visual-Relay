@@ -1,4 +1,4 @@
-"""Exercise the actual B view/scheduler blocks without importing CUDA models."""
+"""Exercise state-aligned B0 guidance without importing the CUDA stack."""
 import ast
 from pathlib import Path
 import types
@@ -6,86 +6,111 @@ import unittest
 
 
 class Frames:
-    def __init__(self, values):
-        self.values = list(values)
+    """Small shared-storage temporal tensor stub for sampling-block tests."""
+    def __init__(self, values, storage=None, indices=None):
+        self.storage = list(values) if storage is None else storage
+        self.indices = list(range(len(self.storage))) if indices is None else indices
+
+    @property
+    def values(self):
+        return [self.storage[i] for i in self.indices]
 
     def __getitem__(self, index):
-        return Frames(self.values[index[1]])
+        return Frames([], self.storage, self.indices[index[1]])
 
-    def to(self, device):
+    def clone(self):
+        return Frames(self.values)
+
+    def copy_(self, source):
+        if len(self.indices) != len(source.values):
+            raise ValueError('frame count mismatch')
+        for i, value in zip(self.indices, source.values):
+            self.storage[i] = value
         return self
-
-    def unsqueeze(self, dim):
-        return self
-
-    def squeeze(self, dim):
-        return self
-
-
-class Scheduler:
-    def step(self, prediction, timestep, state, **kwargs):
-        self.prediction = prediction.values
-        self.state = state.values
-        return (Frames([a + b for a, b in zip(
-            state.values, prediction.values)]),)
 
 
 class B0StateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        source = Path(__file__).resolve().parents[1] / 'wan/image2video.py'
-        cls.tree = ast.parse(source.read_text())
+        cls.root = Path(__file__).resolve().parents[1]
+        cls.tree = ast.parse((cls.root / 'wan/image2video.py').read_text())
+        helpers = [node for node in cls.tree.body
+                   if isinstance(node, ast.FunctionDef)
+                   and node.name == '_replace_joint_anchor_velocity']
+        cls.scope = {}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]),
+                     '<actual anchor replacement>', 'exec'), cls.scope)
 
-    def block(self, first_assignment):
-        matches = [node for node in ast.walk(self.tree)
-                   if isinstance(node, ast.If) and node.body
-                   and isinstance(node.body[0], ast.Assign)
-                   and ast.unparse(node.body[0].targets[0]) == first_assignment
-                   and 'joint_guidance_b_latent' in ast.unparse(node.test)]
-        self.assertEqual(len(matches), 1)
-        return compile(ast.Module(body=[matches[0]], type_ignores=[]),
-                       '<actual sampling block>', 'exec')
+    def guided_block(self):
+        nodes = [node for node in ast.walk(self.tree)
+                 if isinstance(node, ast.If)
+                 and ast.unparse(node.test) == 'joint_guidance_active']
+        self.assertEqual(len(nodes), 1)
+        return compile(ast.Module(body=nodes, type_ignores=[]),
+                       '<actual guided input>', 'exec')
 
     def environment(self):
         return dict(
             torch=types.SimpleNamespace(cat=lambda parts, dim: Frames(
                 [value for part in parts for value in part.values])),
-            self=types.SimpleNamespace(device='cpu'), anchor_index=2,
-            joint_guidance_b_latent=Frames([100, -1, -2, -3]),
-            current_latent=Frames([0, 1, 2, 3, 4]))
+            anchor_index=2, current_latent=Frames([0, 1, 2, 3, 4]), t=999,
+            joint_guidance_active=True,
+            joint_handoff_arg_c={'conditioning': 'retained joint'},
+            joint_handoff_arg_null={'conditioning': 'retained joint negative'},
+            sampling_step=15,
+            image_condition_joint_img2_guidance_adaptive_pair_end_step=15,
+            logging=types.SimpleNamespace(info=lambda *args: None))
 
-    def test_input_uses_own_b0_and_canonical_j_suffix(self):
+    def test_b0_is_a_view_of_the_current_j_anchor(self):
         env = self.environment()
-        exec(self.block('joint_guidance_b_latent'), env)
-        self.assertEqual(env['joint_guidance_b_latent'].values, [100, 2, 3, 4])
-        # A later J9-equivalent change must never replace B0.
-        env['current_latent'] = Frames([10, 999, 20, 30, 40])
-        exec(self.block('joint_guidance_b_latent'), env)
-        self.assertEqual(env['joint_guidance_b_latent'].values,
-                         [100, 20, 30, 40])
+        exec(self.guided_block(), env)
+        main, b = env['latent_model_input']
+        self.assertIs(main, env['current_latent'])
+        self.assertEqual(b.values, [2, 3, 4])
+        main[:, 2:3].copy_(Frames([77]))
+        self.assertEqual(b.values, [77, 3, 4])
+        env['current_latent'] = Frames([10, 11, 12, 13, 14])
+        exec(self.guided_block(), env)
+        self.assertEqual(env['latent_model_input'][1].values, [12, 13, 14])
 
-    def test_only_b0_is_scheduled_and_j_is_not_overwritten(self):
-        env = self.environment()
-        scheduler = Scheduler()
-        env.update(joint_guidance_active=True,
-                   joint_guidance_b_scheduler=scheduler,
-                   joint_guidance_b_noise_pred=Frames([7]),
-                   joint_guidance_b_pred_cond=Frames([8]),
-                   joint_guidance_b_pred_uncond=Frames([1]),
-                   latent=Frames([10, 11, 12, 13, 14]), t=999, seed_g=None)
-        exec(self.block('b_temp_x0'), env)
-        self.assertEqual(scheduler.state, [100])
-        self.assertEqual(scheduler.prediction, [7])
-        self.assertEqual(env['joint_guidance_b_latent'].values,
-                         [107, 12, 13, 14])
-        self.assertEqual(env['latent'].values, [10, 11, 12, 13, 14])
+    def test_b0_velocity_replaces_only_anchor_in_both_cfg_branches(self):
+        assignments = [node for node in ast.walk(self.tree)
+                       if isinstance(node, ast.Assign)
+                       and isinstance(node.value, ast.Call)
+                       and ast.unparse(node.value.func) == '_replace_joint_anchor_velocity']
+        self.assertEqual(len(assignments), 2)
+        self.assertEqual({ast.unparse(n.targets[0]) for n in assignments},
+                         {'noise_pred_cond', 'noise_pred_uncond'})
+        env = dict(self.scope, anchor_index=2,
+                   noise_pred_cond=Frames([10, 11, 12, 13, 14]),
+                   noise_pred_uncond=Frames([1, 2, 3, 4, 5]),
+                   predictions_cond=[None, Frames([100, 200, 300])],
+                   predictions_uncond=[None, Frames([7, 8, 9])])
+        original_c = env['noise_pred_cond']
+        exec(compile(ast.Module(body=assignments, type_ignores=[]),
+                     '<actual CFG branch replacements>', 'exec'), env)
+        self.assertEqual(env['noise_pred_cond'].values, [10, 11, 100, 13, 14])
+        self.assertEqual(env['noise_pred_uncond'].values, [1, 2, 7, 4, 5])
+        self.assertEqual(original_c.values, [10, 11, 12, 13, 14])
+        scale = 3.5
+        guided = [u + scale * (c - u) for c, u in zip(
+            env['noise_pred_cond'].values, env['noise_pred_uncond'].values)]
+        self.assertEqual(guided[2], 7 + scale * (100 - 7))
 
-    def test_b0_stops_at_handoff(self):
+    def test_joint_b_has_no_independent_state_or_scheduler(self):
+        identifiers = {node.id for node in ast.walk(self.tree)
+                       if isinstance(node, ast.Name)}
+        self.assertNotIn('joint_guidance_b_scheduler', identifiers)
+        self.assertNotIn('joint_guidance_b_latent', identifiers)
+
+    def test_handoff_removes_anchor_and_stops_b_input(self):
         env = self.environment()
         env['joint_guidance_active'] = False
-        exec(self.block('b_temp_x0'), env)
-        self.assertEqual(env['joint_guidance_b_latent'].values,
-                         [100, -1, -2, -3])
+        exec(self.guided_block(), env)
+        self.assertEqual(len(env['latent_model_input']), 1)
+        self.assertEqual(env['latent_model_input'][0].values, [0, 1, 3, 4])
+        self.assertIs(env['current_arg_c'], env['joint_handoff_arg_c'])
+        self.assertIs(env['current_arg_null'], env['joint_handoff_arg_null'])
 
     def test_handoff_preserves_joint_features_and_masks_in_both_cfg_calls(self):
         def assignment(name):
@@ -99,7 +124,6 @@ class B0StateTests(unittest.TestCase):
 
         for anchor in (1, 10, 19):
             with self.subTest(anchor=anchor):
-                # Each frame represents distinct mask and VAE feature data.
                 values = [(i == 0 or i == anchor, 100 + i, 200 + i)
                           for i in range(21)]
                 env = self.environment()

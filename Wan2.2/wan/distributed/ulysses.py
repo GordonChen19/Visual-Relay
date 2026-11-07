@@ -38,6 +38,7 @@ def distributed_attention(
         joint_img2_guidance_adaptive_pair_margin=1.05,
         joint_img2_guidance_adaptive_pair_alpha_max=0.7,
         joint_img2_guidance_compression_ratio=1.0,
+        joint_img2_guidance_velocity_only=False,
         cross_tail_bridge_anchor_index=None,
         cross_tail_bridge_tail_frames=4,
         cross_tail_bridge_memory_prior=0.2,
@@ -147,6 +148,7 @@ def distributed_attention(
             adaptive_pair_alpha_max=(
                 joint_img2_guidance_adaptive_pair_alpha_max),
             compression_ratio=joint_img2_guidance_compression_ratio,
+            velocity_only=joint_img2_guidance_velocity_only,
             freqs=freqs,
             window_size=window_size,
         )

@@ -163,6 +163,33 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
                          [10.0, 11.0, 12.0, 13.0])
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_aligned_b0_velocity_only_never_injects_layerwise_outputs(self):
+        q = torch.zeros(2, 5, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        v[0, :, 0, 0] = torch.arange(5, dtype=torch.float32)
+        v[1, :3, 0, 0] = torch.tensor([100., 101., 102.])
+
+        def uniform_attention(q, k, v, **kwargs):
+            return v.mean(dim=1, keepdim=True).expand_as(q).clone()
+
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed), \
+                 mock.patch.object(attention, 'flash_attention', uniform_attention), \
+                 mock.patch.object(attention, '_shift_temporal_rope',
+                                   lambda x, delta, freqs: x):
+                output = attention.joint_img2_guidance_attention(
+                    q=q, k=k, v=v, seq_lens=torch.tensor([5, 3]),
+                    grid_sizes=torch.tensor([[5, 1, 1], [3, 1, 1]]),
+                    anchor_index=2, img2_weight=1.0,
+                    rope_compression=compressed, velocity_only=True,
+                    freqs=torch.ones(2, 1))
+                expected = [2., 2., 3., 2., 2.] if compressed else [2.] * 5
+                self.assertEqual(output[0, :, 0, 0].tolist(), expected)
+                self.assertEqual(output[1, :, 0, 0].tolist(),
+                                 [101., 101., 101., 0., 0.])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_joint_attention_diagnostics_match_dense_probabilities(self):
         torch.manual_seed(17)
         q = torch.randn(1, 10, 2, 4)

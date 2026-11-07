@@ -338,6 +338,7 @@ def joint_img2_guidance_attention(
     adaptive_pair_margin=1.05,
     adaptive_pair_alpha_max=0.7,
     compression_ratio=1.0,
+    velocity_only=False,
     freqs=None,
     window_size=(-1, -1),
     dtype=torch.bfloat16,
@@ -381,9 +382,9 @@ def joint_img2_guidance_attention(
     aligned_start = anchor_index * tokens_per_frame
     anchor_end = aligned_start + tokens_per_frame
     if rope_compression:
-        if not shifted_anchor:
+        if not (shifted_anchor or velocity_only):
             raise ValueError(
-                "joint RoPE compression requires the shifted B alignment")
+                "joint RoPE compression requires velocity-only B guidance")
         if freqs is None:
             raise ValueError("joint RoPE compression requires RoPE frequencies")
 
@@ -443,16 +444,17 @@ def joint_img2_guidance_attention(
             v=v[0:1, :joint_seq_len],
             window_size=window_size,
             dtype=dtype)
-    if shifted_anchor:
+    if shifted_anchor or velocity_only:
         img2_output = flash_attention(
             q=q[1:2, :img2_seq_len],
             k=k[1:2, :img2_seq_len],
             v=v[1:2, :img2_seq_len],
             window_size=window_size,
             dtype=dtype)
-        # B0 aligns with J(anchor-1), making B1 an ordinary four-frame latent
-        # at J's anchor. J and B retain independent ordinary bidirectional
-        # attention. B1 is consumed only as final anchor velocity.
+        # Velocity-only guidance never injects B's layerwise outputs into J.
+        # The pipeline aligns B0 with J's anchor and consumes its final
+        # prediction after the DiT. Retain the older length-based shifted
+        # route for direct callers as well.
         joint_output = torch.cat([
             joint_output, torch.zeros_like(q[0:1, joint_seq_len:])
         ], dim=1)

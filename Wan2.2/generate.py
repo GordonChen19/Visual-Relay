@@ -670,12 +670,10 @@ def _parse_args():
     parser.add_argument(
         "--image_condition_joint_img2_guidance_shifted_anchor",
         action="store_true",
-        help=("Shift the auxiliary standard Img2-first B view one latent "
-              "earlier, so B1 aligns with J's Img2 anchor. J and B retain "
-              "independent ordinary bidirectional self-attention. After the "
-              "DiT, B1 "
-              "replaces J's aligned anchor velocity. B is rebuilt from J "
-              "noise each step and is never scheduled independently."))
+        help=("Legacy-named velocity-only guidance mode: B is rebuilt from "
+              "J[anchor:] every step, so B0 shares J's anchor noisy state "
+              "and supplies its final velocity in both CFG branches. No "
+              "layerwise B-output injection or independent B scheduler."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_single_frame_anchor",
         action="store_true",
@@ -704,15 +702,13 @@ def _parse_args():
     parser.add_argument(
         "--image_condition_joint_img2_guidance_persistent_b",
         action="store_true",
-        help=("Keep B0 as its own persistent Img2-first state with a separate "
-              "single-latent scheduler and CFG-combined B0 prediction. Rebuild "
-              "B1 onward from J[anchor:] at each guided step; only B0 evolves "
-              "independently. B1 supplies J's anchor velocity without any "
-              "post-step B-to-J latent synchronization."))
+        help=("Deprecated compatibility flag. B0 and all later B frames now "
+              "read J[anchor:] at every step; there is no independently "
+              "scheduled B state."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_save_b_video",
         action="store_true",
-        help=("Decode the last guided B view (own B0 plus J's aligned suffix) "
+        help=("Decode the last guided B view (J's canonical anchor and suffix) "
               "beside the main video using an _B filename suffix. If guidance "
               "ends early, this view is an intermediate noisy state."))
     parser.add_argument(

@@ -61,6 +61,12 @@ class ChunkAndCacheTests(unittest.TestCase):
         assignments = [node for node in ast.walk(pipeline)
                        if isinstance(node, ast.Assign)
                        and ast.unparse(node.targets[0]) == 'joint_encode_inputs']
+        joint_branches = [node for node in ast.walk(pipeline)
+                          if isinstance(node, ast.If)
+                          and ast.unparse(node.test) == 'image_condition_joint_img2_guidance'
+                          and any(isinstance(child, ast.Assign)
+                                  and ast.unparse(child.targets[0]) ==
+                                  'suffix_latent_frame_num' for child in node.body)]
         encoding = [node for node in ast.walk(pipeline)
                     if isinstance(node, ast.If)
                     and ast.unparse(node.test) ==
@@ -68,7 +74,12 @@ class ChunkAndCacheTests(unittest.TestCase):
                     and 'self.vae.encode' in ast.unparse(node)]
         self.assertEqual(len(assignments), 1)
         self.assertEqual(len(encoding), 1)
-        code = compile(ast.Module(body=[assignments[0], encoding[0]],
+        self.assertEqual(len(joint_branches), 1)
+        lengths = [node for node in joint_branches[0].body
+                   if isinstance(node, ast.Assign)
+                   and ast.unparse(node.targets[0]) in
+                   ('suffix_latent_frame_num', 'suffix_frame_num')]
+        code = compile(ast.Module(body=lengths + [assignments[0], encoding[0]],
                                   type_ignores=[]), str(pipeline_path), 'exec')
 
         class Video:
@@ -98,15 +109,17 @@ class ChunkAndCacheTests(unittest.TestCase):
                     joint_anchor_conditioning_video=joint_builder,
                     conditioning_video=lambda image, frames: Video(frames),
                     imgs=['Img1', 'Img2'], F=81, anchor_index=10,
-                    suffix_frame_num=45, latent_frame_num=21,
+                    suffix_frame_num=41, latent_frame_num=21,
                     image_condition_joint_img2_guidance_single_frame_anchor=enabled,
                     logging=types.SimpleNamespace(info=lambda *args: None))
                 exec(code, env)
-                self.assertEqual([v.frames for v in env['encoded']], [21, 12])
+                self.assertEqual(env['suffix_latent_frame_num'], 11)
+                self.assertEqual(env['suffix_frame_num'], 41)
+                self.assertEqual([v.frames for v in env['encoded']], [21, 11])
                 if enabled:
-                    self.assertEqual(calls, [([78], (10,)), ([45], None)])
+                    self.assertEqual(calls, [([78], (10,)), ([41], None)])
                 else:
-                    self.assertEqual(calls, [([81, 45], None)])
+                    self.assertEqual(calls, [([81, 41], None)])
 
     def test_default_chunks(self):
         plan = chunk_plan(81)
