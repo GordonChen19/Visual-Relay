@@ -163,6 +163,30 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
                          [10.0, 11.0, 12.0, 13.0])
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_joint_attention_diagnostics_match_dense_probabilities(self):
+        torch.manual_seed(17)
+        q = torch.randn(1, 10, 2, 4)
+        k = torch.randn_like(q)
+        suffix_q = torch.randn(1, 4, 2, 4)
+        suffix_k = torch.randn_like(k)
+        with attention.collect_joint_attention_shares(True) as samples:
+            attention._record_joint_attention_shares(
+                q, k, 2, 2, suffix_q, suffix_k)
+        expected = []
+        for query, memory, targets in (
+                (q[:, 2:4], k, (2, 3)),
+                (suffix_q[:, :2], suffix_k, (2, 1))):
+            probabilities = torch.softmax(
+                torch.einsum('bqhd,bkhd->bhqk', query, memory) / 2, dim=-1)
+            expected.extend([
+                probabilities[..., frame * 2:(frame + 1) * 2].sum()
+                for frame in targets])
+        torch.testing.assert_close(samples[0][:4], torch.stack(expected))
+        self.assertEqual(samples[0][4].item(), 4)
+        attention._record_joint_attention_shares(q, k, 2, 2)
+        self.assertEqual(len(samples), 1)
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_shifted_joint_rope_compression_is_query_dependent(self):
         q = torch.zeros(2, 5, 1, 2)
         k = torch.zeros_like(q)
@@ -199,6 +223,50 @@ class PairedAnchorAttentionRoutingTest(unittest.TestCase):
         self.assertEqual(calls, [(2, 5), (1, 3), (2, 5), (4, 4)])
         self.assertEqual(output[0, :, 0, 0].tolist(),
                          [1.0, 1.0, 2.0, 3.0, 3.0])
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_handoff_mode_compresses_both_routes_with_visible_anchor(self):
+        q = torch.zeros(2, 5, 1, 2)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        calls = []
+        shifts = []
+
+        def fake_flash(q, k, v, **kwargs):
+            calls.append((q.size(1), k.size(1),
+                          kwargs.get('return_lse', False)))
+            output = torch.zeros_like(q)
+            if kwargs.get('return_lse', False):
+                return output, torch.full(
+                    (q.size(0), q.size(1), q.size(2)),
+                    math.log(k.size(1)), dtype=torch.float32)
+            return output
+
+        def fake_shift(x, delta, freqs):
+            shifts.append((x.size(1), delta))
+            return x
+
+        with mock.patch.object(attention, 'flash_attention', fake_flash), \
+             mock.patch.object(attention, '_shift_temporal_rope', fake_shift):
+            attention.joint_img2_guidance_attention(
+                q=q,
+                k=k,
+                v=v,
+                seq_lens=torch.tensor([5, 4]),
+                grid_sizes=torch.tensor([[5, 1, 1], [4, 1, 1]]),
+                anchor_index=2,
+                rope_compression=True,
+                adaptive_pair_attention=True,
+                adaptive_pair_margin=1.05,
+                adaptive_pair_alpha_max=0.7,
+                freqs=torch.ones(2, 1))
+
+        # Prefix memory J3:J4 shifts left and retains J2. Suffix Q3:Q4
+        # and K2:K4 shift left together. Every route uses unpartitioned softmax.
+        self.assertEqual(shifts, [(2, -1), (2, -1.0), (3, -1.0)])
+        self.assertEqual(calls, [
+            (2, 5, False), (1, 3, False), (2, 5, False), (4, 4, False),
+        ])
 
     @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_one_way_img2_guidance_updates_only_aligned_main_outputs(self):

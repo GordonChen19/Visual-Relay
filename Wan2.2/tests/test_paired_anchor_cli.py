@@ -204,6 +204,36 @@ class PairedAnchorCliTest(unittest.TestCase):
                 '--image_condition_joint_img2_guidance',
                 '--image_condition_joint_img2_guidance_rope_compression')
 
+    def test_joint_adaptive_pair_attention_is_opt_in_and_scoped(self):
+        common = (
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation',
+            '--image_condition_joint_img2_guidance',
+            '--image_condition_joint_img2_guidance_shifted_anchor',
+            '--image_condition_joint_img2_guidance_rope_compression')
+        args = self.parse(
+            *common,
+            '--image_condition_joint_img2_guidance_adaptive_pair_attention',
+            '--image_condition_joint_img2_guidance_adaptive_pair_end_step', '8',
+            '--image_condition_joint_img2_guidance_adaptive_pair_margin', '1.05',
+            '--image_condition_joint_img2_guidance_adaptive_pair_alpha_max',
+            '0.7')
+        self.assertTrue(
+            args.image_condition_joint_img2_guidance_adaptive_pair_attention)
+        self.assertEqual(
+            args.image_condition_joint_img2_guidance_adaptive_pair_end_step, 8)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                '--image', 'img1.png', '--image_latent_index', '0',
+                '--image_prompt', 'full trajectory',
+                '--image', 'img2.png', '--image_latent_index', '10',
+                '--image_prompt', 'Img2 continuation',
+                '--image_condition_joint_img2_guidance',
+                '--image_condition_joint_img2_guidance_shifted_anchor',
+                '--image_condition_joint_img2_guidance_adaptive_pair_attention')
+
     def test_joint_img2_guidance_static_b_prompt_is_scoped(self):
         args = self.parse(
             '--image', 'img1.png', '--image_latent_index', '0',

@@ -146,6 +146,10 @@ class WanSelfAttention(nn.Module):
                 joint_img2_guidance_anchor_index=None,
                 joint_img2_guidance_weight=0.25,
                 joint_img2_guidance_rope_compression=False,
+                joint_img2_guidance_adaptive_pair_attention=False,
+                joint_img2_guidance_adaptive_pair_margin=1.05,
+                joint_img2_guidance_adaptive_pair_alpha_max=0.7,
+                joint_img2_guidance_compression_ratio=1.0,
                 cross_tail_bridge_anchor_index=None,
                 cross_tail_bridge_tail_frames=4,
                 cross_tail_bridge_memory_prior=0.2,
@@ -231,6 +235,12 @@ class WanSelfAttention(nn.Module):
                 anchor_index=joint_img2_guidance_anchor_index,
                 img2_weight=joint_img2_guidance_weight,
                 rope_compression=joint_img2_guidance_rope_compression,
+                adaptive_pair_attention=(
+                    joint_img2_guidance_adaptive_pair_attention),
+                adaptive_pair_margin=joint_img2_guidance_adaptive_pair_margin,
+                adaptive_pair_alpha_max=(
+                    joint_img2_guidance_adaptive_pair_alpha_max),
+                compression_ratio=joint_img2_guidance_compression_ratio,
                 freqs=freqs,
                 window_size=self.window_size)
         elif one_way_img2_anchor_index is not None:
@@ -461,6 +471,10 @@ class WanAttentionBlock(nn.Module):
         joint_img2_guidance_anchor_index=None,
         joint_img2_guidance_weight=0.25,
         joint_img2_guidance_rope_compression=False,
+        joint_img2_guidance_adaptive_pair_attention=False,
+        joint_img2_guidance_adaptive_pair_margin=1.05,
+        joint_img2_guidance_adaptive_pair_alpha_max=0.7,
+        joint_img2_guidance_compression_ratio=1.0,
         cross_tail_bridge_anchor_index=None,
         cross_tail_bridge_tail_frames=4,
         cross_tail_bridge_memory_prior=0.2,
@@ -509,6 +523,14 @@ class WanAttentionBlock(nn.Module):
             joint_img2_guidance_weight=joint_img2_guidance_weight,
             joint_img2_guidance_rope_compression=(
                 joint_img2_guidance_rope_compression),
+            joint_img2_guidance_adaptive_pair_attention=(
+                joint_img2_guidance_adaptive_pair_attention),
+            joint_img2_guidance_adaptive_pair_margin=(
+                joint_img2_guidance_adaptive_pair_margin),
+            joint_img2_guidance_adaptive_pair_alpha_max=(
+                joint_img2_guidance_adaptive_pair_alpha_max),
+            joint_img2_guidance_compression_ratio=(
+                joint_img2_guidance_compression_ratio),
             cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
             cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,
             cross_tail_bridge_memory_prior=cross_tail_bridge_memory_prior,
@@ -717,6 +739,10 @@ class WanModel(ModelMixin, ConfigMixin):
         joint_img2_guidance_anchor_index=None,
         joint_img2_guidance_weight=0.25,
         joint_img2_guidance_rope_compression=False,
+        joint_img2_guidance_adaptive_pair_attention=False,
+        joint_img2_guidance_adaptive_pair_margin=1.05,
+        joint_img2_guidance_adaptive_pair_alpha_max=0.7,
+        joint_img2_guidance_compression_ratio=1.0,
         cross_tail_bridge_anchor_index=None,
         cross_tail_bridge_tail_frames=4,
         cross_tail_bridge_memory_prior=0.2,
@@ -827,6 +853,14 @@ class WanModel(ModelMixin, ConfigMixin):
             joint_img2_guidance_weight=joint_img2_guidance_weight,
             joint_img2_guidance_rope_compression=(
                 joint_img2_guidance_rope_compression),
+            joint_img2_guidance_adaptive_pair_attention=(
+                joint_img2_guidance_adaptive_pair_attention),
+            joint_img2_guidance_adaptive_pair_margin=(
+                joint_img2_guidance_adaptive_pair_margin),
+            joint_img2_guidance_adaptive_pair_alpha_max=(
+                joint_img2_guidance_adaptive_pair_alpha_max),
+            joint_img2_guidance_compression_ratio=(
+                joint_img2_guidance_compression_ratio),
             cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
             cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,
             cross_tail_bridge_memory_prior=cross_tail_bridge_memory_prior,

@@ -136,6 +136,20 @@ def _validate_args(args):
             assert args.image_condition_joint_img2_guidance_persistent_b, (
                 "--image_condition_joint_img2_guidance_save_b_video "
                 "requires --image_condition_joint_img2_guidance_persistent_b.")
+        if args.image_condition_joint_img2_guidance_attention_diagnostics:
+            assert args.image_condition_joint_img2_guidance_shifted_anchor, (
+                "Joint attention diagnostics require shifted-anchor guidance.")
+        if args.image_condition_joint_img2_guidance_adaptive_pair_attention:
+            assert args.image_condition_joint_img2_guidance_rope_compression, (
+                "Adaptive pair attention requires joint Img2-guidance RoPE "
+                "compression.")
+            assert (args.image_condition_joint_img2_guidance_adaptive_pair_end_step
+                    >= 1), "Adaptive pair end step must be at least 1."
+            assert (args.image_condition_joint_img2_guidance_adaptive_pair_margin
+                    >= 1.0), "Adaptive pair margin must be at least 1."
+            assert (0.5 <=
+                    args.image_condition_joint_img2_guidance_adaptive_pair_alpha_max
+                    < 1.0), "Adaptive pair alpha max must be in [0.5, 1)."
         if args.image_condition_cross_tail_bridge:
             assert args.image_condition_cross_tail_bridge_tail_frames >= 1, (
                 "--image_condition_cross_tail_bridge_tail_frames must be "
@@ -355,6 +369,11 @@ def _validate_args(args):
         args.sample_steps = cfg.sample_steps
 
     if args.task == "i2v-A14B":
+        if args.image_condition_joint_img2_guidance_adaptive_pair_attention:
+            assert (
+                args.image_condition_joint_img2_guidance_adaptive_pair_end_step
+                < args.sample_steps), (
+                    "Adaptive pair end step must be in [1, sample_steps).")
         for fade_name, fade_steps in paired_fade_pairs.items():
             if fade_steps[0] is not None:
                 assert (0 <= fade_steps[0] < fade_steps[1]
@@ -673,15 +692,54 @@ def _parse_args():
     parser.add_argument(
         "--image_condition_joint_img2_guidance_persistent_b",
         action="store_true",
-        help=("Initialize shifted B once from J[anchor-1:] and evolve it with "
-              "a separate identically configured scheduler using B's own "
-              "CFG-combined prediction. B1 and J's anchor start from the "
-              "same noise, and B1 continues to supply J's anchor velocity."))
+        help=("Keep B0 as its own persistent Img2-first state with a separate "
+              "single-latent scheduler and CFG-combined B0 prediction. Rebuild "
+              "B1 onward from J[anchor:] at each guided step; only B0 evolves "
+              "independently. B1 supplies J's anchor velocity without any "
+              "post-step B-to-J latent synchronization."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_save_b_video",
         action="store_true",
-        help=("Decode and save the final persistent B stream beside the main "
-              "video using an _B filename suffix."))
+        help=("Decode the last guided B view (own B0 plus J's aligned suffix) "
+              "beside the main video using an _B filename suffix. If guidance "
+              "ends early, this view is an intermediate noisy state."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_attention_diagnostics",
+        action="store_true",
+        help=("Print conditional attention percentages at every sampling step "
+              "from anchor-1 to anchor/anchor+1 and from anchor+1 to "
+              "anchor/anchor-1, plus adaptive prefix/suffix mean alpha, cap "
+              "rate, and corrected anchor-win rate. Adds diagnostic "
+              "computation without changing attention outputs."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_adaptive_pair_attention",
+        action="store_true",
+        help=("During the initial configured sampling steps, compress RoPE "
+              "in both directions: prefix queries read all J frames with "
+              "the anchor and first suffix frame colocated as temporal "
+              "neighbours; suffix queries read all J frames with the anchor "
+              "colocated with the last prefix frame. No "
+              "attention-mass correction or gradual temporal shift is "
+              "applied. At the end step, hand off to "
+              "ordinary single-stream Img1 I2V."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_adaptive_pair_end_step",
+        type=int,
+        default=10,
+        help=("First zero-based sampling step that uses ordinary Img1 I2V "
+              "instead of adaptive joint guidance (default: 10)."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_adaptive_pair_margin",
+        type=float,
+        default=1.05,
+        help=("Deprecated compatibility argument; ignored by the current "
+              "prefix-only compression ablation."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_adaptive_pair_alpha_max",
+        type=float,
+        default=0.7,
+        help=("Deprecated compatibility argument; ignored by the current "
+              "prefix-only compression ablation."))
     parser.add_argument(
         "--image_condition_cross_tail_bridge",
         action="store_true",
@@ -1269,6 +1327,16 @@ def generate(args):
                 args.image_condition_joint_img2_guidance_persistent_b),
             return_persistent_b_video=(
                 args.image_condition_joint_img2_guidance_save_b_video),
+            image_condition_joint_img2_guidance_attention_diagnostics=(
+                args.image_condition_joint_img2_guidance_attention_diagnostics),
+            image_condition_joint_img2_guidance_adaptive_pair_attention=(
+                args.image_condition_joint_img2_guidance_adaptive_pair_attention),
+            image_condition_joint_img2_guidance_adaptive_pair_end_step=(
+                args.image_condition_joint_img2_guidance_adaptive_pair_end_step),
+            image_condition_joint_img2_guidance_adaptive_pair_margin=(
+                args.image_condition_joint_img2_guidance_adaptive_pair_margin),
+            image_condition_joint_img2_guidance_adaptive_pair_alpha_max=(
+                args.image_condition_joint_img2_guidance_adaptive_pair_alpha_max),
             image_condition_cross_tail_bridge=(
                 args.image_condition_cross_tail_bridge),
             image_condition_cross_tail_bridge_tail_frames=(

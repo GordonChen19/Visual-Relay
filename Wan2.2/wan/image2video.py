@@ -20,6 +20,8 @@ from .distributed.fsdp import free_model, shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
 from .modules.model import WanModel
+from .modules.attention import (collect_joint_adaptive_alpha_stats,
+                                collect_joint_attention_shares)
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
 from .utils.fm_solvers import (
@@ -265,6 +267,11 @@ class WanI2V:
                  image_condition_joint_img2_guidance_static_b_prompt=False,
                  image_condition_joint_img2_guidance_persistent_b=False,
                  return_persistent_b_video=False,
+                 image_condition_joint_img2_guidance_attention_diagnostics=False,
+                 image_condition_joint_img2_guidance_adaptive_pair_attention=False,
+                 image_condition_joint_img2_guidance_adaptive_pair_end_step=10,
+                 image_condition_joint_img2_guidance_adaptive_pair_margin=1.05,
+                 image_condition_joint_img2_guidance_adaptive_pair_alpha_max=0.7,
                  image_condition_cross_tail_bridge=False,
                  image_condition_cross_tail_bridge_tail_frames=4,
                  image_condition_cross_tail_bridge_memory_prior=0.2,
@@ -500,6 +507,27 @@ class WanI2V:
                 and not image_condition_joint_img2_guidance_persistent_b):
             raise ValueError(
                 "returning B video requires persistent B guidance")
+        if (image_condition_joint_img2_guidance_attention_diagnostics
+                and not (image_condition_joint_img2_guidance
+                         and image_condition_joint_img2_guidance_shifted_anchor)):
+            raise ValueError(
+                "joint attention diagnostics require shifted-anchor guidance")
+        if image_condition_joint_img2_guidance_adaptive_pair_attention:
+            if not image_condition_joint_img2_guidance_rope_compression:
+                raise ValueError(
+                    "adaptive pair attention requires joint RoPE compression")
+            if not (1 <=
+                    image_condition_joint_img2_guidance_adaptive_pair_end_step
+                    < sampling_steps):
+                raise ValueError(
+                    "adaptive pair end step must be in [1, sampling_steps)")
+            if image_condition_joint_img2_guidance_adaptive_pair_margin < 1.0:
+                raise ValueError("adaptive pair margin must be at least one")
+            if not (0.5 <=
+                    image_condition_joint_img2_guidance_adaptive_pair_alpha_max
+                    < 1.0):
+                raise ValueError(
+                    "adaptive pair alpha max must be in [0.5, 1)")
         if image_condition_cross_tail_bridge_tail_frames < 1:
             raise ValueError("cross-tail bridge needs at least one tail frame")
         if not 0 <= image_condition_cross_tail_bridge_memory_prior <= 1:
@@ -773,17 +801,22 @@ class WanI2V:
         one_way_b_latent = None
         joint_guidance_b_latent = None
         if image_condition_joint_img2_guidance_persistent_b:
+            # Only B0 owns an independently scheduled state. The remaining
+            # slots are cached views of canonical J, refreshed at every step.
+            # Reuse the original Gaussian draw for B0 to preserve the seed;
+            # J9 is never copied into B0 after initialization.
             joint_guidance_b_latent = noise[:, anchor_index - 1:].clone()
             if not torch.equal(
                     joint_guidance_b_latent[:, 1:2],
                     noise[:, anchor_index:anchor_index + 1]):
                 raise RuntimeError("persistent B1 and J anchor noise differ")
             logging.info(
-                "Persistent shifted B enabled: B is initialized once from "
-                "J%d:J-end, B1 and J%d share initial noise, B advances with "
-                "its own identically configured scheduler and CFG-combined "
-                "prediction, and J%d is synchronized to scheduled B1 after "
-                "each step",
+                "Persistent B0 enabled: B0 starts from the original J%d "
+                "Gaussian draw and subsequently evolves with its own "
+                "single-latent scheduler using CFG-combined B0 predictions. "
+                "At every guided step B=[own B0, J%d:J-end], so B1 aligns "
+                "exactly with J%d. B1 supplies J's anchor velocity, but no "
+                "B1+ state is independently scheduled or copied back to J",
                 anchor_index - 1, anchor_index, anchor_index)
         if (image_condition_one_way_prompt_guidance
                 and image_condition_one_way_prompt_guidance_full_img2_stream):
@@ -854,6 +887,10 @@ class WanI2V:
                     and image_condition_joint_img2_guidance_static_b_prompt)
                 else join_prompt(global_prompt, local_prompts[1]))
             text_prompts = [main_text_prompt, img2_text_prompt]
+            if image_condition_joint_img2_guidance_adaptive_pair_attention:
+                # The handoff is deliberately ordinary Img1 I2V: global text
+                # only, without Prompt Relay or the Img2-local clause.
+                text_prompts.append(global_prompt)
             if image_condition_cross_tail_bridge:
                 # B and D share prompt 2. B has joint Img1->Img2 VAE context;
                 # D is the independent standard Img2-first reference stream.
@@ -1049,11 +1086,14 @@ class WanI2V:
                 + int(image_condition_joint_img2_guidance_shifted_anchor))
             suffix_frame_num = (1 + self.vae_stride[0]
                                 * (suffix_latent_frame_num - 1))
-            encoded = self.vae.encode([
+            joint_encode_inputs = [
                 joint_anchor_conditioning_video(
                     imgs[0], imgs[1], F, anchor_index),
                 conditioning_video(imgs[1], suffix_frame_num),
-            ])
+            ]
+            if image_condition_joint_img2_guidance_adaptive_pair_attention:
+                joint_encode_inputs.append(conditioning_video(imgs[0], F))
+            encoded = self.vae.encode(joint_encode_inputs)
             if (encoded[0].size(1) != latent_frame_num
                     or encoded[1].size(1) != suffix_latent_frame_num):
                 raise RuntimeError(
@@ -1064,6 +1104,17 @@ class WanI2V:
             guidance_local_y = torch.concat([
                 first_frame_mask(suffix_frame_num), encoded[1]
             ])
+            ordinary_img1_y = None
+            if image_condition_joint_img2_guidance_adaptive_pair_attention:
+                full_ordinary_img1_y = torch.concat([msk, encoded[2]])
+                # Post-handoff J10 is absent from the DiT, including its
+                # image-conditioning channels. J9/J11 consequently become
+                # adjacent tokens with ordinary contiguous RoPE.
+                ordinary_img1_y = torch.cat([
+                    full_ordinary_img1_y[:, :anchor_index],
+                    full_ordinary_img1_y[:, anchor_index + 1:]
+                ], dim=1)
+                del full_ordinary_img1_y
             del encoded, joint_mask
             if image_condition_joint_img2_guidance_shifted_anchor:
                 logging.info(
@@ -1071,9 +1122,11 @@ class WanI2V:
                     "jointly VAE-conditioned with Img1 at the beginning and "
                     "Img2 repeated across all four pixel frames of the "
                     "interior anchor interval. "
-                    "A standard "
-                    "%d-latent Img2-first B view is rebuilt from J%d:J-end "
-                    "at every denoising step, so B1 aligns with J%d. Every "
+                    "An "
+                    "%d-latent Img2-first B view starts at J%d on the "
+                    "aligned timeline, so B1 aligns with J%d. With persistent "
+                    "B enabled, only B0 evolves independently and B1+ are "
+                    "rebuilt from J's current state each step. Every "
                     "J and B query uses %s, with no "
                     "layerwise cross-stream injection. After "
                     "the DiT, B1 replaces J%d's predicted velocity in each "
@@ -1081,12 +1134,19 @@ class WanI2V:
                     "scheduler.%s B conditional text is %s",
                     latent_frame_num, suffix_latent_frame_num,
                     anchor_index - 1, anchor_index,
-                    ("query-dependent compressed J RoPE (prefix colocates "
-                     "J%d/J%d, suffix colocates J%d/J%d while shifting its "
-                     "queries consistently, and the anchor reads only "
-                     "itself/future) and ordinary B RoPE" %
-                     (anchor_index, anchor_index + 1,
-                      anchor_index - 1, anchor_index)
+                    (("bidirectionally compressed J RoPE (prefix reads both J%d "
+                      "and left-shifted J%d at the same temporal coordinate; "
+                      "suffix reads all J with compressed RoPE, and the anchor reads only "
+                      "itself/future) and ordinary B RoPE" %
+                      (anchor_index, anchor_index + 1))
+                     if image_condition_joint_img2_guidance_adaptive_pair_attention
+                     else
+                     ("query-dependent compressed J RoPE (prefix colocates "
+                      "J%d/J%d, suffix colocates J%d/J%d while shifting its "
+                      "queries consistently, and the anchor reads only "
+                      "itself/future) and ordinary B RoPE" %
+                      (anchor_index, anchor_index + 1,
+                       anchor_index - 1, anchor_index))
                      if image_condition_joint_img2_guidance_rope_compression
                      else "ordinary bidirectional attention and local RoPE"),
                     anchor_index,
@@ -1513,6 +1573,13 @@ class WanI2V:
                     image_condition_joint_img2_guidance_weight,
                     'joint_img2_guidance_rope_compression':
                     image_condition_joint_img2_guidance_rope_compression,
+                    'joint_img2_guidance_adaptive_pair_attention':
+                    image_condition_joint_img2_guidance_adaptive_pair_attention,
+                    'joint_img2_guidance_adaptive_pair_margin':
+                    image_condition_joint_img2_guidance_adaptive_pair_margin,
+                    'joint_img2_guidance_adaptive_pair_alpha_max':
+                    image_condition_joint_img2_guidance_adaptive_pair_alpha_max,
+                    'joint_img2_guidance_compression_ratio': 1.0,
                     'temporal_prompt_relay': temporal_prompt_relay,
                 }
                 arg_null = {
@@ -1524,7 +1591,25 @@ class WanI2V:
                     image_condition_joint_img2_guidance_weight,
                     'joint_img2_guidance_rope_compression':
                     image_condition_joint_img2_guidance_rope_compression,
+                    'joint_img2_guidance_adaptive_pair_attention':
+                    image_condition_joint_img2_guidance_adaptive_pair_attention,
+                    'joint_img2_guidance_adaptive_pair_margin':
+                    image_condition_joint_img2_guidance_adaptive_pair_margin,
+                    'joint_img2_guidance_adaptive_pair_alpha_max':
+                    image_condition_joint_img2_guidance_adaptive_pair_alpha_max,
+                    'joint_img2_guidance_compression_ratio': 1.0,
                 }
+                if image_condition_joint_img2_guidance_adaptive_pair_attention:
+                    joint_handoff_arg_c = {
+                        'context': [context[2]],
+                        'seq_len': max_seq_len,
+                        'y': [ordinary_img1_y],
+                    }
+                    joint_handoff_arg_null = {
+                        'context': [context_null[2]],
+                        'seq_len': max_seq_len,
+                        'y': [ordinary_img1_y],
+                    }
             elif image_condition_one_way_prompt_guidance:
                 arg_c = {
                     'context': [context[0], context[1]],
@@ -1728,6 +1813,7 @@ class WanI2V:
                     suffix_prediction[:, :1])
                 return hybrid_prediction
 
+            joint_guidance_active = image_condition_joint_img2_guidance
             for sampling_step, t in enumerate(tqdm(timesteps)):
                 current_arg_c = arg_c
                 current_arg_null = arg_null
@@ -1745,16 +1831,48 @@ class WanI2V:
                     timestep = [t, t, t]
                 elif image_condition_joint_img2_guidance:
                     current_latent = latent.to(self.device)
-                    latent_model_input = [
-                        current_latent,
-                        (joint_guidance_b_latent.to(self.device)
-                         if joint_guidance_b_latent is not None else
-                         current_latent[:,
-                                        (anchor_index - 1
-                                         if image_condition_joint_img2_guidance_shifted_anchor
-                                         else anchor_index):]),
-                    ]
-                    timestep = [t, t]
+                    joint_guidance_active = not (
+                        image_condition_joint_img2_guidance_adaptive_pair_attention
+                        and sampling_step >=
+                        image_condition_joint_img2_guidance_adaptive_pair_end_step)
+                    if joint_guidance_active:
+                        if joint_guidance_b_latent is not None:
+                            # Keep B0's own noisy state. Every other B position
+                            # reads the current canonical J state, rather than
+                            # an independently evolved suffix or J9 as B0.
+                            joint_guidance_b_latent = torch.cat([
+                                joint_guidance_b_latent[:, :1].to(self.device),
+                                current_latent[:, anchor_index:],
+                            ], dim=1)
+                        latent_model_input = [
+                            current_latent,
+                            (joint_guidance_b_latent.to(self.device)
+                             if joint_guidance_b_latent is not None else
+                             current_latent[:,
+                                            (anchor_index - 1
+                                             if image_condition_joint_img2_guidance_shifted_anchor
+                                             else anchor_index):]),
+                        ]
+                        timestep = [t, t]
+                    else:
+                        latent_model_input = [torch.cat([
+                            current_latent[:, :anchor_index],
+                            current_latent[:, anchor_index + 1:]
+                        ], dim=1)]
+                        timestep = [t]
+                        current_arg_c = joint_handoff_arg_c
+                        current_arg_null = joint_handoff_arg_null
+                        if (sampling_step ==
+                                image_condition_joint_img2_guidance_adaptive_pair_end_step):
+                            logging.info(
+                                "Adaptive pair guidance ended at sampling "
+                                "step %d: B, joint Img2 conditioning, Prompt "
+                                "Relay, compressed RoPE, B0 scheduling, and "
+                                "anchor velocity replacement are disabled. J10 is removed "
+                                "from the DiT, J9/J11 become adjacent, and "
+                                "ordinary 20-latent bidirectional Img1 I2V "
+                                "continues",
+                                sampling_step)
                 elif image_condition_one_way_prompt_guidance:
                     current_latent = latent.to(self.device)
                     latent_model_input = [
@@ -1921,8 +2039,65 @@ class WanI2V:
                 sample_guide_scale = guide_scale[1] if t.item(
                 ) >= boundary else guide_scale[0]
 
-                predictions_cond = model(
-                    latent_model_input, t=timestep, **current_arg_c)
+                collect_joint_diagnostics = (
+                    image_condition_joint_img2_guidance_attention_diagnostics
+                    and image_condition_joint_img2_guidance)
+                with collect_joint_attention_shares(
+                        collect_joint_diagnostics) as attention_samples, \
+                     collect_joint_adaptive_alpha_stats(
+                         collect_joint_diagnostics) as alpha_samples:
+                    predictions_cond = model(
+                        latent_model_input, t=timestep, **current_arg_c)
+                if attention_samples:
+                    totals = torch.stack(attention_samples).sum(dim=0)
+                    if dist.is_initialized():
+                        dist.all_reduce(totals)
+                    shares = (100 * totals[:4] / totals[4]).tolist()
+                    if self.rank == 0:
+                        logging.info(
+                            "J conditional attention step %d (t=%s), mean over "
+                            "layers/heads/spatial queries: J%d->anchor=%.3f%%, "
+                            "J%d->J%d=%.3f%%; J%d->anchor=%.3f%%, J%d->J%d=%.3f%%",
+                            sampling_step, t.item(),
+                            anchor_index - 1, shares[0],
+                            anchor_index - 1, anchor_index + 1, shares[1],
+                            anchor_index + 1, shares[2],
+                            anchor_index + 1, anchor_index - 1, shares[3])
+                if alpha_samples:
+                    alpha_tensor = torch.stack(alpha_samples)
+                    route_summaries = []
+                    for route in (0, 1):
+                        selected = alpha_tensor[:, 0] == route
+                        summary = alpha_tensor.new_zeros(4)
+                        if selected.any():
+                            summary = alpha_tensor[selected, 1:].sum(dim=0)
+                        if dist.is_initialized():
+                            dist.all_reduce(summary)
+                        route_summaries.append(summary)
+                    if self.rank == 0:
+                        prefix_stats, suffix_stats = route_summaries
+
+                        def alpha_values(stats):
+                            count = max(float(stats[1]), 1.0)
+                            return (float(stats[0]) / count,
+                                    100.0 * float(stats[2]) / count,
+                                    100.0 * float(stats[3]) / count)
+
+                        prefix_mean, prefix_capped, prefix_wins = alpha_values(
+                            prefix_stats)
+                        suffix_mean, suffix_capped, suffix_wins = alpha_values(
+                            suffix_stats)
+                        logging.info(
+                            "J adaptive alpha step %d: prefix anchor-share "
+                            "mean=%.4f, "
+                            "capped=%.2f%%, anchor-wins=%.2f%%; suffix "
+                            "compression=%.4f, suppression-alpha=%.4f, "
+                            "fully-suppressed=%.2f%%, "
+                            "anchor-wins=%.2f%%",
+                            sampling_step, prefix_mean, prefix_capped,
+                            prefix_wins, 0.0, suffix_mean,
+                            suffix_capped,
+                            suffix_wins)
                 if image_condition_cross_tail_bridge:
                     if (len(predictions_cond) != 3
                             or predictions_cond[0].size(1) !=
@@ -1938,7 +2113,8 @@ class WanI2V:
                     cross_tail_b_pred_cond = predictions_cond[1]
                     cross_tail_d_pred_cond = predictions_cond[2]
                     del predictions_cond
-                elif image_condition_joint_img2_guidance:
+                elif (image_condition_joint_img2_guidance
+                      and joint_guidance_active):
                     if (len(predictions_cond) != 2
                             or predictions_cond[0].size(1) != latent_frame_num
                             or predictions_cond[1].size(1) !=
@@ -1948,7 +2124,7 @@ class WanI2V:
                             "have incorrect lengths")
                     noise_pred_cond = predictions_cond[0]
                     if joint_guidance_b_latent is not None:
-                        joint_guidance_b_pred_cond = predictions_cond[1]
+                        joint_guidance_b_pred_cond = predictions_cond[1][:, :1]
                     if image_condition_joint_img2_guidance_shifted_anchor:
                         noise_pred_cond = noise_pred_cond.clone()
                         noise_pred_cond[:,
@@ -2050,7 +2226,8 @@ class WanI2V:
                     cross_tail_b_pred_uncond = predictions_uncond[1]
                     cross_tail_d_pred_uncond = predictions_uncond[2]
                     del predictions_uncond
-                elif image_condition_joint_img2_guidance:
+                elif (image_condition_joint_img2_guidance
+                      and joint_guidance_active):
                     if (len(predictions_uncond) != 2
                             or predictions_uncond[0].size(1) !=
                             latent_frame_num
@@ -2061,7 +2238,7 @@ class WanI2V:
                             "have incorrect lengths")
                     noise_pred_uncond = predictions_uncond[0]
                     if joint_guidance_b_latent is not None:
-                        joint_guidance_b_pred_uncond = predictions_uncond[1]
+                        joint_guidance_b_pred_uncond = predictions_uncond[1][:, :1]
                     if image_condition_joint_img2_guidance_shifted_anchor:
                         noise_pred_uncond = noise_pred_uncond.clone()
                         noise_pred_uncond[:,
@@ -2128,7 +2305,26 @@ class WanI2V:
                     torch.cuda.empty_cache()
                 noise_pred = noise_pred_uncond + sample_guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
-                if joint_guidance_b_latent is not None:
+                if (image_condition_joint_img2_guidance
+                        and not joint_guidance_active):
+                    if noise_pred.size(1) != latent_frame_num - 1:
+                        raise RuntimeError(
+                            "post-handoff Img1 prediction must omit J anchor")
+                    # The multistep scheduler keeps its original 21-slot
+                    # tensor/history shape. Reinsert an isolated placeholder
+                    # prediction for discarded J10; it never enters the DiT
+                    # again, so it cannot affect retained-frame attention.
+                    placeholder_prediction = 0.5 * (
+                        noise_pred[:, anchor_index - 1:anchor_index]
+                        + noise_pred[:, anchor_index:anchor_index + 1])
+                    noise_pred = torch.cat([
+                        noise_pred[:, :anchor_index],
+                        placeholder_prediction,
+                        noise_pred[:, anchor_index:]
+                    ], dim=1)
+                    del placeholder_prediction
+                if (joint_guidance_b_latent is not None
+                        and joint_guidance_active):
                     joint_guidance_b_noise_pred = (
                         joint_guidance_b_pred_uncond
                         + sample_guide_scale * (
@@ -2167,20 +2363,20 @@ class WanI2V:
                 del noise_pred_cond, noise_pred_uncond, noise_pred
                 latent = temp_x0.squeeze(0)
                 del temp_x0
-                if joint_guidance_b_latent is not None:
+                if (joint_guidance_b_latent is not None
+                        and joint_guidance_active):
                     b_temp_x0 = joint_guidance_b_scheduler.step(
                         joint_guidance_b_noise_pred.unsqueeze(0),
                         t,
-                        joint_guidance_b_latent.unsqueeze(0),
+                        joint_guidance_b_latent[:, :1].unsqueeze(0),
                         return_dict=False,
                         generator=seed_g)[0]
-                    joint_guidance_b_latent = b_temp_x0.squeeze(0)
-                    # Both positions began from identical noise and received
-                    # the same CFG-combined B1 velocity. Synchronize the
-                    # canonical J anchor after the two independent scheduler
-                    # calls to eliminate any solver/numerical drift.
-                    latent[:, anchor_index:anchor_index + 1].copy_(
-                        joint_guidance_b_latent[:, 1:2])
+                    # Only B0 is scheduled. Cache the full aligned view using
+                    # J's newly scheduled suffix, including its B1-guided
+                    # anchor. J remains the sole owner of B1+ noisy states.
+                    joint_guidance_b_latent = torch.cat([
+                        b_temp_x0.squeeze(0), latent[:, anchor_index:]
+                    ], dim=1)
                     del (b_temp_x0, joint_guidance_b_noise_pred,
                          joint_guidance_b_pred_cond,
                          joint_guidance_b_pred_uncond)

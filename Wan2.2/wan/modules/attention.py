@@ -1,7 +1,77 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
+
+_joint_attention_samples = ContextVar('joint_attention_samples', default=None)
+_joint_alpha_samples = ContextVar('joint_alpha_samples', default=None)
+
+
+@contextmanager
+def collect_joint_attention_shares(enabled=False):
+    """Collect conditional J attention only within the current model call."""
+    samples = []
+    token = _joint_attention_samples.set(samples if enabled else None)
+    try:
+        yield samples
+    finally:
+        _joint_attention_samples.reset(token)
+
+
+@contextmanager
+def collect_joint_adaptive_alpha_stats(enabled=False):
+    """Collect per-layer adaptive-alpha summaries for one model call."""
+    samples = []
+    token = _joint_alpha_samples.set(samples if enabled else None)
+    try:
+        yield samples
+    finally:
+        _joint_alpha_samples.reset(token)
+
+
+def _record_joint_attention_shares(q, k, anchor_index, tokens_per_frame,
+                                   suffix_q=None, suffix_k=None,
+                                   prefix_anchor_visible=True):
+    """Exact group probabilities, chunked to avoid a full attention matrix."""
+    samples = _joint_attention_samples.get()
+    if samples is None:
+        return
+    sums = []
+    count = 0
+    for query_frame, targets in (
+            (anchor_index - 1, (anchor_index, anchor_index + 1)),
+            (anchor_index + 1, (anchor_index, anchor_index - 1))):
+        query = q[:, query_frame * tokens_per_frame:
+                  (query_frame + 1) * tokens_per_frame]
+        memory = k
+        if query_frame > anchor_index and suffix_q is not None:
+            query = suffix_q[:, :tokens_per_frame]
+            memory = suffix_k
+        if query_frame < anchor_index and not prefix_anchor_visible:
+            # The anchor was removed from prefix K/V. The original first
+            # suffix frame consequently occupies ``anchor_index`` in this
+            # compact diagnostic memory.
+            targets = (None, anchor_index)
+        group_sums = q.new_zeros(2, dtype=torch.float32)
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            keys = memory.transpose(1, 2).float().transpose(-2, -1)
+            for start in range(0, query.size(1), 16):
+                logits = torch.matmul(
+                    query[:, start:start + 16].transpose(1, 2).float(),
+                    keys) * (q.size(-1) ** -0.5)
+                normalizer = torch.logsumexp(logits, dim=-1)
+                for index, frame in enumerate(targets):
+                    if frame is None:
+                        continue
+                    group_lse = torch.logsumexp(
+                        logits[..., frame * tokens_per_frame:
+                               (frame + 1) * tokens_per_frame], dim=-1)
+                    group_sums[index] += (group_lse - normalizer).exp().sum()
+        sums.append(group_sums)
+        count = query.size(0) * query.size(1) * query.size(2)
+    samples.append(torch.cat([*sums, q.new_tensor([count], dtype=torch.float32)]))
 
 try:
     import flash_attn_interface
@@ -19,6 +89,8 @@ import warnings
 
 __all__ = [
     'flash_attention',
+    'collect_joint_adaptive_alpha_stats',
+    'collect_joint_attention_shares',
     'cross_tail_bridge_attention',
     'cross_tail_bridge_rope',
     'one_way_img2_attention',
@@ -262,6 +334,10 @@ def joint_img2_guidance_attention(
     anchor_index,
     img2_weight=0.25,
     rope_compression=False,
+    adaptive_pair_attention=False,
+    adaptive_pair_margin=1.05,
+    adaptive_pair_alpha_max=0.7,
+    compression_ratio=1.0,
     freqs=None,
     window_size=(-1, -1),
     dtype=torch.bfloat16,
@@ -280,6 +356,8 @@ def joint_img2_guidance_attention(
         raise ValueError("joint Img2 guidance requires global self-attention")
     if not 0.0 <= img2_weight <= 1.0:
         raise ValueError("joint Img2 guidance weight must be in [0, 1]")
+    if not 0.0 <= compression_ratio <= 1.0:
+        raise ValueError("joint RoPE compression ratio must be in [0, 1]")
 
     frames, height, width = (
         int(value) for value in grid_sizes[0].tolist())
@@ -319,16 +397,22 @@ def joint_img2_guidance_attention(
             joint_k[:, :anchor_end],
             _shift_temporal_rope(joint_k[:, anchor_end:], -1, freqs),
         ], dim=1)
-        # Suffix queries and their native anchor/suffix memory are both shifted
-        # left. This preserves suffix-to-suffix relative offsets while making
-        # the last prefix key and anchor key colocated:
-        # [..., J9@9, J10@9, J11@10, J12@11].
+        # Suffix queries read all J frames using compressed RoPE. Shift both
+        # suffix queries and anchor/suffix keys left by one, colocating J9/J10
+        # while preserving relative offsets within the suffix. J11 is then
+        # one temporal step from both J9 and J10 in either ablation.
         compressed_suffix_q = _shift_temporal_rope(
-            joint_q[:, anchor_end:], -1, freqs)
+            joint_q[:, anchor_end:], -1.0, freqs)
         suffix_k = torch.cat([
             joint_k[:, :aligned_start],
-            _shift_temporal_rope(joint_k[:, aligned_start:], -1, freqs),
+            _shift_temporal_rope(
+                joint_k[:, aligned_start:], -1.0, freqs),
         ], dim=1)
+        _record_joint_attention_shares(
+            joint_q, prefix_k, anchor_index, tokens_per_frame,
+            compressed_suffix_q, suffix_k)
+        # Prefix queries read all J memory, including the anchor and its
+        # colocated first suffix neighbour, with no mass correction.
         prefix_output = flash_attention(
             q=joint_q[:, :aligned_start],
             k=prefix_k,
@@ -350,6 +434,9 @@ def joint_img2_guidance_attention(
         joint_output = torch.cat(
             [prefix_output, anchor_output, suffix_output], dim=1)
     else:
+        _record_joint_attention_shares(
+            q[0:1, :joint_seq_len], k[0:1, :joint_seq_len],
+            anchor_index, tokens_per_frame)
         joint_output = flash_attention(
             q=q[0:1, :joint_seq_len],
             k=k[0:1, :joint_seq_len],
@@ -1253,6 +1340,105 @@ def _shared_position_prior_attention(
     if return_lse:
         return output, torch.logsumexp(group_lse, dim=-1)
     return output
+
+
+def _adaptive_shared_position_attention(
+    q,
+    ordinary_k,
+    ordinary_v,
+    anchor_k,
+    anchor_v,
+    neighbour_k,
+    neighbour_v,
+    margin=1.05,
+    alpha_max=0.7,
+    control_strength=1.0,
+    suppress_anchor_with_control=False,
+    diagnostic_route=None,
+    window_size=(-1, -1),
+    dtype=torch.bfloat16,
+):
+    """Control a shared-position anchor/neighbour pair.
+
+    ``anchor_lse`` and ``neighbour_lse`` are the log evidences of the two
+    colocated frame groups.  Their exact equality threshold is
+    ``sigmoid(neighbour_lse - anchor_lse)``.  Applying the margin and cap to
+    that tensor independently preserves spatial/head-specific correspondence
+    instead of allowing unrelated queries to cancel in one layer mean.
+
+    For prefix queries, that adaptive prior continues to favour the anchor.
+    For suffix queries, ``suppress_anchor_with_control`` instead interprets
+    ``control_strength`` as a deterministic anchor-suppression alpha: zero
+    leaves both groups untouched and one removes the anchor group entirely.
+    """
+    if margin < 1.0:
+        raise ValueError("adaptive pair margin must be at least one")
+    if not 0.5 <= alpha_max < 1.0:
+        raise ValueError("adaptive pair alpha max must be in [0.5, 1)")
+    if not 0.0 <= control_strength <= 1.0:
+        raise ValueError("adaptive pair control strength must be in [0, 1]")
+
+    ordinary_output, ordinary_lse = flash_attention(
+        q=q, k=ordinary_k, v=ordinary_v, window_size=window_size,
+        dtype=dtype, return_lse=True)
+    anchor_output, anchor_lse = flash_attention(
+        q=q, k=anchor_k, v=anchor_v, window_size=window_size,
+        dtype=dtype, return_lse=True)
+    neighbour_output, neighbour_lse = flash_attention(
+        q=q, k=neighbour_k, v=neighbour_v, window_size=window_size,
+        dtype=dtype, return_lse=True)
+
+    with torch.no_grad():
+        alpha_min = torch.sigmoid(
+            neighbour_lse.detach() - anchor_lse.detach())
+        alpha = (alpha_min * float(margin)).clamp(
+            min=1.0e-4, max=float(alpha_max))
+        if suppress_anchor_with_control:
+            # As suffix RoPE compresses J9/J10 into one temporal position,
+            # fade duplicate J10 memory out and leave J9 untouched. At zero
+            # compression this is exactly the original, uncontrolled
+            # attention; at full compression suffix queries cannot read J10.
+            suppression_alpha = float(control_strength)
+            anchor_weight = torch.full_like(alpha, 1.0 - suppression_alpha)
+            neighbour_weight = torch.ones_like(alpha)
+            diagnostic_alpha = torch.full_like(alpha, suppression_alpha)
+            capped = torch.full_like(
+                alpha, suppression_alpha >= 1.0 - 1.0e-6,
+                dtype=torch.bool)
+        else:
+            anchor_weight = ((1.0 - float(control_strength))
+                             + float(control_strength) * alpha)
+            neighbour_weight = ((1.0 - float(control_strength))
+                                + float(control_strength) * (1.0 - alpha))
+            diagnostic_alpha = (
+                anchor_weight / (anchor_weight + neighbour_weight))
+            capped = alpha >= (float(alpha_max) - 1.0e-6)
+
+        alpha_samples = _joint_alpha_samples.get()
+        if alpha_samples is not None and diagnostic_route is not None:
+            anchor_wins = (
+                anchor_lse.detach() + torch.log(anchor_weight)
+                >= neighbour_lse.detach() + torch.log(neighbour_weight))
+            alpha_samples.append(torch.stack([
+                alpha.new_tensor(float(diagnostic_route)),
+                diagnostic_alpha.sum(),
+                alpha.new_tensor(alpha.numel()),
+                capped.sum(),
+                anchor_wins.sum(),
+            ]).float())
+
+    group_lse = torch.stack([
+        ordinary_lse,
+        anchor_lse + torch.log(anchor_weight),
+        neighbour_lse + torch.log(neighbour_weight),
+    ], dim=-1)
+    group_weights = group_lse.softmax(dim=-1).unsqueeze(-1)
+    group_outputs = torch.stack([
+        ordinary_output.float(), anchor_output.float(),
+        neighbour_output.float()
+    ], dim=-2)
+    return (group_weights * group_outputs).sum(dim=-2).to(
+        ordinary_output.dtype)
 
 
 def self_attention_guidance_attention(

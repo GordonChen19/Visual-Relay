@@ -81,6 +81,10 @@ def sp_dit_forward(
     joint_img2_guidance_anchor_index=None,
     joint_img2_guidance_weight=0.25,
     joint_img2_guidance_rope_compression=False,
+    joint_img2_guidance_adaptive_pair_attention=False,
+    joint_img2_guidance_adaptive_pair_margin=1.05,
+    joint_img2_guidance_adaptive_pair_alpha_max=0.7,
+    joint_img2_guidance_compression_ratio=1.0,
     cross_tail_bridge_anchor_index=None,
     cross_tail_bridge_tail_frames=4,
     cross_tail_bridge_memory_prior=0.2,
@@ -181,6 +185,14 @@ def sp_dit_forward(
         joint_img2_guidance_weight=joint_img2_guidance_weight,
         joint_img2_guidance_rope_compression=(
             joint_img2_guidance_rope_compression),
+        joint_img2_guidance_adaptive_pair_attention=(
+            joint_img2_guidance_adaptive_pair_attention),
+        joint_img2_guidance_adaptive_pair_margin=(
+            joint_img2_guidance_adaptive_pair_margin),
+        joint_img2_guidance_adaptive_pair_alpha_max=(
+            joint_img2_guidance_adaptive_pair_alpha_max),
+        joint_img2_guidance_compression_ratio=(
+            joint_img2_guidance_compression_ratio),
         cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
         cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,
         cross_tail_bridge_memory_prior=cross_tail_bridge_memory_prior,
@@ -231,6 +243,10 @@ def sp_attn_forward(self,
                     joint_img2_guidance_anchor_index=None,
                     joint_img2_guidance_weight=0.25,
                     joint_img2_guidance_rope_compression=False,
+                    joint_img2_guidance_adaptive_pair_attention=False,
+                    joint_img2_guidance_adaptive_pair_margin=1.05,
+                    joint_img2_guidance_adaptive_pair_alpha_max=0.7,
+                    joint_img2_guidance_compression_ratio=1.0,
                     cross_tail_bridge_anchor_index=None,
                     cross_tail_bridge_tail_frames=4,
                     cross_tail_bridge_memory_prior=0.2,
@@ -282,6 +298,14 @@ def sp_attn_forward(self,
         joint_img2_guidance_weight=joint_img2_guidance_weight,
         joint_img2_guidance_rope_compression=(
             joint_img2_guidance_rope_compression),
+        joint_img2_guidance_adaptive_pair_attention=(
+            joint_img2_guidance_adaptive_pair_attention),
+        joint_img2_guidance_adaptive_pair_margin=(
+            joint_img2_guidance_adaptive_pair_margin),
+        joint_img2_guidance_adaptive_pair_alpha_max=(
+            joint_img2_guidance_adaptive_pair_alpha_max),
+        joint_img2_guidance_compression_ratio=(
+            joint_img2_guidance_compression_ratio),
         cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
         cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,
         cross_tail_bridge_memory_prior=cross_tail_bridge_memory_prior,
