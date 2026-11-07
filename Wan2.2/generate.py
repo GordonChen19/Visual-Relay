@@ -120,6 +120,10 @@ def _validate_args(args):
             assert args.image_condition_joint_img2_guidance, (
                 "--image_condition_joint_img2_guidance_shifted_anchor "
                 "requires --image_condition_joint_img2_guidance.")
+        if args.image_condition_joint_img2_guidance_single_frame_anchor:
+            assert args.image_condition_joint_img2_guidance, (
+                "--image_condition_joint_img2_guidance_single_frame_anchor "
+                "requires --image_condition_joint_img2_guidance.")
         if args.image_condition_joint_img2_guidance_rope_compression:
             assert args.image_condition_joint_img2_guidance_shifted_anchor, (
                 "--image_condition_joint_img2_guidance_rope_compression "
@@ -672,6 +676,14 @@ def _parse_args():
               "DiT, B1 "
               "replaces J's aligned anchor velocity. B is rebuilt from J "
               "noise each step and is never scheduled independently."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_single_frame_anchor",
+        action="store_true",
+        help=("Experimental contextual single-frame Img2 VAE encoding: "
+              "replace Img2x4 with one pixel frame, retain causal convolution "
+              "history, and bypass the encoder's temporal downsampling at "
+              "the anchor as for a first frame. Keeps the latent count, "
+              "attention, B encoding, and velocity replacement unchanged."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_rope_compression",
         action="store_true",
@@ -1321,6 +1333,8 @@ def generate(args):
                 args.image_condition_joint_img2_guidance_weight),
             image_condition_joint_img2_guidance_shifted_anchor=(
                 args.image_condition_joint_img2_guidance_shifted_anchor),
+            image_condition_joint_img2_guidance_single_frame_anchor=(
+                args.image_condition_joint_img2_guidance_single_frame_anchor),
             image_condition_joint_img2_guidance_rope_compression=(
                 args.image_condition_joint_img2_guidance_rope_compression),
             image_condition_joint_img2_guidance_static_b_prompt=(

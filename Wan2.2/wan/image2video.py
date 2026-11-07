@@ -263,6 +263,7 @@ class WanI2V:
                  image_condition_joint_img2_guidance=False,
                  image_condition_joint_img2_guidance_weight=0.25,
                  image_condition_joint_img2_guidance_shifted_anchor=False,
+                 image_condition_joint_img2_guidance_single_frame_anchor=False,
                  image_condition_joint_img2_guidance_rope_compression=False,
                  image_condition_joint_img2_guidance_static_b_prompt=False,
                  image_condition_joint_img2_guidance_persistent_b=False,
@@ -491,6 +492,9 @@ class WanI2V:
                 "shared one-way anchor update requires one-way prompt guidance")
         if not 0 <= image_condition_joint_img2_guidance_weight <= 1:
             raise ValueError("joint Img2 guidance weight must be in [0, 1]")
+        if (image_condition_joint_img2_guidance_single_frame_anchor
+                and not image_condition_joint_img2_guidance):
+            raise ValueError("single-frame anchor requires joint Img2 guidance")
         if (image_condition_joint_img2_guidance_rope_compression
                 and not image_condition_joint_img2_guidance_shifted_anchor):
             raise ValueError(
@@ -988,8 +992,9 @@ class WanI2V:
             ], dim=1).to(self.device)
 
         def joint_anchor_conditioning_video(first_image, anchor_image,
-                                            pixel_frames, latent_index):
-            """Build Img1 ... Img2x4 ... for one causal joint VAE encode."""
+                                            pixel_frames, latent_index,
+                                            single_frame_anchor=False):
+            """Build joint conditioning, optionally compacting Img2x4 to Img2x1."""
             first = torch.nn.functional.interpolate(
                 first_image[None].cpu(), size=(h, w),
                 mode='bicubic').to(self.device)[0]
@@ -1006,6 +1011,13 @@ class WanI2V:
                 raise ValueError("joint Img2 anchor exceeds conditioning video")
             video[:, anchor_pixel_start:anchor_pixel_end].copy_(
                 anchor[:, None].expand(-1, self.vae_stride[0], -1, -1))
+            if single_frame_anchor:
+                # The custom encoder consumes this anchor as one pixel frame.
+                # Keep the ordinary four-frame chunks before and after it.
+                video = torch.cat([
+                    video[:, :anchor_pixel_start + 1],
+                    video[:, anchor_pixel_end:]
+                ], dim=1)
             return video
 
         if not 0.0 <= image_condition_paired_prefix_future_eta <= 1.0:
@@ -1018,7 +1030,9 @@ class WanI2V:
             encoded = self.vae.encode([
                 conditioning_video(imgs[0], m_pixel_frames),
                 joint_anchor_conditioning_video(
-                    imgs[0], imgs[1], F, anchor_index),
+                    imgs[0], imgs[1], F, anchor_index,
+                    single_frame_anchor=(
+                        image_condition_joint_img2_guidance_single_frame_anchor)),
                 conditioning_video(imgs[1], b_pixel_frames),
             ])
             if (encoded[0].size(1) != cross_tail_m_frame_num
@@ -1088,7 +1102,21 @@ class WanI2V:
                     imgs[0], imgs[1], F, anchor_index),
                 conditioning_video(imgs[1], suffix_frame_num),
             ]
-            encoded = self.vae.encode(joint_encode_inputs)
+            if image_condition_joint_img2_guidance_single_frame_anchor:
+                encoded = self.vae.encode(
+                    joint_encode_inputs[:1], single_frame_indices=(anchor_index,))
+                # B remains an ordinary Img2-first encode with no restart.
+                encoded += self.vae.encode(joint_encode_inputs[1:])
+                logging.info(
+                    "Single-frame contextual anchor enabled: J%d consumes "
+                    "one Img2 pixel frame; causal convolution history is "
+                    "retained and temporal downsampling alone takes its "
+                    "first-frame bypass. Conditioning input has %d pixels "
+                    "and still produces %d latents. B encoding, attention, "
+                    "velocity replacement, and decoding are unchanged",
+                    anchor_index, joint_encode_inputs[0].size(1), latent_frame_num)
+            else:
+                encoded = self.vae.encode(joint_encode_inputs)
             if (encoded[0].size(1) != latent_frame_num
                     or encoded[1].size(1) != suffix_latent_frame_num):
                 raise RuntimeError(
@@ -1113,8 +1141,7 @@ class WanI2V:
                 logging.info(
                     "Shifted joint Img2 guidance: native %d-latent J is "
                     "jointly VAE-conditioned with Img1 at the beginning and "
-                    "Img2 repeated across all four pixel frames of the "
-                    "interior anchor interval. "
+                    "Img2 represented as %s. "
                     "An "
                     "%d-latent Img2-first B view starts at J%d on the "
                     "aligned timeline, so B1 aligns with J%d. With persistent "
@@ -1125,7 +1152,11 @@ class WanI2V:
                     "the DiT, B1 replaces J%d's predicted velocity in each "
                     "CFG branch; only the resulting J prediction enters the "
                     "scheduler.%s B conditional text is %s",
-                    latent_frame_num, suffix_latent_frame_num,
+                    latent_frame_num,
+                    ("one contextual pixel frame with temporal-downsampler bypass"
+                     if image_condition_joint_img2_guidance_single_frame_anchor
+                     else "four repeated pixel frames in the interior anchor interval"),
+                    suffix_latent_frame_num,
                     anchor_index - 1, anchor_index,
                     (("bidirectionally compressed J RoPE (prefix reads both J%d "
                       "and left-shifted J%d at the same temporal coordinate; "
@@ -1150,7 +1181,7 @@ class WanI2V:
             else:
                 logging.info(
                 "Joint Img2-guidance ablation: native %d-latent J is VAE "
-                "conditioned jointly by Img1 at frame 0 and Img2x4 at latent "
+                "conditioned jointly by Img1 at frame 0 and %s at latent "
                 "%d and uses the global prompt plus temporally relayed local "
                 "prompts 1 and 2. J uses ordinary bidirectional attention "
                 "except that its anchor query reads only itself and its "
@@ -1162,7 +1193,10 @@ class WanI2V:
                 "prefix is unchanged. After all DiT layers, B0 replaces "
                 "J%d's predicted velocity independently in both CFG passes "
                 "before the scheduler step.",
-                latent_frame_num, anchor_index, suffix_latent_frame_num,
+                latent_frame_num,
+                ("contextual Img2x1"
+                 if image_condition_joint_img2_guidance_single_frame_anchor
+                 else "Img2x4"), anchor_index, suffix_latent_frame_num,
                 anchor_index, image_condition_joint_img2_guidance_weight,
                 anchor_index)
         elif image_condition_one_way_prompt_guidance:

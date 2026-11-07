@@ -249,6 +249,21 @@ class PairedAnchorCliTest(unittest.TestCase):
                 '--image', 'img1.png',
                 '--image_condition_joint_img2_guidance_static_b_prompt')
 
+    def test_joint_single_frame_anchor_is_opt_in_and_scoped(self):
+        base = (
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation')
+        args = self.parse(*base, '--image_condition_joint_img2_guidance')
+        self.assertFalse(args.image_condition_joint_img2_guidance_single_frame_anchor)
+        args = self.parse(*base, '--image_condition_joint_img2_guidance',
+                          '--image_condition_joint_img2_guidance_single_frame_anchor')
+        self.assertTrue(args.image_condition_joint_img2_guidance_single_frame_anchor)
+        with self.assertRaises(AssertionError):
+            self.parse(*base,
+                       '--image_condition_joint_img2_guidance_single_frame_anchor')
+
     def test_joint_img2_guidance_persistent_b_is_shifted_only(self):
         args = self.parse(
             '--image', 'img1.png', '--image_latent_index', '0',
