@@ -146,6 +146,7 @@ class WanSelfAttention(nn.Module):
                 joint_img2_guidance_anchor_index=None,
                 joint_img2_guidance_weight=0.25,
                 joint_img2_guidance_rope_compression=False,
+                joint_img2_guidance_prefix_no_anchor=False,
                 cross_tail_bridge_anchor_index=None,
                 cross_tail_bridge_tail_frames=4,
                 cross_tail_bridge_memory_prior=0.2,
@@ -231,6 +232,7 @@ class WanSelfAttention(nn.Module):
                 anchor_index=joint_img2_guidance_anchor_index,
                 img2_weight=joint_img2_guidance_weight,
                 rope_compression=joint_img2_guidance_rope_compression,
+                prefix_no_anchor=joint_img2_guidance_prefix_no_anchor,
                 freqs=freqs,
                 window_size=self.window_size)
         elif one_way_img2_anchor_index is not None:
@@ -461,6 +463,7 @@ class WanAttentionBlock(nn.Module):
         joint_img2_guidance_anchor_index=None,
         joint_img2_guidance_weight=0.25,
         joint_img2_guidance_rope_compression=False,
+        joint_img2_guidance_prefix_no_anchor=False,
         cross_tail_bridge_anchor_index=None,
         cross_tail_bridge_tail_frames=4,
         cross_tail_bridge_memory_prior=0.2,
@@ -509,6 +512,8 @@ class WanAttentionBlock(nn.Module):
             joint_img2_guidance_weight=joint_img2_guidance_weight,
             joint_img2_guidance_rope_compression=(
                 joint_img2_guidance_rope_compression),
+            joint_img2_guidance_prefix_no_anchor=(
+                joint_img2_guidance_prefix_no_anchor),
             cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
             cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,
             cross_tail_bridge_memory_prior=cross_tail_bridge_memory_prior,
@@ -717,6 +722,7 @@ class WanModel(ModelMixin, ConfigMixin):
         joint_img2_guidance_anchor_index=None,
         joint_img2_guidance_weight=0.25,
         joint_img2_guidance_rope_compression=False,
+        joint_img2_guidance_prefix_no_anchor=False,
         cross_tail_bridge_anchor_index=None,
         cross_tail_bridge_tail_frames=4,
         cross_tail_bridge_memory_prior=0.2,
@@ -827,6 +833,8 @@ class WanModel(ModelMixin, ConfigMixin):
             joint_img2_guidance_weight=joint_img2_guidance_weight,
             joint_img2_guidance_rope_compression=(
                 joint_img2_guidance_rope_compression),
+            joint_img2_guidance_prefix_no_anchor=(
+                joint_img2_guidance_prefix_no_anchor),
             cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
             cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,
             cross_tail_bridge_memory_prior=cross_tail_bridge_memory_prior,

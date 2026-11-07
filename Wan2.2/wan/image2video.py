@@ -293,7 +293,8 @@ class WanI2V:
                  image_condition_self_attention_guidance_anchor_prior_start=0.8,
                  image_condition_self_attention_guidance_anchor_prior_end=0.2,
                  image_condition_self_attention_guidance_anchor_prior_end_step=None,
-                 image_condition_self_attention_guidance_stop_step=None):
+                 image_condition_self_attention_guidance_stop_step=None,
+                 image_condition_joint_img2_guidance_prefix_no_anchor=False):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -484,6 +485,16 @@ class WanI2V:
                 "shared one-way anchor update requires one-way prompt guidance")
         if not 0 <= image_condition_joint_img2_guidance_weight <= 1:
             raise ValueError("joint Img2 guidance weight must be in [0, 1]")
+        if (image_condition_joint_img2_guidance_prefix_no_anchor
+                and not (image_condition_joint_img2_guidance
+                         and image_condition_joint_img2_guidance_shifted_anchor
+                         and image_condition_joint_img2_guidance_rope_compression)):
+            raise ValueError(
+                "prefix anchor masking requires compressed shifted joint Img2 guidance")
+        if image_condition_joint_img2_guidance_prefix_no_anchor:
+            logging.info(
+                "J prefix queries exclude the anchor K/V in both CFG branches "
+                "at every denoising step; J suffix retains the anchor")
         if (image_condition_joint_img2_guidance_rope_compression
                 and not image_condition_joint_img2_guidance_shifted_anchor):
             raise ValueError(
@@ -1513,6 +1524,8 @@ class WanI2V:
                     image_condition_joint_img2_guidance_weight,
                     'joint_img2_guidance_rope_compression':
                     image_condition_joint_img2_guidance_rope_compression,
+                    'joint_img2_guidance_prefix_no_anchor':
+                    image_condition_joint_img2_guidance_prefix_no_anchor,
                     'temporal_prompt_relay': temporal_prompt_relay,
                 }
                 arg_null = {
@@ -1524,6 +1537,8 @@ class WanI2V:
                     image_condition_joint_img2_guidance_weight,
                     'joint_img2_guidance_rope_compression':
                     image_condition_joint_img2_guidance_rope_compression,
+                    'joint_img2_guidance_prefix_no_anchor':
+                    image_condition_joint_img2_guidance_prefix_no_anchor,
                 }
             elif image_condition_one_way_prompt_guidance:
                 arg_c = {

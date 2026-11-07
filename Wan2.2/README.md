@@ -202,6 +202,19 @@ python generate.py --task i2v-A14B --size 1280*720 --ckpt_dir ./Wan2.2-I2V-A14B 
 
 > 💡For the Image-to-Video task, the `size` parameter represents the area of the generated video, with the aspect ratio following that of the original input image.
 
+For compressed shifted-anchor joint Img2 guidance, opt into directional anchor
+masking with `--image_condition_joint_img2_guidance_prefix_no_anchor`. This
+requires `--image_condition_joint_img2_guidance`,
+`--image_condition_joint_img2_guidance_shifted_anchor`, and
+`--image_condition_joint_img2_guidance_rope_compression`. With anchor index 10,
+all J-prefix queries (model latent slots 0 through 9) exclude slot 10's K/V;
+J-suffix queries (slots 11 onward) retain it. The mask applies to every layer
+and denoising step, in both CFG branches. All retained RoPE coordinates, the
+anchor-query route, and the independent B stream keep their existing behavior.
+Frame numbers here are zero-based model latent slots before anchor removal,
+not decoded video-frame numbers. This flag is off by default. It defines an
+attention ablation; its effect on color and camera motion requires evaluation.
+
 Experimental paired-anchor attention keeps the upstream single-image path as
 the default. To condition an internal latent on a second image, repeat
 `--image` and `--image_latent_index`, then enable the paired mode:

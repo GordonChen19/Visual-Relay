@@ -265,6 +265,7 @@ def joint_img2_guidance_attention(
     freqs=None,
     window_size=(-1, -1),
     dtype=torch.bfloat16,
+    prefix_no_anchor=False,
 ):
     """Guide a native joint Img1/Img2 stream with an Img2-first suffix.
 
@@ -273,6 +274,9 @@ def joint_img2_guidance_attention(
     ordinary bidirectional attention. Optional shifted-anchor RoPE compression
     gives prefix and suffix queries distinct anchor-key coordinates and limits
     the anchor query to itself/future frames. B always retains ordinary RoPE.
+    With ``prefix_no_anchor``, every pre-anchor query excludes the anchor K/V
+    from its softmax. Suffix queries still read the anchor. This option requires
+    compressed RoPE and preserves all relative coordinates.
     """
     if q.size(0) != 2 or k.size(0) != 2 or v.size(0) != 2:
         raise ValueError("joint Img2 guidance requires exactly J and B streams")
@@ -280,6 +284,8 @@ def joint_img2_guidance_attention(
         raise ValueError("joint Img2 guidance requires global self-attention")
     if not 0.0 <= img2_weight <= 1.0:
         raise ValueError("joint Img2 guidance weight must be in [0, 1]")
+    if prefix_no_anchor and not rope_compression:
+        raise ValueError("prefix anchor masking requires joint RoPE compression")
 
     frames, height, width = (
         int(value) for value in grid_sizes[0].tolist())
@@ -319,6 +325,16 @@ def joint_img2_guidance_attention(
             joint_k[:, :anchor_end],
             _shift_temporal_rope(joint_k[:, anchor_end:], -1, freqs),
         ], dim=1)
+        prefix_v = joint_v
+        if prefix_no_anchor:
+            # All prefix rows use the same mask: drop only the anchor K/V.
+            # Retained past/future keys keep their compressed coordinates.
+            prefix_k = torch.cat([
+                prefix_k[:, :aligned_start], prefix_k[:, anchor_end:]
+            ], dim=1)
+            prefix_v = torch.cat([
+                joint_v[:, :aligned_start], joint_v[:, anchor_end:]
+            ], dim=1)
         # Suffix queries and their native anchor/suffix memory are both shifted
         # left. This preserves suffix-to-suffix relative offsets while making
         # the last prefix key and anchor key colocated:
@@ -332,7 +348,7 @@ def joint_img2_guidance_attention(
         prefix_output = flash_attention(
             q=joint_q[:, :aligned_start],
             k=prefix_k,
-            v=joint_v,
+            v=prefix_v,
             window_size=window_size,
             dtype=dtype)
         anchor_output = flash_attention(

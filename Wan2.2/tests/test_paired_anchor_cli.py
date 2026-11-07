@@ -219,6 +219,22 @@ class PairedAnchorCliTest(unittest.TestCase):
                 '--image', 'img1.png',
                 '--image_condition_joint_img2_guidance_static_b_prompt')
 
+    def test_prefix_anchor_mask_requires_compressed_shifted_joint_mode(self):
+        options = (
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation',
+            '--image_condition_joint_img2_guidance',
+            '--image_condition_joint_img2_guidance_shifted_anchor')
+        self.assertFalse(self.parse(*options).image_condition_joint_img2_guidance_prefix_no_anchor)
+        with self.assertRaises(AssertionError):
+            self.parse(*options, '--image_condition_joint_img2_guidance_prefix_no_anchor')
+        args = self.parse(*options,
+                          '--image_condition_joint_img2_guidance_rope_compression',
+                          '--image_condition_joint_img2_guidance_prefix_no_anchor')
+        self.assertTrue(args.image_condition_joint_img2_guidance_prefix_no_anchor)
+
     def test_joint_img2_guidance_persistent_b_is_shifted_only(self):
         args = self.parse(
             '--image', 'img1.png', '--image_latent_index', '0',

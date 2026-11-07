@@ -22,6 +22,11 @@ and predicts only the hidden transport slot that is discarded before decode.
 Run the CPU dense-reference attention tests with PyTorch installed:
 `python3 -m unittest discover -s tests -p 'test_paired_anchor*.py'`.
 
+The directional prefix mask has an additional standalone dense-reference test:
+`python3 -m unittest discover -s tests -p 'test_prefix_no_anchor.py'`.
+It checks that every prefix query drops only the anchor K/V and that the
+suffix, anchor, and B outputs stay identical for fixed layer inputs.
+
 ```bash
 bash ./tests/test.sh <local model dir> <gpu number>
 ```

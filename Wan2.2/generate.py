@@ -124,6 +124,10 @@ def _validate_args(args):
             assert args.image_condition_joint_img2_guidance_shifted_anchor, (
                 "--image_condition_joint_img2_guidance_rope_compression "
                 "requires --image_condition_joint_img2_guidance_shifted_anchor.")
+        if args.image_condition_joint_img2_guidance_prefix_no_anchor:
+            assert args.image_condition_joint_img2_guidance_rope_compression, (
+                "--image_condition_joint_img2_guidance_prefix_no_anchor "
+                "requires --image_condition_joint_img2_guidance_rope_compression.")
         if args.image_condition_joint_img2_guidance_static_b_prompt:
             assert args.image_condition_joint_img2_guidance, (
                 "--image_condition_joint_img2_guidance_static_b_prompt "
@@ -670,6 +674,12 @@ def _parse_args():
         help=("Condition B on the global --prompt followed by 'No motion in "
               "the video occurs.' instead of global prompt plus local image "
               "prompt 2. J and its Prompt Relay are unchanged."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_prefix_no_anchor",
+        action="store_true",
+        help=("Exclude the interior anchor K/V from every J-prefix query. "
+              "J-suffix queries still read the anchor. Requires compressed "
+              "shifted-anchor J/B; applies to both CFG branches at every step."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_persistent_b",
         action="store_true",
@@ -1263,6 +1273,8 @@ def generate(args):
                 args.image_condition_joint_img2_guidance_shifted_anchor),
             image_condition_joint_img2_guidance_rope_compression=(
                 args.image_condition_joint_img2_guidance_rope_compression),
+            image_condition_joint_img2_guidance_prefix_no_anchor=(
+                args.image_condition_joint_img2_guidance_prefix_no_anchor),
             image_condition_joint_img2_guidance_static_b_prompt=(
                 args.image_condition_joint_img2_guidance_static_b_prompt),
             image_condition_joint_img2_guidance_persistent_b=(
