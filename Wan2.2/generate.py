@@ -686,9 +686,9 @@ def _parse_args():
     parser.add_argument(
         "--image_condition_joint_img2_guidance_static_b_prompt",
         action="store_true",
-        help=("Condition B on the global --prompt followed by 'No motion in "
-              "the video occurs.' instead of global prompt plus local image "
-              "prompt 2. J and its Prompt Relay are unchanged."))
+        help=("Deprecated compatibility flag. B always uses the global "
+              "--prompt plus local image prompt 2; no static-motion sentence "
+              "is appended."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_persistent_b",
         action="store_true",
@@ -721,13 +721,15 @@ def _parse_args():
               "colocated with the last prefix frame. No "
               "attention-mass correction or gradual temporal shift is "
               "applied. At the end step, hand off to "
-              "ordinary single-stream Img1 I2V."))
+              "ordinary single-stream attention with the anchor removed "
+              "and the retained joint VAE conditioning preserved."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_adaptive_pair_end_step",
         type=int,
         default=10,
-        help=("First zero-based sampling step that uses ordinary Img1 I2V "
-              "instead of adaptive joint guidance (default: 10)."))
+        help=("First zero-based sampling step that removes the anchor and "
+              "uses ordinary single-stream attention with retained joint "
+              "VAE conditioning (default: 10)."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_adaptive_pair_margin",
         type=float,

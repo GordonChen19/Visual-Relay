@@ -87,6 +87,35 @@ class B0StateTests(unittest.TestCase):
         self.assertEqual(env['joint_guidance_b_latent'].values,
                          [100, -1, -2, -3])
 
+    def test_handoff_preserves_joint_features_and_masks_in_both_cfg_calls(self):
+        def assignment(name):
+            matches = [node for node in ast.walk(self.tree)
+                       if isinstance(node, ast.Assign)
+                       and ast.unparse(node.targets[0]) == name
+                       and isinstance(node.value, (ast.Call, ast.Dict))]
+            self.assertEqual(len(matches), 1)
+            return compile(ast.Module(body=matches, type_ignores=[]),
+                           '<actual conditioning handoff>', 'exec')
+
+        for anchor in (1, 10, 19):
+            with self.subTest(anchor=anchor):
+                # Each frame represents distinct mask and VAE feature data.
+                values = [(i == 0 or i == anchor, 100 + i, 200 + i)
+                          for i in range(21)]
+                env = self.environment()
+                env.update(anchor_index=anchor, joint_y=Frames(values),
+                           context=['J', 'B', 'global'],
+                           context_null=['negative'] * 3, max_seq_len=21)
+                exec(assignment('joint_handoff_y'), env)
+                exec(assignment('joint_handoff_arg_c'), env)
+                exec(assignment('joint_handoff_arg_null'), env)
+                expected = values[:anchor] + values[anchor + 1:]
+                self.assertEqual(env['joint_handoff_y'].values, expected)
+                for name in ('joint_handoff_arg_c', 'joint_handoff_arg_null'):
+                    self.assertIs(env[name]['y'][0], env['joint_handoff_y'])
+                    self.assertEqual(env[name]['y'][0].values, expected)
+                self.assertEqual(env['joint_y'].values, values)
+
 
 if __name__ == '__main__':
     unittest.main()

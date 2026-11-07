@@ -881,15 +881,12 @@ class WanI2V:
                 return ' '.join(part for part in parts if part)
 
             main_text_prompt = join_prompt(global_prompt, *local_prompts)
-            img2_text_prompt = (
-                join_prompt(global_prompt, "No motion in the video occurs.")
-                if (image_condition_joint_img2_guidance
-                    and image_condition_joint_img2_guidance_static_b_prompt)
-                else join_prompt(global_prompt, local_prompts[1]))
+            img2_text_prompt = join_prompt(global_prompt, local_prompts[1])
             text_prompts = [main_text_prompt, img2_text_prompt]
             if image_condition_joint_img2_guidance_adaptive_pair_attention:
-                # The handoff is deliberately ordinary Img1 I2V: global text
-                # only, without Prompt Relay or the Img2-local clause.
+                # The text handoff uses the global prompt only, without
+                # Prompt Relay or the Img2-local clause. Joint VAE image
+                # conditioning is preserved separately on retained frames.
                 text_prompts.append(global_prompt)
             if image_condition_cross_tail_bridge:
                 # B and D share prompt 2. B has joint Img1->Img2 VAE context;
@@ -1091,8 +1088,6 @@ class WanI2V:
                     imgs[0], imgs[1], F, anchor_index),
                 conditioning_video(imgs[1], suffix_frame_num),
             ]
-            if image_condition_joint_img2_guidance_adaptive_pair_attention:
-                joint_encode_inputs.append(conditioning_video(imgs[0], F))
             encoded = self.vae.encode(joint_encode_inputs)
             if (encoded[0].size(1) != latent_frame_num
                     or encoded[1].size(1) != suffix_latent_frame_num):
@@ -1104,17 +1099,15 @@ class WanI2V:
             guidance_local_y = torch.concat([
                 first_frame_mask(suffix_frame_num), encoded[1]
             ])
-            ordinary_img1_y = None
+            joint_handoff_y = None
             if image_condition_joint_img2_guidance_adaptive_pair_attention:
-                full_ordinary_img1_y = torch.concat([msk, encoded[2]])
-                # Post-handoff J10 is absent from the DiT, including its
-                # image-conditioning channels. J9/J11 consequently become
-                # adjacent tokens with ordinary contiguous RoPE.
-                ordinary_img1_y = torch.cat([
-                    full_ordinary_img1_y[:, :anchor_index],
-                    full_ordinary_img1_y[:, anchor_index + 1:]
+                # Remove exactly the same temporal slot as the noisy DiT
+                # input, retaining every other joint VAE feature and mask
+                # channel unchanged. Do not switch to an Img1-only encode.
+                joint_handoff_y = torch.cat([
+                    joint_y[:, :anchor_index],
+                    joint_y[:, anchor_index + 1:]
                 ], dim=1)
-                del full_ordinary_img1_y
             del encoded, joint_mask
             if image_condition_joint_img2_guidance_shifted_anchor:
                 logging.info(
@@ -1153,9 +1146,7 @@ class WanI2V:
                     (" The J anchor is discarded before decoding."
                      if image_condition_joint_img2_guidance_rope_compression
                      else ""),
-                    ("global prompt plus the static-motion sentence."
-                     if image_condition_joint_img2_guidance_static_b_prompt
-                     else "global prompt plus local prompt 2."))
+                    "global prompt plus local prompt 2.")
             else:
                 logging.info(
                 "Joint Img2-guidance ablation: native %d-latent J is VAE "
@@ -1603,12 +1594,12 @@ class WanI2V:
                     joint_handoff_arg_c = {
                         'context': [context[2]],
                         'seq_len': max_seq_len,
-                        'y': [ordinary_img1_y],
+                        'y': [joint_handoff_y],
                     }
                     joint_handoff_arg_null = {
                         'context': [context_null[2]],
                         'seq_len': max_seq_len,
-                        'y': [ordinary_img1_y],
+                        'y': [joint_handoff_y],
                     }
             elif image_condition_one_way_prompt_guidance:
                 arg_c = {
@@ -1866,12 +1857,13 @@ class WanI2V:
                                 image_condition_joint_img2_guidance_adaptive_pair_end_step):
                             logging.info(
                                 "Adaptive pair guidance ended at sampling "
-                                "step %d: B, joint Img2 conditioning, Prompt "
+                                "step %d: B, Prompt "
                                 "Relay, compressed RoPE, B0 scheduling, and "
                                 "anchor velocity replacement are disabled. J10 is removed "
                                 "from the DiT, J9/J11 become adjacent, and "
-                                "ordinary 20-latent bidirectional Img1 I2V "
-                                "continues",
+                                "ordinary 20-latent bidirectional attention "
+                                "continues with retained joint VAE conditioning "
+                                "and the global prompt only",
                                 sampling_step)
                 elif image_condition_one_way_prompt_guidance:
                     current_latent = latent.to(self.device)
@@ -2309,7 +2301,7 @@ class WanI2V:
                         and not joint_guidance_active):
                     if noise_pred.size(1) != latent_frame_num - 1:
                         raise RuntimeError(
-                            "post-handoff Img1 prediction must omit J anchor")
+                            "post-handoff prediction must omit J anchor")
                     # The multistep scheduler keeps its original 21-slot
                     # tensor/history shape. Reinsert an isolated placeholder
                     # prediction for discarded J10; it never enters the DiT
