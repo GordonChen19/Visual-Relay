@@ -54,6 +54,60 @@ exec(compile(ast.Module(body=[resample_forward], type_ignores=[]),
 
 
 class ChunkAndCacheTests(unittest.TestCase):
+    def test_joint_guidance_builder_and_vae_receive_matching_frame_counts(self):
+        """Regression: the flag must reach J's builder, not another mode's."""
+        pipeline_path = ROOT / 'wan/image2video.py'
+        pipeline = ast.parse(pipeline_path.read_text())
+        assignments = [node for node in ast.walk(pipeline)
+                       if isinstance(node, ast.Assign)
+                       and ast.unparse(node.targets[0]) == 'joint_encode_inputs']
+        encoding = [node for node in ast.walk(pipeline)
+                    if isinstance(node, ast.If)
+                    and ast.unparse(node.test) ==
+                    'image_condition_joint_img2_guidance_single_frame_anchor'
+                    and 'self.vae.encode' in ast.unparse(node)]
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(len(encoding), 1)
+        code = compile(ast.Module(body=[assignments[0], encoding[0]],
+                                  type_ignores=[]), str(pipeline_path), 'exec')
+
+        class Video:
+            def __init__(self, frames):
+                self.frames = frames
+
+            def size(self, dimension):
+                assert dimension == 1
+                return self.frames
+
+        for enabled in (False, True):
+            with self.subTest(single_frame_anchor=enabled):
+                calls = []
+
+                def encode(videos, single_frame_indices=None):
+                    calls.append(([v.frames for v in videos], single_frame_indices))
+                    return [Video(len(chunk_plan(v.frames, single_frame_indices)))
+                            for v in videos]
+
+                def joint_builder(first, anchor, frames, index,
+                                  single_frame_anchor=False):
+                    return Video(frames - (3 if single_frame_anchor else 0))
+
+                env = dict(
+                    self=types.SimpleNamespace(
+                        vae=types.SimpleNamespace(encode=encode), vae_stride=(4, 8, 8)),
+                    joint_anchor_conditioning_video=joint_builder,
+                    conditioning_video=lambda image, frames: Video(frames),
+                    imgs=['Img1', 'Img2'], F=81, anchor_index=10,
+                    suffix_frame_num=45, latent_frame_num=21,
+                    image_condition_joint_img2_guidance_single_frame_anchor=enabled,
+                    logging=types.SimpleNamespace(info=lambda *args: None))
+                exec(code, env)
+                self.assertEqual([v.frames for v in env['encoded']], [21, 12])
+                if enabled:
+                    self.assertEqual(calls, [([78], (10,)), ([45], None)])
+                else:
+                    self.assertEqual(calls, [([81, 45], None)])
+
     def test_default_chunks(self):
         plan = chunk_plan(81)
         self.assertEqual(len(plan), 21)

@@ -27,7 +27,11 @@ def _encoding_chunk_plan(pixel_frames, single_frame_indices=None):
         raise ValueError("single-frame indices must be unique positive latent indices")
     expanded_length = pixel_frames + 3 * len(indices)
     if (expanded_length - 1) % 4:
-        raise ValueError("pixel count does not match 1/4-frame encoding chunks")
+        raise ValueError(
+            "pixel count does not match 1/4-frame encoding chunks: got %d "
+            "pixels with single-frame latent indices %s; input length must "
+            "be 1 + 4*(latent_count-1) - 3*boundary_count" %
+            (pixel_frames, indices))
     latent_frames = 1 + (expanded_length - 1) // 4
     if any(i >= latent_frames for i in indices):
         raise ValueError("single-frame boundary exceeds the latent timeline")

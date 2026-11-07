@@ -1030,9 +1030,7 @@ class WanI2V:
             encoded = self.vae.encode([
                 conditioning_video(imgs[0], m_pixel_frames),
                 joint_anchor_conditioning_video(
-                    imgs[0], imgs[1], F, anchor_index,
-                    single_frame_anchor=(
-                        image_condition_joint_img2_guidance_single_frame_anchor)),
+                    imgs[0], imgs[1], F, anchor_index),
                 conditioning_video(imgs[1], b_pixel_frames),
             ])
             if (encoded[0].size(1) != cross_tail_m_frame_num
@@ -1099,10 +1097,18 @@ class WanI2V:
                                 * (suffix_latent_frame_num - 1))
             joint_encode_inputs = [
                 joint_anchor_conditioning_video(
-                    imgs[0], imgs[1], F, anchor_index),
+                    imgs[0], imgs[1], F, anchor_index,
+                    single_frame_anchor=(
+                        image_condition_joint_img2_guidance_single_frame_anchor)),
                 conditioning_video(imgs[1], suffix_frame_num),
             ]
             if image_condition_joint_img2_guidance_single_frame_anchor:
+                expected_pixels = F - (self.vae_stride[0] - 1)
+                if joint_encode_inputs[0].size(1) != expected_pixels:
+                    raise RuntimeError(
+                        "single-frame joint conditioning must compact exactly "
+                        "one anchor interval: expected %d pixel frames, got %d" %
+                        (expected_pixels, joint_encode_inputs[0].size(1)))
                 encoded = self.vae.encode(
                     joint_encode_inputs[:1], single_frame_indices=(anchor_index,))
                 # B remains an ordinary Img2-first encode with no restart.
