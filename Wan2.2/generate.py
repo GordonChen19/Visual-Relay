@@ -136,6 +136,12 @@ def _validate_args(args):
             assert args.image_condition_joint_img2_guidance_shifted_anchor, (
                 "--image_condition_joint_img2_guidance_no_rope_compression "
                 "requires --image_condition_joint_img2_guidance_shifted_anchor.")
+        if args.image_condition_joint_img2_guidance_anchor_rope_offset is not None:
+            assert args.image_condition_joint_img2_guidance_shifted_anchor, (
+                "--image_condition_joint_img2_guidance_anchor_rope_offset "
+                "requires --image_condition_joint_img2_guidance_shifted_anchor.")
+            assert (0.0 <= args.image_condition_joint_img2_guidance_anchor_rope_offset
+                    <= 1.0), "Anchor RoPE offset must be in [0, 1]."
         if args.image_condition_joint_img2_guidance_static_b_prompt:
             assert args.image_condition_joint_img2_guidance, (
                 "--image_condition_joint_img2_guidance_static_b_prompt "
@@ -153,9 +159,11 @@ def _validate_args(args):
                 "Joint attention diagnostics require shifted-anchor guidance.")
         if args.image_condition_joint_img2_guidance_adaptive_pair_attention:
             assert (args.image_condition_joint_img2_guidance_rope_compression
-                    or args.image_condition_joint_img2_guidance_no_rope_compression), (
+                    or args.image_condition_joint_img2_guidance_no_rope_compression
+                    or args.image_condition_joint_img2_guidance_anchor_rope_offset
+                    is not None), (
                 "Adaptive pair attention requires a joint Img2-guidance RoPE "
-                "mode: rope_compression or no_rope_compression.")
+                "mode: rope_compression, no_rope_compression, or anchor_rope_offset.")
             assert (args.image_condition_joint_img2_guidance_adaptive_pair_end_step
                     >= 1), "Adaptive pair end step must be at least 1."
             assert (args.image_condition_joint_img2_guidance_adaptive_pair_margin
@@ -718,6 +726,16 @@ def _parse_args():
               "if both are set. Keeps anchor self/future-only attention, "
               "B0 velocity replacement, and the configured anchor-removal "
               "handoff unchanged. Requires shifted-anchor guidance."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_anchor_rope_offset",
+        type=float,
+        default=None,
+        help=("Place the J anchor key at anchor_index-1+OFFSET for prefix "
+              "and suffix queries, with OFFSET in [0, 1]. For example, "
+              "OFFSET=0.8 puts J10 at 9.8 while J9=9 and J11=10. "
+              "J10's own query reads itself/future at ordinary uncompressed "
+              "offsets. Overrides either other joint RoPE option. Requires "
+              "shifted-anchor guidance; handoff and velocity stay unchanged."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_static_b_prompt",
         action="store_true",
@@ -1362,6 +1380,8 @@ def generate(args):
                 args.image_condition_joint_img2_guidance_rope_compression),
             image_condition_joint_img2_guidance_no_rope_compression=(
                 args.image_condition_joint_img2_guidance_no_rope_compression),
+            image_condition_joint_img2_guidance_anchor_rope_offset=(
+                args.image_condition_joint_img2_guidance_anchor_rope_offset),
             image_condition_joint_img2_guidance_static_b_prompt=(
                 args.image_condition_joint_img2_guidance_static_b_prompt),
             image_condition_joint_img2_guidance_persistent_b=(

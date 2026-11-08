@@ -274,6 +274,7 @@ class WanI2V:
                  image_condition_joint_img2_guidance_single_frame_anchor_history=False,
                  image_condition_joint_img2_guidance_rope_compression=False,
                  image_condition_joint_img2_guidance_no_rope_compression=False,
+                 image_condition_joint_img2_guidance_anchor_rope_offset=None,
                  image_condition_joint_img2_guidance_static_b_prompt=False,
                  image_condition_joint_img2_guidance_persistent_b=False,
                  return_persistent_b_video=False,
@@ -515,6 +516,12 @@ class WanI2V:
                 and not image_condition_joint_img2_guidance_shifted_anchor):
             raise ValueError(
                 "ordinary joint Img2 RoPE requires shifted-anchor guidance")
+        if image_condition_joint_img2_guidance_anchor_rope_offset is not None:
+            if not image_condition_joint_img2_guidance_shifted_anchor:
+                raise ValueError(
+                    "fractional anchor RoPE requires shifted-anchor guidance")
+            if not 0.0 <= image_condition_joint_img2_guidance_anchor_rope_offset <= 1.0:
+                raise ValueError("fractional anchor RoPE offset must be in [0, 1]")
         if (image_condition_joint_img2_guidance_static_b_prompt
                 and not image_condition_joint_img2_guidance):
             raise ValueError(
@@ -534,7 +541,9 @@ class WanI2V:
                 "joint attention diagnostics require shifted-anchor guidance")
         if image_condition_joint_img2_guidance_adaptive_pair_attention:
             if not (image_condition_joint_img2_guidance_rope_compression
-                    or image_condition_joint_img2_guidance_no_rope_compression):
+                    or image_condition_joint_img2_guidance_no_rope_compression
+                    or image_condition_joint_img2_guidance_anchor_rope_offset
+                    is not None):
                 raise ValueError(
                     "adaptive pair attention requires a joint RoPE mode")
             if not (1 <=
@@ -1175,7 +1184,16 @@ class WanI2V:
                      else "four repeated pixel frames in the interior anchor interval"),
                     suffix_latent_frame_num,
                     anchor_index, anchor_index,
-                    ("ordinary integer J and B RoPE (J9/J11 offset 2; "
+                    ("fractional J anchor key at position %d-1+%.3f for "
+                     "prefix/suffix queries; suffix begins at %d and the "
+                     "anchor's own self/future query uses ordinary offsets; "
+                     "B uses ordinary RoPE" %
+                     (anchor_index,
+                      image_condition_joint_img2_guidance_anchor_rope_offset,
+                      anchor_index)
+                     if image_condition_joint_img2_guidance_anchor_rope_offset
+                     is not None else
+                     "ordinary integer J and B RoPE (J9/J11 offset 2; "
                      "J anchor reads only itself/future)"
                      if image_condition_joint_img2_guidance_no_rope_compression else
                      ("bidirectionally compressed J RoPE (prefix reads both J%d "
@@ -1196,7 +1214,9 @@ class WanI2V:
                     anchor_index,
                     (" The J anchor is discarded before decoding."
                      if (image_condition_joint_img2_guidance_rope_compression
-                         or image_condition_joint_img2_guidance_no_rope_compression)
+                         or image_condition_joint_img2_guidance_no_rope_compression
+                         or image_condition_joint_img2_guidance_anchor_rope_offset
+                         is not None)
                      else ""),
                     "global prompt plus local prompt 2.")
             else:
@@ -1605,7 +1625,9 @@ class WanI2V:
                     image_condition_joint_img2_guidance_weight,
                     'joint_img2_guidance_rope_compression':
                     (image_condition_joint_img2_guidance_rope_compression
-                     or image_condition_joint_img2_guidance_no_rope_compression),
+                     or image_condition_joint_img2_guidance_no_rope_compression
+                     or image_condition_joint_img2_guidance_anchor_rope_offset
+                     is not None),
                     'joint_img2_guidance_adaptive_pair_attention':
                     image_condition_joint_img2_guidance_adaptive_pair_attention,
                     'joint_img2_guidance_adaptive_pair_margin':
@@ -1613,8 +1635,12 @@ class WanI2V:
                     'joint_img2_guidance_adaptive_pair_alpha_max':
                     image_condition_joint_img2_guidance_adaptive_pair_alpha_max,
                     'joint_img2_guidance_compression_ratio': (
-                        0.0 if image_condition_joint_img2_guidance_no_rope_compression
+                        0.0 if (image_condition_joint_img2_guidance_no_rope_compression
+                                and image_condition_joint_img2_guidance_anchor_rope_offset
+                                is None)
                         else 1.0),
+                    'joint_img2_guidance_anchor_rope_offset':
+                    image_condition_joint_img2_guidance_anchor_rope_offset,
                     'joint_img2_guidance_velocity_only':
                     image_condition_joint_img2_guidance_shifted_anchor,
                     'temporal_prompt_relay': temporal_prompt_relay,
@@ -1628,7 +1654,9 @@ class WanI2V:
                     image_condition_joint_img2_guidance_weight,
                     'joint_img2_guidance_rope_compression':
                     (image_condition_joint_img2_guidance_rope_compression
-                     or image_condition_joint_img2_guidance_no_rope_compression),
+                     or image_condition_joint_img2_guidance_no_rope_compression
+                     or image_condition_joint_img2_guidance_anchor_rope_offset
+                     is not None),
                     'joint_img2_guidance_adaptive_pair_attention':
                     image_condition_joint_img2_guidance_adaptive_pair_attention,
                     'joint_img2_guidance_adaptive_pair_margin':
@@ -1636,8 +1664,12 @@ class WanI2V:
                     'joint_img2_guidance_adaptive_pair_alpha_max':
                     image_condition_joint_img2_guidance_adaptive_pair_alpha_max,
                     'joint_img2_guidance_compression_ratio': (
-                        0.0 if image_condition_joint_img2_guidance_no_rope_compression
+                        0.0 if (image_condition_joint_img2_guidance_no_rope_compression
+                                and image_condition_joint_img2_guidance_anchor_rope_offset
+                                is None)
                         else 1.0),
+                    'joint_img2_guidance_anchor_rope_offset':
+                    image_condition_joint_img2_guidance_anchor_rope_offset,
                     'joint_img2_guidance_velocity_only':
                     image_condition_joint_img2_guidance_shifted_anchor,
                 }
@@ -2416,7 +2448,9 @@ class WanI2V:
                 elif (temporary_anchor_mode
                       or (image_condition_joint_img2_guidance
                           and (image_condition_joint_img2_guidance_rope_compression
-                               or image_condition_joint_img2_guidance_no_rope_compression))):
+                               or image_condition_joint_img2_guidance_no_rope_compression
+                               or image_condition_joint_img2_guidance_anchor_rope_offset
+                               is not None))):
                     retained_x0 = torch.cat([
                         x0[0][:, :anchor_index],
                         x0[0][:, anchor_index + 1:]

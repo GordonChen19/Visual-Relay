@@ -262,6 +262,36 @@ class PairedAnchorCliTest(unittest.TestCase):
             self.parse('--image', 'img1.png',
                        '--image_condition_joint_img2_guidance_no_rope_compression')
 
+    def test_fractional_anchor_rope_offset_is_configurable_and_scoped(self):
+        common = (
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation',
+            '--image_condition_joint_img2_guidance',
+            '--image_condition_joint_img2_guidance_shifted_anchor',
+            '--image_condition_joint_img2_guidance_adaptive_pair_attention',
+            '--image_condition_joint_img2_guidance_adaptive_pair_end_step', '25')
+        for offset in (0.0, 0.5, 0.8, 1.0):
+            with self.subTest(offset=offset):
+                args = self.parse(
+                    *common,
+                    '--image_condition_joint_img2_guidance_anchor_rope_offset',
+                    str(offset))
+                self.assertEqual(
+                    args.image_condition_joint_img2_guidance_anchor_rope_offset,
+                    offset)
+        for invalid in ('-0.1', '1.1', 'nan'):
+            with self.subTest(invalid=invalid), self.assertRaises(AssertionError):
+                self.parse(
+                    *common,
+                    '--image_condition_joint_img2_guidance_anchor_rope_offset',
+                    invalid)
+        with self.assertRaises(AssertionError):
+            self.parse('--image', 'img1.png',
+                       '--image_condition_joint_img2_guidance_anchor_rope_offset',
+                       '0.8')
+
     def test_joint_img2_guidance_static_b_prompt_is_scoped(self):
         args = self.parse(
             '--image', 'img1.png', '--image_latent_index', '0',

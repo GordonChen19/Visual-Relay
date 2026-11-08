@@ -1,8 +1,14 @@
 """Exercise state-aligned B0 guidance without importing the CUDA stack."""
 import ast
+import math
 from pathlib import Path
 import types
 import unittest
+
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
 
 
 class Frames:
@@ -124,6 +130,7 @@ class B0StateTests(unittest.TestCase):
                 env.update(
                     context=['J', 'B'], context_null=['negative'],
                     image_condition_joint_img2_guidance_no_rope_compression=ordinary,
+                    image_condition_joint_img2_guidance_anchor_rope_offset=None,
                     image_condition_joint_img2_guidance_rope_compression=compressed,
                     image_condition_joint_img2_guidance_shifted_anchor=True,
                     image_condition_joint_img2_guidance_adaptive_pair_attention=True)
@@ -212,6 +219,86 @@ class TemporalRows:
 
 
 class OrdinaryJointRopeTests(unittest.TestCase):
+    @unittest.skipIf(torch is None, "PyTorch is not installed")
+    def test_fractional_anchor_has_real_temporal_rope_phase(self):
+        path = Path(__file__).resolve().parents[1] / 'wan/modules/attention.py'
+        tree = ast.parse(path.read_text())
+        functions = [node for node in tree.body
+                     if isinstance(node, ast.FunctionDef)
+                     and node.name in ('_shift_temporal_rope',
+                                       'joint_img2_guidance_attention')]
+        calls = []
+
+        def flash(q, k, v, **kwargs):
+            calls.append((q.clone(), k.clone()))
+            return torch.zeros_like(q)
+
+        scope = dict(
+            torch=torch, flash_attention=flash,
+            _record_joint_attention_shares=lambda *args: None)
+        exec(compile(ast.Module(body=functions, type_ignores=[]),
+                     str(path), 'exec'), scope)
+        freqs = torch.polar(
+            torch.ones(6, 6),
+            torch.outer(torch.arange(6, dtype=torch.float32),
+                        torch.tensor([0.5, 0.3, 0.2, 0.1, 0.1, 0.1])))
+        q = torch.zeros(2, 5, 1, 12)
+        for frame in range(5):
+            q[:, frame, 0, 0] = math.cos(0.5 * frame)
+            q[:, frame, 0, 1] = math.sin(0.5 * frame)
+        scope['joint_img2_guidance_attention'](
+            q=q, k=q, v=q,
+            seq_lens=torch.tensor([5, 3]),
+            grid_sizes=torch.tensor([[5, 1, 1], [3, 1, 1]]),
+            anchor_index=2, rope_compression=True,
+            anchor_rope_offset=0.8, velocity_only=True, freqs=freqs)
+
+        def positions(x):
+            return torch.atan2(x[0, :, 0, 1], x[0, :, 0, 0]) / 0.5
+
+        self.assertEqual(len(calls), 4)
+        expected = torch.tensor([0., 1., 1.8, 2., 3.])
+        torch.testing.assert_close(positions(calls[0][1]), expected,
+                                   atol=1e-5, rtol=0)
+        torch.testing.assert_close(positions(calls[1][0]), torch.tensor([2.]),
+                                   atol=1e-5, rtol=0)
+        torch.testing.assert_close(positions(calls[1][1]),
+                                   torch.tensor([2., 3., 4.]),
+                                   atol=1e-5, rtol=0)
+        torch.testing.assert_close(positions(calls[2][0]),
+                                   torch.tensor([2., 3.]),
+                                   atol=1e-5, rtol=0)
+        torch.testing.assert_close(positions(calls[2][1]), expected,
+                                   atol=1e-5, rtol=0)
+
+    def test_fractional_offset_is_forwarded_through_each_model_path(self):
+        root = Path(__file__).resolve().parents[1]
+        for relative in ('wan/modules/model.py',
+                         'wan/distributed/sequence_parallel.py',
+                         'wan/distributed/ulysses.py'):
+            with self.subTest(path=relative):
+                tree = ast.parse((root / relative).read_text())
+                calls = [node for node in ast.walk(tree)
+                         if isinstance(node, ast.Call)]
+                carriers = [call for call in calls
+                            if any(keyword.arg ==
+                                   'joint_img2_guidance_compression_ratio'
+                                   for keyword in call.keywords)]
+                for call in carriers:
+                    self.assertIn('joint_img2_guidance_anchor_rope_offset',
+                                  {keyword.arg for keyword in call.keywords})
+                if relative != 'wan/distributed/ulysses.py':
+                    self.assertGreater(len(carriers), 0)
+                attention_calls = [call for call in calls
+                                   if isinstance(call.func, ast.Name)
+                                   and call.func.id ==
+                                   'joint_img2_guidance_attention']
+                if relative != 'wan/distributed/sequence_parallel.py':
+                    self.assertEqual(len(attention_calls), 1)
+                    self.assertIn('anchor_rope_offset',
+                                  {keyword.arg for keyword in
+                                   attention_calls[0].keywords})
+
     def test_real_attention_routes_keep_native_offsets_and_anchor_mask(self):
         root = Path(__file__).resolve().parents[1]
         tree = ast.parse((root / 'wan/modules/attention.py').read_text())
@@ -243,7 +330,9 @@ class OrdinaryJointRopeTests(unittest.TestCase):
             _record_joint_attention_shares=lambda *args: None)
         exec(compile(ast.Module(body=[function], type_ignores=[]),
                      '<actual joint attention>', 'exec'), env)
-        for ratio in (0.0, 1.0):
+        for ratio, anchor_offset in (
+                (0.0, None), (1.0, None),
+                (1.0, 0.0), (1.0, 0.5), (1.0, 0.8), (1.0, 1.0)):
             calls.clear()
             shifts.clear()
             coordinates = TemporalRows([list(range(21)), list(range(21))])
@@ -252,13 +341,23 @@ class OrdinaryJointRopeTests(unittest.TestCase):
                 seq_lens=[21, 11], grid_sizes=TemporalRows([[21, 1, 1], [11, 1, 1]]),
                 anchor_index=10, rope_compression=True,
                 adaptive_pair_attention=True, compression_ratio=ratio,
+                anchor_rope_offset=anchor_offset,
                 velocity_only=True, freqs=object())
             self.assertEqual(len(calls), 4)  # J prefix, anchor, suffix, native B
             self.assertEqual(calls[0][0], list(range(10)))
             self.assertEqual(calls[1], ([10], list(range(10, 21))))
             self.assertEqual(calls[3], (list(range(11)), list(range(11))))
             self.assertEqual(output.size(0), 2)
-            if ratio == 0:
+            if anchor_offset is not None:
+                self.assertEqual(shifts, [anchor_offset - 1.0, -1.0, -1.0])
+                self.assertEqual(calls[0][1][9], 9)
+                self.assertAlmostEqual(calls[0][1][10], 9 + anchor_offset)
+                self.assertEqual(calls[0][1][11], 10)
+                self.assertEqual(calls[2][0][0], 10)
+                self.assertEqual(calls[2][1], calls[0][1])
+                self.assertAlmostEqual(
+                    calls[2][0][0] - calls[2][1][10], 1 - anchor_offset)
+            elif ratio == 0:
                 self.assertEqual(shifts, [])
                 self.assertEqual(calls[0][1], list(range(21)))
                 self.assertEqual(calls[2], (list(range(11, 21)), list(range(21))))

@@ -150,6 +150,7 @@ class WanSelfAttention(nn.Module):
                 joint_img2_guidance_adaptive_pair_margin=1.05,
                 joint_img2_guidance_adaptive_pair_alpha_max=0.7,
                 joint_img2_guidance_compression_ratio=1.0,
+                joint_img2_guidance_anchor_rope_offset=None,
                 joint_img2_guidance_velocity_only=False,
                 cross_tail_bridge_anchor_index=None,
                 cross_tail_bridge_tail_frames=4,
@@ -242,6 +243,7 @@ class WanSelfAttention(nn.Module):
                 adaptive_pair_alpha_max=(
                     joint_img2_guidance_adaptive_pair_alpha_max),
                 compression_ratio=joint_img2_guidance_compression_ratio,
+                anchor_rope_offset=joint_img2_guidance_anchor_rope_offset,
                 velocity_only=joint_img2_guidance_velocity_only,
                 freqs=freqs,
                 window_size=self.window_size)
@@ -477,6 +479,7 @@ class WanAttentionBlock(nn.Module):
         joint_img2_guidance_adaptive_pair_margin=1.05,
         joint_img2_guidance_adaptive_pair_alpha_max=0.7,
         joint_img2_guidance_compression_ratio=1.0,
+        joint_img2_guidance_anchor_rope_offset=None,
         joint_img2_guidance_velocity_only=False,
         cross_tail_bridge_anchor_index=None,
         cross_tail_bridge_tail_frames=4,
@@ -534,6 +537,8 @@ class WanAttentionBlock(nn.Module):
                 joint_img2_guidance_adaptive_pair_alpha_max),
             joint_img2_guidance_compression_ratio=(
                 joint_img2_guidance_compression_ratio),
+            joint_img2_guidance_anchor_rope_offset=(
+                joint_img2_guidance_anchor_rope_offset),
             joint_img2_guidance_velocity_only=joint_img2_guidance_velocity_only,
             cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
             cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,
@@ -747,6 +752,7 @@ class WanModel(ModelMixin, ConfigMixin):
         joint_img2_guidance_adaptive_pair_margin=1.05,
         joint_img2_guidance_adaptive_pair_alpha_max=0.7,
         joint_img2_guidance_compression_ratio=1.0,
+        joint_img2_guidance_anchor_rope_offset=None,
         joint_img2_guidance_velocity_only=False,
         cross_tail_bridge_anchor_index=None,
         cross_tail_bridge_tail_frames=4,
@@ -866,6 +872,8 @@ class WanModel(ModelMixin, ConfigMixin):
                 joint_img2_guidance_adaptive_pair_alpha_max),
             joint_img2_guidance_compression_ratio=(
                 joint_img2_guidance_compression_ratio),
+            joint_img2_guidance_anchor_rope_offset=(
+                joint_img2_guidance_anchor_rope_offset),
             joint_img2_guidance_velocity_only=joint_img2_guidance_velocity_only,
             cross_tail_bridge_anchor_index=cross_tail_bridge_anchor_index,
             cross_tail_bridge_tail_frames=cross_tail_bridge_tail_frames,

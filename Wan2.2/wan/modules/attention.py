@@ -338,6 +338,7 @@ def joint_img2_guidance_attention(
     adaptive_pair_margin=1.05,
     adaptive_pair_alpha_max=0.7,
     compression_ratio=1.0,
+    anchor_rope_offset=None,
     velocity_only=False,
     freqs=None,
     window_size=(-1, -1),
@@ -361,6 +362,10 @@ def joint_img2_guidance_attention(
         raise ValueError("joint Img2 guidance weight must be in [0, 1]")
     if not 0.0 <= compression_ratio <= 1.0:
         raise ValueError("joint RoPE compression ratio must be in [0, 1]")
+    if anchor_rope_offset is not None:
+        if not rope_compression or not 0.0 <= anchor_rope_offset <= 1.0:
+            raise ValueError(
+                "fractional anchor RoPE requires compressed routing and offset in [0, 1]")
 
     frames, height, width = (
         int(value) for value in grid_sizes[0].tolist())
@@ -370,6 +375,8 @@ def joint_img2_guidance_attention(
         raise ValueError("joint and Img2 streams must share a spatial grid")
     if not 0 < anchor_index < frames:
         raise ValueError("joint Img2 anchor must be inside the timeline")
+    if anchor_rope_offset is not None and anchor_index >= frames - 1:
+        raise ValueError("fractional anchor RoPE needs a following J frame")
     shifted_anchor = b_frames == frames - anchor_index + 1
     if not shifted_anchor and b_frames != frames - anchor_index:
         raise ValueError("Img2 stream does not align with joint anchor/suffix")
@@ -398,23 +405,38 @@ def joint_img2_guidance_attention(
         # At ratio 1, prefix queries retain their native coordinates. Compress every
         # post-anchor key left by one so the anchor and first suffix frame
         # share the anchor coordinate: [..., J9@9, J10@10, J11@10, J12@11].
-        prefix_k = torch.cat([
-            joint_k[:, :anchor_end],
-            _shift_temporal_rope(
-                joint_k[:, anchor_end:], -compression_ratio, freqs),
-        ], dim=1) if compression_ratio else joint_k
+        if anchor_rope_offset is not None:
+            # For prefix/suffix queries, J9/J11 are neighbours while J10
+            # sits at the requested fraction between them. The anchor query
+            # below keeps native self/future offsets and its existing mask.
+            prefix_k = torch.cat([
+                joint_k[:, :aligned_start],
+                _shift_temporal_rope(
+                    joint_k[:, aligned_start:anchor_end],
+                    anchor_rope_offset - 1.0, freqs),
+                _shift_temporal_rope(joint_k[:, anchor_end:], -1.0, freqs),
+            ], dim=1)
+        else:
+            prefix_k = torch.cat([
+                joint_k[:, :anchor_end],
+                _shift_temporal_rope(
+                    joint_k[:, anchor_end:], -compression_ratio, freqs),
+            ], dim=1) if compression_ratio else joint_k
         # Suffix queries read all J frames using compressed RoPE. Shift both
         # suffix queries and anchor/suffix keys left by one, colocating J9/J10
         # while preserving relative offsets within the suffix. J11 is then
         # one temporal step from both J9 and J10 at ratio 1.
+        suffix_shift = 1.0 if anchor_rope_offset is not None else compression_ratio
         compressed_suffix_q = (_shift_temporal_rope(
-            joint_q[:, anchor_end:], -compression_ratio, freqs)
-            if compression_ratio else joint_q[:, anchor_end:])
-        suffix_k = torch.cat([
-            joint_k[:, :aligned_start],
-            _shift_temporal_rope(
-                joint_k[:, aligned_start:], -compression_ratio, freqs),
-        ], dim=1) if compression_ratio else joint_k
+            joint_q[:, anchor_end:], -suffix_shift, freqs)
+            if suffix_shift else joint_q[:, anchor_end:])
+        suffix_k = (prefix_k if anchor_rope_offset is not None else
+                    torch.cat([
+                        joint_k[:, :aligned_start],
+                        _shift_temporal_rope(
+                            joint_k[:, aligned_start:], -compression_ratio,
+                            freqs),
+                    ], dim=1) if compression_ratio else joint_k)
         _record_joint_attention_shares(
             joint_q, prefix_k, anchor_index, tokens_per_frame,
             compressed_suffix_q, suffix_k)
