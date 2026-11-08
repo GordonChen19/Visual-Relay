@@ -234,6 +234,34 @@ class PairedAnchorCliTest(unittest.TestCase):
                 '--image_condition_joint_img2_guidance_shifted_anchor',
                 '--image_condition_joint_img2_guidance_adaptive_pair_attention')
 
+    def test_joint_no_rope_compression_preserves_handoff_option(self):
+        common = (
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation',
+            '--image_condition_joint_img2_guidance',
+            '--image_condition_joint_img2_guidance_shifted_anchor')
+        self.assertFalse(self.parse(
+            *common).image_condition_joint_img2_guidance_no_rope_compression)
+        for compression in ((), (
+                '--image_condition_joint_img2_guidance_rope_compression',)):
+            with self.subTest(compression=compression):
+                args = self.parse(
+                    *common, *compression,
+                    '--image_condition_joint_img2_guidance_no_rope_compression',
+                    '--image_condition_joint_img2_guidance_adaptive_pair_attention',
+                    '--image_condition_joint_img2_guidance_adaptive_pair_end_step', '25')
+                self.assertTrue(
+                    args.image_condition_joint_img2_guidance_no_rope_compression)
+                self.assertTrue(
+                    args.image_condition_joint_img2_guidance_adaptive_pair_attention)
+                self.assertEqual(
+                    args.image_condition_joint_img2_guidance_adaptive_pair_end_step, 25)
+        with self.assertRaises(AssertionError):
+            self.parse('--image', 'img1.png',
+                       '--image_condition_joint_img2_guidance_no_rope_compression')
+
     def test_joint_img2_guidance_static_b_prompt_is_scoped(self):
         args = self.parse(
             '--image', 'img1.png', '--image_latent_index', '0',

@@ -349,7 +349,9 @@ def joint_img2_guidance_attention(
     standard Img2-first I2V timeline aligned to J. By default, both streams use
     ordinary bidirectional attention. Optional shifted-anchor RoPE compression
     gives prefix and suffix queries distinct anchor-key coordinates and limits
-    the anchor query to itself/future frames. B always retains ordinary RoPE.
+    the anchor query to itself/future frames. A zero compression_ratio retains
+    that routing mask but uses native coordinates for every query and key.
+    B always retains ordinary RoPE.
     """
     if q.size(0) != 2 or k.size(0) != 2 or v.size(0) != 2:
         raise ValueError("joint Img2 guidance requires exactly J and B streams")
@@ -391,24 +393,28 @@ def joint_img2_guidance_attention(
         joint_q = q[0:1, :joint_seq_len]
         joint_k = k[0:1, :joint_seq_len]
         joint_v = v[0:1, :joint_seq_len]
-        # Prefix queries retain their native coordinates. Compress every
+        # A zero ratio is the ordinary-RoPE ablation: preserve all routing,
+        # including the anchor's self/future mask, without rotating Q/K.
+        # At ratio 1, prefix queries retain their native coordinates. Compress every
         # post-anchor key left by one so the anchor and first suffix frame
         # share the anchor coordinate: [..., J9@9, J10@10, J11@10, J12@11].
         prefix_k = torch.cat([
             joint_k[:, :anchor_end],
-            _shift_temporal_rope(joint_k[:, anchor_end:], -1, freqs),
-        ], dim=1)
+            _shift_temporal_rope(
+                joint_k[:, anchor_end:], -compression_ratio, freqs),
+        ], dim=1) if compression_ratio else joint_k
         # Suffix queries read all J frames using compressed RoPE. Shift both
         # suffix queries and anchor/suffix keys left by one, colocating J9/J10
         # while preserving relative offsets within the suffix. J11 is then
-        # one temporal step from both J9 and J10 in either ablation.
-        compressed_suffix_q = _shift_temporal_rope(
-            joint_q[:, anchor_end:], -1.0, freqs)
+        # one temporal step from both J9 and J10 at ratio 1.
+        compressed_suffix_q = (_shift_temporal_rope(
+            joint_q[:, anchor_end:], -compression_ratio, freqs)
+            if compression_ratio else joint_q[:, anchor_end:])
         suffix_k = torch.cat([
             joint_k[:, :aligned_start],
             _shift_temporal_rope(
-                joint_k[:, aligned_start:], -1.0, freqs),
-        ], dim=1)
+                joint_k[:, aligned_start:], -compression_ratio, freqs),
+        ], dim=1) if compression_ratio else joint_k
         _record_joint_attention_shares(
             joint_q, prefix_k, anchor_index, tokens_per_frame,
             compressed_suffix_q, suffix_k)

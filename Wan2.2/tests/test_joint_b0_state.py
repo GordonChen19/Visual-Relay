@@ -21,6 +21,11 @@ class Frames:
     def clone(self):
         return Frames(self.values)
 
+    def size(self, dim):
+        if dim != 1:
+            raise ValueError('stub only models the temporal dimension')
+        return len(self.indices)
+
     def copy_(self, source):
         if len(self.indices) != len(source.values):
             raise ValueError('frame count mismatch')
@@ -103,6 +108,34 @@ class B0StateTests(unittest.TestCase):
         self.assertNotIn('joint_guidance_b_scheduler', identifiers)
         self.assertNotIn('joint_guidance_b_latent', identifiers)
 
+    def test_ordinary_rope_reaches_both_cfg_branches_without_changing_handoff(self):
+        assignments = [node for node in ast.walk(self.tree)
+                       if isinstance(node, ast.Assign)
+                       and isinstance(node.value, ast.Dict)
+                       and any(isinstance(key, ast.Constant)
+                               and key.value == 'joint_img2_guidance_compression_ratio'
+                               for key in node.value.keys)]
+        self.assertEqual(len(assignments), 2)
+        for ordinary, compressed in ((False, True), (True, True), (True, False)):
+            for node in assignments:
+                names = {n.id for n in ast.walk(node.value)
+                         if isinstance(n, ast.Name)}
+                env = dict.fromkeys(names, False)
+                env.update(
+                    context=['J', 'B'], context_null=['negative'],
+                    image_condition_joint_img2_guidance_no_rope_compression=ordinary,
+                    image_condition_joint_img2_guidance_rope_compression=compressed,
+                    image_condition_joint_img2_guidance_shifted_anchor=True,
+                    image_condition_joint_img2_guidance_adaptive_pair_attention=True)
+                exec(compile(ast.Module(body=[node], type_ignores=[]),
+                             '<actual joint CFG arguments>', 'exec'), env)
+                args = env[node.targets[0].id]
+                self.assertTrue(args['joint_img2_guidance_rope_compression'])
+                self.assertEqual(args['joint_img2_guidance_compression_ratio'],
+                                 0.0 if ordinary else 1.0)
+                self.assertTrue(args['joint_img2_guidance_velocity_only'])
+                self.assertTrue(args['joint_img2_guidance_adaptive_pair_attention'])
+
     def test_handoff_removes_anchor_and_stops_b_input(self):
         env = self.environment()
         env['joint_guidance_active'] = False
@@ -111,6 +144,29 @@ class B0StateTests(unittest.TestCase):
         self.assertEqual(env['latent_model_input'][0].values, [0, 1, 3, 4])
         self.assertIs(env['current_arg_c'], env['joint_handoff_arg_c'])
         self.assertIs(env['current_arg_null'], env['joint_handoff_arg_null'])
+
+    def test_ordinary_rope_still_discards_anchor_before_decoding(self):
+        branch = next(node for node in ast.walk(self.tree)
+                      if isinstance(node, ast.If)
+                      and any(isinstance(child, ast.Assign)
+                              and ast.unparse(child.targets[0]) == 'retained_x0'
+                              for child in node.body))
+        for ordinary, compressed in ((True, False), (True, True), (False, True)):
+            env = self.environment()
+            env.update(
+                temporary_anchor_mode=False,
+                image_condition_joint_img2_guidance=True,
+                image_condition_joint_img2_guidance_no_rope_compression=ordinary,
+                image_condition_joint_img2_guidance_rope_compression=compressed,
+                latent_frame_num=21, anchor_index=10,
+                x0=[Frames(list(range(21)))],
+                self=types.SimpleNamespace(vae=types.SimpleNamespace(
+                    decode=lambda frames: [frame.values for frame in frames])))
+            self.assertTrue(eval(compile(ast.Expression(branch.test),
+                                         '<actual decode guard>', 'eval'), env))
+            exec(compile(ast.Module(body=branch.body, type_ignores=[]),
+                         '<actual retained-frame decoding>', 'exec'), env)
+            self.assertEqual(env['videos'], [list(range(10)) + list(range(11, 21))])
 
     def test_handoff_preserves_joint_features_and_masks_in_both_cfg_calls(self):
         def assignment(name):
@@ -140,6 +196,79 @@ class B0StateTests(unittest.TestCase):
                     self.assertEqual(env[name]['y'][0].values, expected)
                 self.assertEqual(env['joint_y'].values, values)
 
+
+class TemporalRows:
+    """Track temporal coordinates through the actual attention routing code."""
+    def __init__(self, rows):
+        self.rows = rows
+
+    def size(self, dim):
+        return len(self.rows) if dim == 0 else len(self.rows[0])
+
+    def __getitem__(self, index):
+        if isinstance(index, int):
+            return types.SimpleNamespace(tolist=lambda: self.rows[index])
+        return TemporalRows([row[index[1]] for row in self.rows[index[0]]])
+
+
+class OrdinaryJointRopeTests(unittest.TestCase):
+    def test_real_attention_routes_keep_native_offsets_and_anchor_mask(self):
+        root = Path(__file__).resolve().parents[1]
+        tree = ast.parse((root / 'wan/modules/attention.py').read_text())
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == 'joint_img2_guidance_attention')
+
+        def cat(parts, dim):
+            if dim == 0:
+                return TemporalRows([row for part in parts for row in part.rows])
+            return TemporalRows([sum((part.rows[i] for part in parts), [])
+                                 for i in range(parts[0].size(0))])
+
+        calls, shifts = [], []
+
+        def flash(q, k, v, **kwargs):
+            calls.append((q.rows[0], k.rows[0]))
+            return q
+
+        def shift(x, delta, freqs):
+            shifts.append(delta)
+            return TemporalRows([[value + delta for value in row] for row in x.rows])
+
+        env = dict(
+            torch=types.SimpleNamespace(
+                bfloat16=None, cat=cat,
+                zeros_like=lambda x: TemporalRows([[0] * len(row) for row in x.rows])),
+            flash_attention=flash, _shift_temporal_rope=shift,
+            _record_joint_attention_shares=lambda *args: None)
+        exec(compile(ast.Module(body=[function], type_ignores=[]),
+                     '<actual joint attention>', 'exec'), env)
+        for ratio in (0.0, 1.0):
+            calls.clear()
+            shifts.clear()
+            coordinates = TemporalRows([list(range(21)), list(range(21))])
+            output = env[function.name](
+                q=coordinates, k=coordinates, v=coordinates,
+                seq_lens=[21, 11], grid_sizes=TemporalRows([[21, 1, 1], [11, 1, 1]]),
+                anchor_index=10, rope_compression=True,
+                adaptive_pair_attention=True, compression_ratio=ratio,
+                velocity_only=True, freqs=object())
+            self.assertEqual(len(calls), 4)  # J prefix, anchor, suffix, native B
+            self.assertEqual(calls[0][0], list(range(10)))
+            self.assertEqual(calls[1], ([10], list(range(10, 21))))
+            self.assertEqual(calls[3], (list(range(11)), list(range(11))))
+            self.assertEqual(output.size(0), 2)
+            if ratio == 0:
+                self.assertEqual(shifts, [])
+                self.assertEqual(calls[0][1], list(range(21)))
+                self.assertEqual(calls[2], (list(range(11, 21)), list(range(21))))
+                self.assertEqual(calls[0][1][11] - calls[0][0][9], 2)
+                self.assertEqual(calls[2][0][0] - calls[2][1][9], 2)
+            else:
+                self.assertEqual(shifts, [-1.0] * 3)
+                self.assertEqual(calls[0][1][10:12], [10, 10])
+                self.assertEqual(calls[2][1][9:11], [9, 9])
+                self.assertEqual(calls[2][0][0], 10)
 
 if __name__ == '__main__':
     unittest.main()

@@ -132,6 +132,10 @@ def _validate_args(args):
             assert args.image_condition_joint_img2_guidance_shifted_anchor, (
                 "--image_condition_joint_img2_guidance_rope_compression "
                 "requires --image_condition_joint_img2_guidance_shifted_anchor.")
+        if args.image_condition_joint_img2_guidance_no_rope_compression:
+            assert args.image_condition_joint_img2_guidance_shifted_anchor, (
+                "--image_condition_joint_img2_guidance_no_rope_compression "
+                "requires --image_condition_joint_img2_guidance_shifted_anchor.")
         if args.image_condition_joint_img2_guidance_static_b_prompt:
             assert args.image_condition_joint_img2_guidance, (
                 "--image_condition_joint_img2_guidance_static_b_prompt "
@@ -148,9 +152,10 @@ def _validate_args(args):
             assert args.image_condition_joint_img2_guidance_shifted_anchor, (
                 "Joint attention diagnostics require shifted-anchor guidance.")
         if args.image_condition_joint_img2_guidance_adaptive_pair_attention:
-            assert args.image_condition_joint_img2_guidance_rope_compression, (
-                "Adaptive pair attention requires joint Img2-guidance RoPE "
-                "compression.")
+            assert (args.image_condition_joint_img2_guidance_rope_compression
+                    or args.image_condition_joint_img2_guidance_no_rope_compression), (
+                "Adaptive pair attention requires a joint Img2-guidance RoPE "
+                "mode: rope_compression or no_rope_compression.")
             assert (args.image_condition_joint_img2_guidance_adaptive_pair_end_step
                     >= 1), "Adaptive pair end step must be at least 1."
             assert (args.image_condition_joint_img2_guidance_adaptive_pair_margin
@@ -705,6 +710,14 @@ def _parse_args():
               "and future frames. "
               "The anchor is discarded before decoding. B keeps ordinary "
               "RoPE."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_no_rope_compression",
+        action="store_true",
+        help=("Use ordinary integer J RoPE before the handoff: J9/J11 have "
+              "temporal offset 2. Overrides --image_condition_joint_img2_guidance_rope_compression "
+              "if both are set. Keeps anchor self/future-only attention, "
+              "B0 velocity replacement, and the configured anchor-removal "
+              "handoff unchanged. Requires shifted-anchor guidance."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_static_b_prompt",
         action="store_true",
@@ -1347,6 +1360,8 @@ def generate(args):
                 args.image_condition_joint_img2_guidance_single_frame_anchor_history),
             image_condition_joint_img2_guidance_rope_compression=(
                 args.image_condition_joint_img2_guidance_rope_compression),
+            image_condition_joint_img2_guidance_no_rope_compression=(
+                args.image_condition_joint_img2_guidance_no_rope_compression),
             image_condition_joint_img2_guidance_static_b_prompt=(
                 args.image_condition_joint_img2_guidance_static_b_prompt),
             image_condition_joint_img2_guidance_persistent_b=(
