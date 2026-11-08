@@ -340,6 +340,40 @@ class PairedAnchorCliTest(unittest.TestCase):
             self.parse(*base,
                        '--image_condition_joint_img2_guidance_single_frame_anchor_history')
 
+    def test_joint_single_frame_four_history_is_separate_and_scoped(self):
+        base = (
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'first',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'second',
+            '--image_condition_joint_img2_guidance')
+        single = '--image_condition_joint_img2_guidance_single_frame_anchor'
+        four = '--image_condition_joint_img2_guidance_single_frame_anchor_four_history'
+        with self.assertRaises(AssertionError):
+            self.parse(*base, four)
+        args = self.parse(*base, single, four)
+        self.assertTrue(
+            args.image_condition_joint_img2_guidance_single_frame_anchor_four_history)
+        with self.assertRaises(AssertionError):
+            self.parse(
+                *base, single, four,
+                '--image_condition_joint_img2_guidance_single_frame_anchor_history')
+
+    def test_joint_three_frame_anchor_is_separate_and_scoped(self):
+        base = (
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'first',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'second')
+        flag = '--image_condition_joint_img2_guidance_three_frame_anchor'
+        with self.assertRaises(AssertionError):
+            self.parse(*base, flag)
+        args = self.parse(*base, '--image_condition_joint_img2_guidance', flag)
+        self.assertTrue(args.image_condition_joint_img2_guidance_three_frame_anchor)
+        with self.assertRaises(AssertionError):
+            self.parse(*base, '--image_condition_joint_img2_guidance', flag,
+                       '--image_condition_joint_img2_guidance_single_frame_anchor')
+
     def test_joint_img2_guidance_persistent_b_is_shifted_only(self):
         args = self.parse(
             '--image', 'img1.png', '--image_latent_index', '0',

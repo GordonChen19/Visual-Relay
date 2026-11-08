@@ -128,6 +128,19 @@ def _validate_args(args):
             assert args.image_condition_joint_img2_guidance_single_frame_anchor, (
                 "--image_condition_joint_img2_guidance_single_frame_anchor_history "
                 "requires --image_condition_joint_img2_guidance_single_frame_anchor.")
+        if args.image_condition_joint_img2_guidance_single_frame_anchor_four_history:
+            assert args.image_condition_joint_img2_guidance_single_frame_anchor, (
+                "--image_condition_joint_img2_guidance_single_frame_anchor_four_history "
+                "requires --image_condition_joint_img2_guidance_single_frame_anchor.")
+            assert not args.image_condition_joint_img2_guidance_single_frame_anchor_history, (
+                "Choose either two-history or four-history single-frame encoding.")
+        if args.image_condition_joint_img2_guidance_three_frame_anchor:
+            assert args.image_condition_joint_img2_guidance, (
+                "--image_condition_joint_img2_guidance_three_frame_anchor "
+                "requires --image_condition_joint_img2_guidance.")
+            assert not args.image_condition_joint_img2_guidance_single_frame_anchor, (
+                "Choose either --image_condition_joint_img2_guidance_three_frame_anchor "
+                "or --image_condition_joint_img2_guidance_single_frame_anchor.")
         if args.image_condition_joint_img2_guidance_rope_compression:
             assert args.image_condition_joint_img2_guidance_shifted_anchor, (
                 "--image_condition_joint_img2_guidance_rope_compression "
@@ -707,6 +720,20 @@ def _parse_args():
               "learned kernel on [older, newer, Img2] at the anchor instead "
               "of bypassing it. Ordinary chunks still use their normal "
               "one-slice history. Experimental; preserves latent count."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_single_frame_anchor_four_history",
+        action="store_true",
+        help=("With the single-frame anchor option, run the first temporal "
+              "downsampler on [four cached features, Img2] to make two "
+              "outputs, then run the second on [one cached feature, two "
+              "current features] to make one latent. Experimental."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_three_frame_anchor",
+        action="store_true",
+        help=("Experimental contextual Img2x3 VAE anchor: the first temporal "
+              "downsampler uses two cached features plus three Img2 features "
+              "to make two outputs; the second uses one cached feature plus "
+              "those two outputs to make one latent. Other modes unchanged."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_rope_compression",
         action="store_true",
@@ -1376,6 +1403,10 @@ def generate(args):
                 args.image_condition_joint_img2_guidance_single_frame_anchor),
             image_condition_joint_img2_guidance_single_frame_anchor_history=(
                 args.image_condition_joint_img2_guidance_single_frame_anchor_history),
+            image_condition_joint_img2_guidance_single_frame_anchor_four_history=(
+                args.image_condition_joint_img2_guidance_single_frame_anchor_four_history),
+            image_condition_joint_img2_guidance_three_frame_anchor=(
+                args.image_condition_joint_img2_guidance_three_frame_anchor),
             image_condition_joint_img2_guidance_rope_compression=(
                 args.image_condition_joint_img2_guidance_rope_compression),
             image_condition_joint_img2_guidance_no_rope_compression=(

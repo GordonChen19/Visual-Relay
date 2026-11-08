@@ -272,6 +272,8 @@ class WanI2V:
                  image_condition_joint_img2_guidance_shifted_anchor=False,
                  image_condition_joint_img2_guidance_single_frame_anchor=False,
                  image_condition_joint_img2_guidance_single_frame_anchor_history=False,
+                 image_condition_joint_img2_guidance_single_frame_anchor_four_history=False,
+                 image_condition_joint_img2_guidance_three_frame_anchor=False,
                  image_condition_joint_img2_guidance_rope_compression=False,
                  image_condition_joint_img2_guidance_no_rope_compression=False,
                  image_condition_joint_img2_guidance_anchor_rope_offset=None,
@@ -508,6 +510,18 @@ class WanI2V:
         if (image_condition_joint_img2_guidance_single_frame_anchor_history
                 and not image_condition_joint_img2_guidance_single_frame_anchor):
             raise ValueError("history mixing requires the single-frame anchor option")
+        if (image_condition_joint_img2_guidance_single_frame_anchor_four_history
+                and not image_condition_joint_img2_guidance_single_frame_anchor):
+            raise ValueError("four-history mixing requires the single-frame anchor")
+        if (image_condition_joint_img2_guidance_single_frame_anchor_history
+                and image_condition_joint_img2_guidance_single_frame_anchor_four_history):
+            raise ValueError("choose one single-frame history layout")
+        if (image_condition_joint_img2_guidance_three_frame_anchor
+                and not image_condition_joint_img2_guidance):
+            raise ValueError("three-frame anchor requires joint Img2 guidance")
+        if (image_condition_joint_img2_guidance_three_frame_anchor
+                and image_condition_joint_img2_guidance_single_frame_anchor):
+            raise ValueError("choose either the single- or three-frame anchor")
         if (image_condition_joint_img2_guidance_rope_compression
                 and not image_condition_joint_img2_guidance_shifted_anchor):
             raise ValueError(
@@ -1009,8 +1023,9 @@ class WanI2V:
 
         def joint_anchor_conditioning_video(first_image, anchor_image,
                                             pixel_frames, latent_index,
-                                            single_frame_anchor=False):
-            """Build joint conditioning, optionally compacting Img2x4 to Img2x1."""
+                                            single_frame_anchor=False,
+                                            three_frame_anchor=False):
+            """Build joint conditioning with a 1-, 3-, or 4-pixel Img2 anchor."""
             first = torch.nn.functional.interpolate(
                 first_image[None].cpu(), size=(h, w),
                 mode='bicubic').to(self.device)[0]
@@ -1027,11 +1042,11 @@ class WanI2V:
                 raise ValueError("joint Img2 anchor exceeds conditioning video")
             video[:, anchor_pixel_start:anchor_pixel_end].copy_(
                 anchor[:, None].expand(-1, self.vae_stride[0], -1, -1))
-            if single_frame_anchor:
-                # The custom encoder consumes this anchor as one pixel frame.
-                # Keep the ordinary four-frame chunks before and after it.
+            if single_frame_anchor or three_frame_anchor:
+                anchor_pixels = 1 if single_frame_anchor else 3
+                # Keep ordinary four-frame chunks before and after the anchor.
                 video = torch.cat([
-                    video[:, :anchor_pixel_start + 1],
+                    video[:, :anchor_pixel_start + anchor_pixels],
                     video[:, anchor_pixel_end:]
                 ], dim=1)
             return video
@@ -1113,7 +1128,9 @@ class WanI2V:
                 joint_anchor_conditioning_video(
                     imgs[0], imgs[1], F, anchor_index,
                     single_frame_anchor=(
-                        image_condition_joint_img2_guidance_single_frame_anchor)),
+                        image_condition_joint_img2_guidance_single_frame_anchor),
+                    three_frame_anchor=(
+                        image_condition_joint_img2_guidance_three_frame_anchor)),
                 conditioning_video(imgs[1], suffix_frame_num),
             ]
             if image_condition_joint_img2_guidance_single_frame_anchor:
@@ -1126,7 +1143,9 @@ class WanI2V:
                 encoded = self.vae.encode(
                     joint_encode_inputs[:1], single_frame_indices=(anchor_index,),
                     single_frame_history=(
-                        image_condition_joint_img2_guidance_single_frame_anchor_history))
+                        image_condition_joint_img2_guidance_single_frame_anchor_history),
+                    single_frame_four_history=(
+                        image_condition_joint_img2_guidance_single_frame_anchor_four_history))
                 # B remains an ordinary Img2-first encode with no restart.
                 encoded += self.vae.encode(joint_encode_inputs[1:])
                 logging.info(
@@ -1137,10 +1156,30 @@ class WanI2V:
                     "and still produces %d latents. B encoding, attention, "
                     "velocity replacement, and decoding are unchanged",
                     anchor_index,
-                    ("runs its learned filters on two cached features plus Img2"
+                    ("uses [four cached features, Img2] at the first temporal "
+                     "downsampler and [one cached feature, two current features] "
+                     "at the second"
+                     if image_condition_joint_img2_guidance_single_frame_anchor_four_history
+                     else "runs its learned filters on two cached features plus Img2"
                      if image_condition_joint_img2_guidance_single_frame_anchor_history
                      else "takes its first-frame bypass"),
                     joint_encode_inputs[0].size(1), latent_frame_num)
+            elif image_condition_joint_img2_guidance_three_frame_anchor:
+                if joint_encode_inputs[0].size(1) != F - 1:
+                    raise RuntimeError(
+                        "three-frame joint conditioning must remove one pixel frame")
+                encoded = self.vae.encode(
+                    joint_encode_inputs[:1],
+                    three_frame_indices=(anchor_index,))
+                encoded += self.vae.encode(joint_encode_inputs[1:])
+                logging.info(
+                    "Three-frame contextual anchor enabled: J%d consumes "
+                    "three Img2 pixel frames. The first temporal downsampler "
+                    "reads two cached features and produces two outputs; the "
+                    "second reads its newest cached feature plus those two "
+                    "outputs and produces one latent. B encoding, attention, "
+                    "velocity replacement, and decoding are unchanged",
+                    anchor_index)
             else:
                 encoded = self.vae.encode(joint_encode_inputs)
             if (encoded[0].size(1) != latent_frame_num
@@ -1177,11 +1216,16 @@ class WanI2V:
                     "CFG branch; only the resulting J prediction enters the "
                     "scheduler.%s B conditional text is %s",
                     latent_frame_num,
-                    (("one contextual pixel frame with history-mixing temporal filters"
+                    (("one contextual pixel frame with four-to-one history mixing"
+                      if image_condition_joint_img2_guidance_single_frame_anchor_four_history
+                      else "one contextual pixel frame with history-mixing temporal filters"
                       if image_condition_joint_img2_guidance_single_frame_anchor_history
                       else "one contextual pixel frame with temporal-downsampler bypass")
                      if image_condition_joint_img2_guidance_single_frame_anchor
-                     else "four repeated pixel frames in the interior anchor interval"),
+                     else ("three repeated pixel frames with first-stage "
+                           "history mixing and ordinary second-stage history"
+                           if image_condition_joint_img2_guidance_three_frame_anchor
+                           else "four repeated pixel frames in the interior anchor interval")),
                     suffix_latent_frame_num,
                     anchor_index, anchor_index,
                     ("fractional J anchor key at position %d-1+%.3f for "
@@ -1235,11 +1279,15 @@ class WanI2V:
                 "J%d's predicted velocity independently in both CFG passes "
                 "before the scheduler step.",
                 latent_frame_num,
-                (("history-mixed Img2x1"
+                (("four-to-one-history Img2x1"
+                  if image_condition_joint_img2_guidance_single_frame_anchor_four_history
+                  else "history-mixed Img2x1"
                   if image_condition_joint_img2_guidance_single_frame_anchor_history
                   else "contextual Img2x1")
                  if image_condition_joint_img2_guidance_single_frame_anchor
-                 else "Img2x4"), anchor_index, suffix_latent_frame_num,
+                 else ("contextual Img2x3"
+                       if image_condition_joint_img2_guidance_three_frame_anchor
+                       else "Img2x4")), anchor_index, suffix_latent_frame_num,
                 anchor_index, image_condition_joint_img2_guidance_weight,
                 anchor_index)
         elif image_condition_one_way_prompt_guidance:
