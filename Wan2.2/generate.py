@@ -124,6 +124,10 @@ def _validate_args(args):
             assert args.image_condition_joint_img2_guidance, (
                 "--image_condition_joint_img2_guidance_single_frame_anchor "
                 "requires --image_condition_joint_img2_guidance.")
+        if args.image_condition_joint_img2_guidance_single_frame_anchor_history:
+            assert args.image_condition_joint_img2_guidance_single_frame_anchor, (
+                "--image_condition_joint_img2_guidance_single_frame_anchor_history "
+                "requires --image_condition_joint_img2_guidance_single_frame_anchor.")
         if args.image_condition_joint_img2_guidance_rope_compression:
             assert args.image_condition_joint_img2_guidance_shifted_anchor, (
                 "--image_condition_joint_img2_guidance_rope_compression "
@@ -682,6 +686,14 @@ def _parse_args():
               "history, and bypass the encoder's temporal downsampling at "
               "the anchor as for a first frame. Keeps the latent count, "
               "attention, B encoding, and velocity replacement unchanged."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_single_frame_anchor_history",
+        action="store_true",
+        help=("With the single-frame anchor option, retain two preceding "
+              "feature slices at each temporal downsampler and run its "
+              "learned kernel on [older, newer, Img2] at the anchor instead "
+              "of bypassing it. Ordinary chunks still use their normal "
+              "one-slice history. Experimental; preserves latent count."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_rope_compression",
         action="store_true",
@@ -1331,6 +1343,8 @@ def generate(args):
                 args.image_condition_joint_img2_guidance_shifted_anchor),
             image_condition_joint_img2_guidance_single_frame_anchor=(
                 args.image_condition_joint_img2_guidance_single_frame_anchor),
+            image_condition_joint_img2_guidance_single_frame_anchor_history=(
+                args.image_condition_joint_img2_guidance_single_frame_anchor_history),
             image_condition_joint_img2_guidance_rope_compression=(
                 args.image_condition_joint_img2_guidance_rope_compression),
             image_condition_joint_img2_guidance_static_b_prompt=(

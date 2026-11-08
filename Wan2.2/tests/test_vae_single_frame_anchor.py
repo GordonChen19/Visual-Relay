@@ -47,8 +47,10 @@ resample_forward = next(n for n in resample_class.body
                         if isinstance(n, ast.FunctionDef) and n.name == 'forward')
 resample_scope = dict(
     rearrange=lambda value, pattern, **kwargs: value,
-    torch=types.SimpleNamespace(cat=lambda parts, dim: Pixels(
-        [value for part in parts for value in part.values])))
+    torch=types.SimpleNamespace(
+        cat=lambda parts, dim: Pixels(
+            [value for part in parts for value in part.values]),
+        zeros_like=lambda value: Pixels([0] * value.size(2))))
 exec(compile(ast.Module(body=[resample_forward], type_ignores=[]),
              str(SOURCE), 'exec'), resample_scope)
 
@@ -90,12 +92,13 @@ class ChunkAndCacheTests(unittest.TestCase):
                 assert dimension == 1
                 return self.frames
 
-        for enabled in (False, True):
-            with self.subTest(single_frame_anchor=enabled):
+        for enabled, history in ((False, False), (True, False), (True, True)):
+            with self.subTest(single_frame_anchor=enabled, history=history):
                 calls = []
 
-                def encode(videos, single_frame_indices=None):
-                    calls.append(([v.frames for v in videos], single_frame_indices))
+                def encode(videos, single_frame_indices=None, single_frame_history=False):
+                    calls.append(([v.frames for v in videos], single_frame_indices,
+                                  single_frame_history))
                     return [Video(len(chunk_plan(v.frames, single_frame_indices)))
                             for v in videos]
 
@@ -111,15 +114,16 @@ class ChunkAndCacheTests(unittest.TestCase):
                     imgs=['Img1', 'Img2'], F=81, anchor_index=10,
                     suffix_frame_num=41, latent_frame_num=21,
                     image_condition_joint_img2_guidance_single_frame_anchor=enabled,
+                    image_condition_joint_img2_guidance_single_frame_anchor_history=history,
                     logging=types.SimpleNamespace(info=lambda *args: None))
                 exec(code, env)
                 self.assertEqual(env['suffix_latent_frame_num'], 11)
                 self.assertEqual(env['suffix_frame_num'], 41)
                 self.assertEqual([v.frames for v in env['encoded']], [21, 11])
                 if enabled:
-                    self.assertEqual(calls, [([78], (10,)), ([41], None)])
+                    self.assertEqual(calls, [([78], (10,), history), ([41], None, False)])
                 else:
-                    self.assertEqual(calls, [([81, 41], None)])
+                    self.assertEqual(calls, [([81, 41], None, False)])
 
     def test_default_chunks(self):
         plan = chunk_plan(81)
@@ -179,6 +183,80 @@ class ChunkAndCacheTests(unittest.TestCase):
         self.assertEqual(calls, [[7, 1, 2, 3, 4]])
         self.assertEqual(result.values, [10, 9])
 
+    def history_layer(self):
+        calls = []
+
+        def temporal_conv(value):
+            calls.append(value.values)
+            return Pixels([sum(value.values[i:i + 3])
+                           for i in range(0, len(value.values) - 2, 2)])
+
+        return types.SimpleNamespace(mode='downsample3d',
+                                     resample=lambda x: x, time_conv=temporal_conv), calls
+
+    def test_history_anchor_runs_kernel_and_continuation_uses_anchor(self):
+        layer, calls = self.history_layer()
+        forward = resample_scope['forward']
+        unrelated_cache = object()
+        cache = [unrelated_cache, Pixels([10, 20])]
+        result = forward(layer, Pixels([7]), cache, [1],
+                         single_frame_boundary=True, single_frame_history=True)
+        self.assertEqual(calls, [[10, 20, 7]])
+        self.assertEqual(result.values, [37])
+        self.assertEqual(cache[1].values, [20, 7])
+        self.assertIs(cache[0], unrelated_cache)
+        result = forward(layer, Pixels([1, 2, 3, 4]), cache, [1],
+                         single_frame_history=True)
+        self.assertEqual(calls[-1], [7, 1, 2, 3, 4])
+        self.assertEqual(result.values, [10, 9])
+        self.assertEqual(cache[1].values, [3, 4])
+
+    def test_two_cached_slices_do_not_change_ordinary_chunk_filtering(self):
+        layer, calls = self.history_layer()
+        forward = resample_scope['forward']
+        cache = [Pixels([99, 100])]
+        result = forward(layer, Pixels([1, 2, 3, 4]), cache, [0],
+                         single_frame_history=True)
+        self.assertEqual(calls, [[100, 1, 2, 3, 4]])
+        self.assertEqual(result.values, [103, 9])
+        self.assertEqual(cache[0].values, [3, 4])
+
+    def test_history_at_both_temporal_scales_produces_one_anchor(self):
+        first, first_calls = self.history_layer()
+        second, second_calls = self.history_layer()
+        cache = [Pixels([10, 20]), Pixels([100, 200])]
+        cursor = [0]
+        out = resample_scope['forward'](
+            first, Pixels([7]), cache, cursor,
+            single_frame_boundary=True, single_frame_history=True)
+        out = resample_scope['forward'](
+            second, out, cache, cursor,
+            single_frame_boundary=True, single_frame_history=True)
+        self.assertEqual(first_calls, [[10, 20, 7]])
+        self.assertEqual(second_calls, [[100, 200, 37]])
+        self.assertEqual(out.size(2), 1)
+        self.assertEqual(out.values, [337])
+        self.assertEqual(cursor, [2])
+
+    def test_near_start_anchor_pads_only_missing_older_feature(self):
+        layer, calls = self.history_layer()
+        cache = [Pixels([6])]
+        result = resample_scope['forward'](
+            layer, Pixels([7]), cache, [0],
+            single_frame_boundary=True, single_frame_history=True)
+        self.assertEqual(calls, [[0, 6, 7]])
+        self.assertEqual(result.values, [13])
+        self.assertEqual(cache[0].values, [6, 7])
+
+    def test_actual_first_frame_still_bypasses_even_in_history_mode(self):
+        layer, calls = self.history_layer()
+        cache = [None]
+        result = resample_scope['forward'](
+            layer, Pixels([7]), cache, [0], single_frame_history=True)
+        self.assertEqual(calls, [])
+        self.assertEqual(result.values, [7])
+        self.assertEqual(cache[0].values, [7])
+
 
 try:
     import torch
@@ -230,6 +308,56 @@ class TinyEncoderTests(unittest.TestCase):
             # Boundary processing leaves no persistent mode on the encoder.
             repeat = model.encode(ordinary, (0.0, 1.0))
             torch.testing.assert_close(repeat, baseline)
+
+    def test_real_history_filters_shapes_and_prefix_at_different_boundaries(self):
+        torch.manual_seed(28)
+        model = self.vae.WanVAE_(
+            dim=4, z_dim=2, dim_mult=[1, 2, 2, 2], num_res_blocks=1,
+            temperal_downsample=[True, True, False]).eval()
+        ordinary = torch.randn(1, 3, 17, 16, 16)
+        with torch.no_grad():
+            baseline = model.encode(ordinary, (0.0, 1.0))
+            for anchor in (1, 2, 4):
+                with self.subTest(anchor=anchor):
+                    start = 1 + 4 * (anchor - 1)
+                    compact = torch.cat([
+                        ordinary[:, :, :start + 1], ordinary[:, :, start + 4:]
+                    ], dim=2)
+                    layers = [layer for layer in model.encoder.downsamples
+                              if isinstance(layer, self.vae.Resample)
+                              and layer.mode == 'downsample3d']
+                    calls = [[] for _ in layers]
+                    handles = [layer.time_conv.register_forward_hook(
+                        lambda module, inputs, output, i=i:
+                        calls[i].append((inputs[0].shape[2], output.shape[2])))
+                        for i, layer in enumerate(layers)]
+                    try:
+                        result = model.encode(
+                            compact, (0.0, 1.0), single_frame_indices=(anchor,),
+                            single_frame_history=True)
+                    finally:
+                        for handle in handles:
+                            handle.remove()
+                    self.assertEqual(result.shape, baseline.shape)
+                    torch.testing.assert_close(result[:, :, :anchor],
+                                               baseline[:, :, :anchor])
+                    self.assertEqual([len(values) for values in calls], [4, 4])
+                    # The first true video frame bypasses; the interior anchor
+                    # is call anchor-1 at both scales and uses one 3-slice window.
+                    self.assertEqual(calls[0][anchor - 1], (3, 1))
+                    self.assertEqual(calls[1][anchor - 1], (3, 1))
+                    self.assertTrue(torch.isfinite(result).all())
+                    self.assertTrue(all(x is None for x in model._enc_feat_map))
+            repeat = model.encode(ordinary, (0.0, 1.0))
+            torch.testing.assert_close(repeat, baseline)
+
+    def test_history_option_requires_a_boundary(self):
+        model = self.vae.WanVAE_(
+            dim=4, z_dim=2, dim_mult=[1, 2, 2, 2], num_res_blocks=1,
+            temperal_downsample=[True, True, False]).eval()
+        with self.assertRaises(ValueError):
+            model.encode(torch.zeros(1, 3, 17, 16, 16), (0.0, 1.0),
+                         single_frame_history=True)
 
 
 if __name__ == '__main__':

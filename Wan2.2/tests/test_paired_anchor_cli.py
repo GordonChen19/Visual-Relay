@@ -264,6 +264,24 @@ class PairedAnchorCliTest(unittest.TestCase):
             self.parse(*base,
                        '--image_condition_joint_img2_guidance_single_frame_anchor')
 
+    def test_joint_single_frame_history_requires_single_frame_anchor(self):
+        base = (
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'full trajectory',
+            '--image', 'img2.png', '--image_latent_index', '10',
+            '--image_prompt', 'Img2 continuation',
+            '--image_condition_joint_img2_guidance')
+        default = self.parse(*base,
+                             '--image_condition_joint_img2_guidance_single_frame_anchor')
+        self.assertFalse(default.image_condition_joint_img2_guidance_single_frame_anchor_history)
+        args = self.parse(*base,
+                          '--image_condition_joint_img2_guidance_single_frame_anchor',
+                          '--image_condition_joint_img2_guidance_single_frame_anchor_history')
+        self.assertTrue(args.image_condition_joint_img2_guidance_single_frame_anchor_history)
+        with self.assertRaises(AssertionError):
+            self.parse(*base,
+                       '--image_condition_joint_img2_guidance_single_frame_anchor_history')
+
     def test_joint_img2_guidance_persistent_b_is_shifted_only(self):
         args = self.parse(
             '--image', 'img1.png', '--image_latent_index', '0',

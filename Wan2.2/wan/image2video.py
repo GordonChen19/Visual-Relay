@@ -271,6 +271,7 @@ class WanI2V:
                  image_condition_joint_img2_guidance_weight=0.25,
                  image_condition_joint_img2_guidance_shifted_anchor=False,
                  image_condition_joint_img2_guidance_single_frame_anchor=False,
+                 image_condition_joint_img2_guidance_single_frame_anchor_history=False,
                  image_condition_joint_img2_guidance_rope_compression=False,
                  image_condition_joint_img2_guidance_static_b_prompt=False,
                  image_condition_joint_img2_guidance_persistent_b=False,
@@ -502,6 +503,9 @@ class WanI2V:
         if (image_condition_joint_img2_guidance_single_frame_anchor
                 and not image_condition_joint_img2_guidance):
             raise ValueError("single-frame anchor requires joint Img2 guidance")
+        if (image_condition_joint_img2_guidance_single_frame_anchor_history
+                and not image_condition_joint_img2_guidance_single_frame_anchor):
+            raise ValueError("history mixing requires the single-frame anchor option")
         if (image_condition_joint_img2_guidance_rope_compression
                 and not image_condition_joint_img2_guidance_shifted_anchor):
             raise ValueError(
@@ -1105,17 +1109,23 @@ class WanI2V:
                         "one anchor interval: expected %d pixel frames, got %d" %
                         (expected_pixels, joint_encode_inputs[0].size(1)))
                 encoded = self.vae.encode(
-                    joint_encode_inputs[:1], single_frame_indices=(anchor_index,))
+                    joint_encode_inputs[:1], single_frame_indices=(anchor_index,),
+                    single_frame_history=(
+                        image_condition_joint_img2_guidance_single_frame_anchor_history))
                 # B remains an ordinary Img2-first encode with no restart.
                 encoded += self.vae.encode(joint_encode_inputs[1:])
                 logging.info(
                     "Single-frame contextual anchor enabled: J%d consumes "
                     "one Img2 pixel frame; causal convolution history is "
-                    "retained and temporal downsampling alone takes its "
-                    "first-frame bypass. Conditioning input has %d pixels "
+                    "retained; temporal downsampling %s. "
+                    "Conditioning input has %d pixels "
                     "and still produces %d latents. B encoding, attention, "
                     "velocity replacement, and decoding are unchanged",
-                    anchor_index, joint_encode_inputs[0].size(1), latent_frame_num)
+                    anchor_index,
+                    ("runs its learned filters on two cached features plus Img2"
+                     if image_condition_joint_img2_guidance_single_frame_anchor_history
+                     else "takes its first-frame bypass"),
+                    joint_encode_inputs[0].size(1), latent_frame_num)
             else:
                 encoded = self.vae.encode(joint_encode_inputs)
             if (encoded[0].size(1) != latent_frame_num
@@ -1152,7 +1162,9 @@ class WanI2V:
                     "CFG branch; only the resulting J prediction enters the "
                     "scheduler.%s B conditional text is %s",
                     latent_frame_num,
-                    ("one contextual pixel frame with temporal-downsampler bypass"
+                    (("one contextual pixel frame with history-mixing temporal filters"
+                      if image_condition_joint_img2_guidance_single_frame_anchor_history
+                      else "one contextual pixel frame with temporal-downsampler bypass")
                      if image_condition_joint_img2_guidance_single_frame_anchor
                      else "four repeated pixel frames in the interior anchor interval"),
                     suffix_latent_frame_num,
@@ -1193,7 +1205,9 @@ class WanI2V:
                 "J%d's predicted velocity independently in both CFG passes "
                 "before the scheduler step.",
                 latent_frame_num,
-                ("contextual Img2x1"
+                (("history-mixed Img2x1"
+                  if image_condition_joint_img2_guidance_single_frame_anchor_history
+                  else "contextual Img2x1")
                  if image_condition_joint_img2_guidance_single_frame_anchor
                  else "Img2x4"), anchor_index, suffix_latent_frame_num,
                 anchor_index, image_condition_joint_img2_guidance_weight,
