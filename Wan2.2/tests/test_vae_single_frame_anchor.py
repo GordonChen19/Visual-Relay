@@ -92,12 +92,13 @@ class ChunkAndCacheTests(unittest.TestCase):
                 assert dimension == 1
                 return self.frames
 
-        for enabled, history, four_history, three in (
-                (False, False, False, False),
-                (True, False, False, False),
-                (True, True, False, False),
-                (True, False, True, False),
-                (False, False, False, True)):
+        for enabled, history, four_history, three, b_index in (
+                (False, False, False, False, 0),
+                (True, False, False, False, 0),
+                (True, True, False, False, 0),
+                (True, False, True, False, 0),
+                (False, False, False, True, 0),
+                (True, False, True, False, 1)):
             with self.subTest(single_frame_anchor=enabled, history=history,
                               four_history=four_history,
                               three_frame_anchor=three):
@@ -126,6 +127,7 @@ class ChunkAndCacheTests(unittest.TestCase):
                     conditioning_video=lambda image, frames: Video(frames),
                     imgs=['Img1', 'Img2'], F=81, anchor_index=10,
                     suffix_frame_num=41, latent_frame_num=21,
+                    joint_b_anchor_index=b_index,
                     image_condition_joint_img2_guidance_single_frame_anchor=enabled,
                     image_condition_joint_img2_guidance_single_frame_anchor_history=history,
                     image_condition_joint_img2_guidance_single_frame_anchor_four_history=(
@@ -133,13 +135,14 @@ class ChunkAndCacheTests(unittest.TestCase):
                     image_condition_joint_img2_guidance_three_frame_anchor=three,
                     logging=types.SimpleNamespace(info=lambda *args: None))
                 exec(code, env)
-                self.assertEqual(env['suffix_latent_frame_num'], 11)
-                self.assertEqual(env['suffix_frame_num'], 41)
-                self.assertEqual([v.frames for v in env['encoded']], [21, 11])
+                b_pixels = 41 + 4 * b_index
+                self.assertEqual(env['suffix_latent_frame_num'], 11 + b_index)
+                self.assertEqual(env['suffix_frame_num'], b_pixels)
+                self.assertEqual([v.frames for v in env['encoded']], [21, 11 + b_index])
                 if enabled:
                     self.assertEqual(
                         calls, [([78], (10,), history, None, four_history),
-                                ([41], None, False, None, False)])
+                                ([b_pixels], None, False, None, False)])
                 elif three:
                     self.assertEqual(calls, [([80], None, False, (10,), False),
                                              ([41], None, False, None, False)])

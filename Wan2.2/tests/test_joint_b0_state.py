@@ -1,5 +1,6 @@
 """Exercise state-aligned B0 guidance without importing the CUDA stack."""
 import ast
+import copy
 import math
 from pathlib import Path
 import types
@@ -39,6 +40,9 @@ class Frames:
             self.storage[i] = value
         return self
 
+    def to(self, device):
+        return self
+
 
 class B0StateTests(unittest.TestCase):
     @classmethod
@@ -66,6 +70,7 @@ class B0StateTests(unittest.TestCase):
                 [value for part in parts for value in part.values])),
             anchor_index=2, current_latent=Frames([0, 1, 2, 3, 4]), t=999,
             joint_guidance_active=True,
+            image_condition_joint_img2_guidance_align_b1=False,
             joint_handoff_arg_c={'conditioning': 'retained joint'},
             joint_handoff_arg_null={'conditioning': 'retained joint negative'},
             sampling_step=15,
@@ -96,7 +101,8 @@ class B0StateTests(unittest.TestCase):
                    noise_pred_cond=Frames([10, 11, 12, 13, 14]),
                    noise_pred_uncond=Frames([1, 2, 3, 4, 5]),
                    predictions_cond=[None, Frames([100, 200, 300])],
-                   predictions_uncond=[None, Frames([7, 8, 9])])
+                   predictions_uncond=[None, Frames([7, 8, 9])],
+                   joint_b_anchor_index=0)
         original_c = env['noise_pred_cond']
         exec(compile(ast.Module(body=assignments, type_ignores=[]),
                      '<actual CFG branch replacements>', 'exec'), env)
@@ -113,6 +119,91 @@ class B0StateTests(unittest.TestCase):
                        if isinstance(node, ast.Name)}
         self.assertNotIn('joint_guidance_b_scheduler', identifiers)
         self.assertNotIn('joint_guidance_b_latent', identifiers)
+
+    def test_b1_alignment_prepends_persistent_b0_and_refreshes_suffix(self):
+        env = self.environment()
+        env.update(image_condition_joint_img2_guidance_align_b1=True,
+                   joint_b0_latent=Frames([99]))
+        env['self'] = types.SimpleNamespace(device='cpu')
+        exec(self.guided_block(), env)
+        self.assertEqual(env['latent_model_input'][1].values, [99, 2, 3, 4])
+        env['current_latent'] = Frames([10, 11, 12, 13, 14])
+        env['joint_b0_latent'] = Frames([88])
+        exec(self.guided_block(), env)
+        self.assertEqual(env['latent_model_input'][1].values, [88, 12, 13, 14])
+        # User's 21-latent, anchor-14 configuration: eight B latents,
+        # with B1..B7 matching J14..J20 and no extra trailing noise.
+        env.update(anchor_index=14, current_latent=Frames(list(range(21))))
+        exec(self.guided_block(), env)
+        self.assertEqual(env['latent_model_input'][1].values,
+                         [88, 14, 15, 16, 17, 18, 19, 20])
+
+    def test_b1_velocity_replaces_only_j_anchor_in_both_cfg_branches(self):
+        assignments = [node for node in ast.walk(self.tree)
+                       if isinstance(node, ast.Assign)
+                       and isinstance(node.value, ast.Call)
+                       and ast.unparse(node.value.func) == '_replace_joint_anchor_velocity']
+        env = dict(self.scope, anchor_index=2, joint_b_anchor_index=1,
+                   noise_pred_cond=Frames([10, 11, 12, 13, 14]),
+                   noise_pred_uncond=Frames([1, 2, 3, 4, 5]),
+                   predictions_cond=[None, Frames([100, 200, 300, 400])],
+                   predictions_uncond=[None, Frames([7, 8, 9, 10])])
+        exec(compile(ast.Module(body=assignments, type_ignores=[]),
+                     '<actual B1 replacements>', 'exec'), env)
+        self.assertEqual(env['noise_pred_cond'].values, [10, 11, 200, 13, 14])
+        self.assertEqual(env['noise_pred_uncond'].values, [1, 2, 8, 4, 5])
+
+    def test_b0_scheduler_uses_own_state_and_cfg_and_stops_at_handoff(self):
+        class Scalar(float):
+            def __add__(self, other):
+                return Scalar(float(self) + other)
+            def __sub__(self, other):
+                return Scalar(float(self) - other)
+            def __mul__(self, other):
+                return Scalar(float(self) * other)
+            def unsqueeze(self, dim):
+                return self
+            def squeeze(self, dim):
+                return self
+        branch = next(node for node in ast.walk(self.tree)
+                      if isinstance(node, ast.If)
+                      and any(isinstance(child, ast.Assign)
+                              and ast.unparse(child.targets[0]) == 'joint_b0_prediction'
+                              for child in node.body))
+        code = compile(ast.Module(body=[branch], type_ignores=[]),
+                       '<actual persistent B0 step>', 'exec')
+        calls = []
+        def step(prediction, timestep, state, **kwargs):
+            calls.append((prediction, state, timestep))
+            return (state - prediction * 0.1,)
+        env = dict(joint_guidance_active=True,
+                   image_condition_joint_img2_guidance_align_b1=True,
+                   joint_b0_scheduler=types.SimpleNamespace(step=step),
+                   joint_b0_pred_cond=Scalar(5),
+                   joint_b0_pred_uncond=Scalar(1),
+                   joint_b0_latent=Scalar(20),
+                   sample_guide_scale=3.0, t=999, seed_g=None)
+        exec(code, env)
+        self.assertEqual(calls[0][0], 13.0)
+        self.assertEqual(calls[0][1], 20.0)
+        self.assertAlmostEqual(env['joint_b0_latent'], 18.7, places=5)
+        env['joint_guidance_active'] = False
+        exec(code, env)
+        self.assertEqual(len(calls), 1)
+
+    def test_b0_scheduler_copies_initialized_schedule_without_shared_history(self):
+        assignment = next(node for node in ast.walk(self.tree)
+                          if isinstance(node, ast.Assign)
+                          and ast.unparse(node.targets[0]) == 'joint_b0_scheduler')
+        main = types.SimpleNamespace(timesteps=[999, 900, 800], history=[])
+        env = dict(copy=copy, sample_scheduler=main)
+        exec(compile(ast.Module(body=[assignment], type_ignores=[]),
+                     '<actual B0 scheduler initialization>', 'exec'), env)
+        b = env['joint_b0_scheduler']
+        self.assertEqual(b.timesteps, main.timesteps)
+        self.assertIsNot(b, main)
+        b.history.append('B0 prediction')
+        self.assertEqual(main.history, [])
 
     def test_ordinary_rope_reaches_both_cfg_branches_without_changing_handoff(self):
         assignments = [node for node in ast.walk(self.tree)
@@ -219,6 +310,51 @@ class TemporalRows:
 
 
 class OrdinaryJointRopeTests(unittest.TestCase):
+    def test_backward_pair_rope_uses_requested_query_dependent_coordinates(self):
+        root = Path(__file__).resolve().parents[1]
+        tree = ast.parse((root / 'wan/modules/attention.py').read_text())
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == 'joint_img2_guidance_attention')
+
+        def cat(parts, dim):
+            if dim == 0:
+                return TemporalRows([row for part in parts for row in part.rows])
+            return TemporalRows([sum((part.rows[i] for part in parts), [])
+                                 for i in range(parts[0].size(0))])
+
+        calls = []
+        def flash(q, k, v, **kwargs):
+            calls.append((q.rows[0], k.rows[0]))
+            return q
+        def shift(x, delta, freqs):
+            return TemporalRows([[value + delta for value in row] for row in x.rows])
+
+        env = dict(
+            torch=types.SimpleNamespace(
+                bfloat16=None, cat=cat,
+                zeros_like=lambda x: TemporalRows([[0] * len(row) for row in x.rows])),
+            flash_attention=flash, _shift_temporal_rope=shift,
+            _record_joint_attention_shares=lambda *args: None)
+        exec(compile(ast.Module(body=[function], type_ignores=[]),
+                     '<backward-pair attention>', 'exec'), env)
+        coordinates = TemporalRows([list(range(21)), list(range(21))])
+        env[function.name](
+            q=coordinates, k=coordinates, v=coordinates,
+            seq_lens=[21, 12],
+            grid_sizes=TemporalRows([[21, 1, 1], [12, 1, 1]]),
+            anchor_index=10, rope_compression=True,
+            anchor_rope_offset=-1.0, velocity_only=True, freqs=object())
+
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(calls[0][0], list(range(10)))
+        self.assertEqual(calls[0][1][9:11], [9, 9])
+        self.assertEqual(calls[1][0], [9])
+        self.assertEqual(calls[1][1][8:10], [8, 8])
+        self.assertEqual(calls[1][1][10:], list(range(9, 20)))
+        self.assertEqual(calls[2], (list(range(11, 21)), list(range(21))))
+        self.assertEqual(calls[3], (list(range(12)), list(range(12))))
+
     @unittest.skipIf(torch is None, "PyTorch is not installed")
     def test_fractional_anchor_has_real_temporal_rope_phase(self):
         path = Path(__file__).resolve().parents[1] / 'wan/modules/attention.py'

@@ -33,7 +33,8 @@ def collect_joint_adaptive_alpha_stats(enabled=False):
 
 def _record_joint_attention_shares(q, k, anchor_index, tokens_per_frame,
                                    suffix_q=None, suffix_k=None,
-                                   prefix_anchor_visible=True):
+                                   prefix_anchor_visible=True,
+                                   suffix_anchor_transfer=None):
     """Exact group probabilities, chunked to avoid a full attention matrix."""
     samples = _joint_attention_samples.get()
     if samples is None:
@@ -62,13 +63,32 @@ def _record_joint_attention_shares(q, k, anchor_index, tokens_per_frame,
                     query[:, start:start + 16].transpose(1, 2).float(),
                     keys) * (q.size(-1) ** -0.5)
                 normalizer = torch.logsumexp(logits, dim=-1)
+                transfer_weights = None
+                if query_frame > anchor_index and suffix_anchor_transfer is not None:
+                    boundary = anchor_index * tokens_per_frame
+                    end = boundary + tokens_per_frame
+                    group_lse = torch.stack([
+                        torch.logsumexp(logits[..., :boundary], dim=-1),
+                        torch.logsumexp(logits[..., boundary:end], dim=-1),
+                        torch.logsumexp(logits[..., end:], dim=-1),
+                    ], dim=-1)
+                    original_weights, transfer_weights = _joint_suffix_transfer_weights(
+                        group_lse, *suffix_anchor_transfer)
                 for index, frame in enumerate(targets):
                     if frame is None:
                         continue
                     group_lse = torch.logsumexp(
                         logits[..., frame * tokens_per_frame:
                                (frame + 1) * tokens_per_frame], dim=-1)
-                    group_sums[index] += (group_lse - normalizer).exp().sum()
+                    probability = (group_lse - normalizer).exp()
+                    if transfer_weights is not None:
+                        if frame == anchor_index:
+                            probability = transfer_weights[..., 1]
+                        elif frame < anchor_index:
+                            probability = probability * (
+                                transfer_weights[..., 0]
+                                / original_weights[..., 0].clamp_min(1e-30))
+                    group_sums[index] += probability.sum()
         sums.append(group_sums)
         count = query.size(0) * query.size(1) * query.size(2)
     samples.append(torch.cat([*sums, q.new_tensor([count], dtype=torch.float32)]))
@@ -325,6 +345,43 @@ def cross_tail_bridge_attention(
     return torch.cat([m_output, b_output, d_output], dim=0)
 
 
+def _joint_suffix_transfer_weights(group_lse, ratio, max_delta):
+    """Move a bounded probability share from prefix to anchor, keeping suffix fixed."""
+    if not math.isfinite(ratio) or ratio < 0:
+        raise ValueError("suffix anchor transfer ratio must be finite and nonnegative")
+    if not math.isfinite(max_delta) or not 0 <= max_delta <= 1:
+        raise ValueError("suffix anchor transfer cap must be in [0, 1]")
+    weights = group_lse.float().softmax(dim=-1)
+    prefix, anchor, suffix = weights.unbind(dim=-1)
+    delta = ((ratio * prefix - anchor) / (1.0 + ratio)).clamp(
+        min=0.0, max=max_delta)
+    delta = torch.minimum(delta, prefix)
+    corrected = torch.stack([prefix - delta, anchor + delta, suffix], dim=-1)
+    return weights, corrected
+
+
+def _joint_first_suffix_attention(q, k, v, anchor_start, anchor_end,
+                                  transfer, window_size, dtype):
+    """Exactly aggregate one softmax with probability-preserving group biases.
+
+    Separate FlashAttention calls expose each group's LSE and normalized
+    spatial output. Their corrected mixture is algebraically the attention
+    obtained by applying the proposed per-query/head biases to the full logits.
+    """
+    outputs, evidence = [], []
+    for start, end in ((0, anchor_start), (anchor_start, anchor_end),
+                       (anchor_end, k.size(1))):
+        output, lse = flash_attention(
+            q=q, k=k[:, start:end], v=v[:, start:end],
+            window_size=window_size, dtype=dtype, return_lse=True)
+        outputs.append(output)
+        evidence.append(lse)
+    _, weights = _joint_suffix_transfer_weights(
+        torch.stack(evidence, dim=-1), *transfer)
+    return (torch.stack([output.float() for output in outputs], dim=-2)
+            * weights.unsqueeze(-1)).sum(dim=-2).to(outputs[0].dtype)
+
+
 def joint_img2_guidance_attention(
     q,
     k,
@@ -339,6 +396,7 @@ def joint_img2_guidance_attention(
     adaptive_pair_alpha_max=0.7,
     compression_ratio=1.0,
     anchor_rope_offset=None,
+    suffix_anchor_transfer=None,
     velocity_only=False,
     freqs=None,
     window_size=(-1, -1),
@@ -362,8 +420,13 @@ def joint_img2_guidance_attention(
         raise ValueError("joint Img2 guidance weight must be in [0, 1]")
     if not 0.0 <= compression_ratio <= 1.0:
         raise ValueError("joint RoPE compression ratio must be in [0, 1]")
+    backward_pair_rope = anchor_rope_offset == -1.0
+    if suffix_anchor_transfer is not None and not (rope_compression and velocity_only):
+        raise ValueError("suffix anchor transfer requires shifted-anchor RoPE routing")
     if anchor_rope_offset is not None:
-        if not rope_compression or not 0.0 <= anchor_rope_offset <= 1.0:
+        if (not rope_compression
+                or not (backward_pair_rope
+                        or 0.0 <= anchor_rope_offset <= 1.0)):
             raise ValueError(
                 "fractional anchor RoPE requires compressed routing and offset in [0, 1]")
 
@@ -405,7 +468,13 @@ def joint_img2_guidance_attention(
         # At ratio 1, prefix queries retain their native coordinates. Compress every
         # post-anchor key left by one so the anchor and first suffix frame
         # share the anchor coordinate: [..., J9@9, J10@10, J11@10, J12@11].
-        if anchor_rope_offset is not None:
+        if backward_pair_rope:
+            prefix_k = torch.cat([
+                joint_k[:, :aligned_start],
+                _shift_temporal_rope(
+                    joint_k[:, aligned_start:], -1.0, freqs),
+            ], dim=1)
+        elif anchor_rope_offset is not None:
             # For prefix/suffix queries, J9/J11 are neighbours while J10
             # sits at the requested fraction between them. The anchor query
             # below keeps native self/future offsets and its existing mask.
@@ -426,11 +495,14 @@ def joint_img2_guidance_attention(
         # suffix queries and anchor/suffix keys left by one, colocating J9/J10
         # while preserving relative offsets within the suffix. J11 is then
         # one temporal step from both J9 and J10 at ratio 1.
-        suffix_shift = 1.0 if anchor_rope_offset is not None else compression_ratio
+        suffix_shift = (0.0 if backward_pair_rope else
+                        1.0 if anchor_rope_offset is not None else
+                        compression_ratio)
         compressed_suffix_q = (_shift_temporal_rope(
             joint_q[:, anchor_end:], -suffix_shift, freqs)
             if suffix_shift else joint_q[:, anchor_end:])
-        suffix_k = (prefix_k if anchor_rope_offset is not None else
+        suffix_k = (joint_k if backward_pair_rope else
+                    prefix_k if anchor_rope_offset is not None else
                     torch.cat([
                         joint_k[:, :aligned_start],
                         _shift_temporal_rope(
@@ -439,7 +511,7 @@ def joint_img2_guidance_attention(
                     ], dim=1) if compression_ratio else joint_k)
         _record_joint_attention_shares(
             joint_q, prefix_k, anchor_index, tokens_per_frame,
-            compressed_suffix_q, suffix_k)
+            compressed_suffix_q, suffix_k, True, suffix_anchor_transfer)
         # Prefix queries read all J memory, including the anchor and its
         # colocated first suffix neighbour, with no mass correction.
         prefix_output = flash_attention(
@@ -448,18 +520,46 @@ def joint_img2_guidance_attention(
             v=joint_v,
             window_size=window_size,
             dtype=dtype)
-        anchor_output = flash_attention(
-            q=joint_q[:, aligned_start:anchor_end],
-            k=joint_k[:, aligned_start:],
-            v=joint_v[:, aligned_start:],
-            window_size=window_size,
-            dtype=dtype)
-        suffix_output = flash_attention(
-            q=compressed_suffix_q,
-            k=suffix_k,
-            v=joint_v,
-            window_size=window_size,
-            dtype=dtype)
+        if backward_pair_rope:
+            anchor_q = _shift_temporal_rope(
+                joint_q[:, aligned_start:anchor_end], -1.0, freqs)
+            anchor_k = torch.cat([
+                joint_k[:, :aligned_start - tokens_per_frame],
+                _shift_temporal_rope(
+                    joint_k[:, aligned_start - tokens_per_frame:],
+                    -1.0, freqs),
+            ], dim=1)
+            anchor_output = flash_attention(
+                q=anchor_q,
+                k=anchor_k,
+                v=joint_v,
+                window_size=window_size,
+                dtype=dtype)
+        else:
+            anchor_output = flash_attention(
+                q=joint_q[:, aligned_start:anchor_end],
+                k=joint_k[:, aligned_start:],
+                v=joint_v[:, aligned_start:],
+                window_size=window_size,
+                dtype=dtype)
+        if suffix_anchor_transfer is not None:
+            first_suffix = _joint_first_suffix_attention(
+                compressed_suffix_q[:, :tokens_per_frame], suffix_k, joint_v,
+                aligned_start, anchor_end, suffix_anchor_transfer, window_size, dtype)
+            if compressed_suffix_q.size(1) > tokens_per_frame:
+                remaining_suffix = flash_attention(
+                    q=compressed_suffix_q[:, tokens_per_frame:],
+                    k=suffix_k, v=joint_v, window_size=window_size, dtype=dtype)
+                suffix_output = torch.cat([first_suffix, remaining_suffix], dim=1)
+            else:
+                suffix_output = first_suffix
+        else:
+            suffix_output = flash_attention(
+                q=compressed_suffix_q,
+                k=suffix_k,
+                v=joint_v,
+                window_size=window_size,
+                dtype=dtype)
         joint_output = torch.cat(
             [prefix_output, anchor_output, suffix_output], dim=1)
     else:

@@ -374,6 +374,59 @@ class PairedAnchorCliTest(unittest.TestCase):
             self.parse(*base, '--image_condition_joint_img2_guidance', flag,
                        '--image_condition_joint_img2_guidance_single_frame_anchor')
 
+    def test_joint_b1_alignment_requires_shifted_mode_and_defaults_off(self):
+        base = (
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'first',
+            '--image', 'img2.png', '--image_latent_index', '14',
+            '--image_prompt', 'second',
+            '--image_condition_joint_img2_guidance')
+        flag = '--image_condition_joint_img2_guidance_align_b1'
+        self.assertFalse(self.parse(*base).image_condition_joint_img2_guidance_align_b1)
+        with self.assertRaises(AssertionError):
+            self.parse(*base, flag)
+        args = self.parse(*base, flag,
+                          '--image_condition_joint_img2_guidance_shifted_anchor')
+        self.assertTrue(args.image_condition_joint_img2_guidance_align_b1)
+
+    def test_backward_pair_rope_is_shifted_and_exclusive(self):
+        base = (
+            '--image', 'img1.png', '--image_latent_index', '0',
+            '--image_prompt', 'first',
+            '--image', 'img2.png', '--image_latent_index', '14',
+            '--image_prompt', 'second',
+            '--image_condition_joint_img2_guidance')
+        flag = '--image_condition_joint_img2_guidance_backward_pair_rope_compression'
+        with self.assertRaises(AssertionError):
+            self.parse(*base, flag)
+        args = self.parse(*base, flag,
+                          '--image_condition_joint_img2_guidance_shifted_anchor')
+        self.assertTrue(
+            args.image_condition_joint_img2_guidance_backward_pair_rope_compression)
+        with self.assertRaises(AssertionError):
+            self.parse(*base, flag,
+                       '--image_condition_joint_img2_guidance_shifted_anchor',
+                       '--image_condition_joint_img2_guidance_anchor_rope_offset', '0.5')
+
+    def test_suffix_anchor_transfer_requires_routing_and_valid_cap(self):
+        base = (
+            '--image', 'img1.png', '--image_latent_index', '0', '--image_prompt', 'first',
+            '--image', 'img2.png', '--image_latent_index', '14', '--image_prompt', 'second',
+            '--image_condition_joint_img2_guidance',
+            '--image_condition_joint_img2_guidance_shifted_anchor')
+        flag = '--image_condition_joint_img2_guidance_suffix_anchor_transfer'
+        self.assertFalse(self.parse(*base).image_condition_joint_img2_guidance_suffix_anchor_transfer)
+        with self.assertRaises(AssertionError):
+            self.parse(*base, flag)
+        routed = (*base, '--image_condition_joint_img2_guidance_anchor_rope_offset', '0.8')
+        args = self.parse(*routed, flag)
+        self.assertEqual(args.image_condition_joint_img2_guidance_suffix_anchor_transfer_ratio, 1.)
+        self.assertEqual(args.image_condition_joint_img2_guidance_suffix_anchor_transfer_max_delta, .05)
+        for value in ('-0.1', '1.1', 'nan'):
+            with self.assertRaises(AssertionError):
+                self.parse(*routed, flag,
+                           '--image_condition_joint_img2_guidance_suffix_anchor_transfer_max_delta', value)
+
     def test_joint_img2_guidance_persistent_b_is_shifted_only(self):
         args = self.parse(
             '--image', 'img1.png', '--image_latent_index', '0',

@@ -120,6 +120,10 @@ def _validate_args(args):
             assert args.image_condition_joint_img2_guidance, (
                 "--image_condition_joint_img2_guidance_shifted_anchor "
                 "requires --image_condition_joint_img2_guidance.")
+        if args.image_condition_joint_img2_guidance_align_b1:
+            assert args.image_condition_joint_img2_guidance_shifted_anchor, (
+                "--image_condition_joint_img2_guidance_align_b1 requires "
+                "--image_condition_joint_img2_guidance_shifted_anchor.")
         if args.image_condition_joint_img2_guidance_single_frame_anchor:
             assert args.image_condition_joint_img2_guidance, (
                 "--image_condition_joint_img2_guidance_single_frame_anchor "
@@ -155,10 +159,32 @@ def _validate_args(args):
                 "requires --image_condition_joint_img2_guidance_shifted_anchor.")
             assert (0.0 <= args.image_condition_joint_img2_guidance_anchor_rope_offset
                     <= 1.0), "Anchor RoPE offset must be in [0, 1]."
+        if args.image_condition_joint_img2_guidance_backward_pair_rope_compression:
+            assert args.image_condition_joint_img2_guidance_shifted_anchor, (
+                "--image_condition_joint_img2_guidance_backward_pair_rope_compression "
+                "requires --image_condition_joint_img2_guidance_shifted_anchor.")
+            assert not args.image_condition_joint_img2_guidance_rope_compression, (
+                "Backward-pair compression is a separate RoPE ablation.")
+            assert not args.image_condition_joint_img2_guidance_no_rope_compression, (
+                "Backward-pair compression is a separate RoPE ablation.")
+            assert args.image_condition_joint_img2_guidance_anchor_rope_offset is None, (
+                "Backward-pair compression replaces the fractional anchor offset.")
         if args.image_condition_joint_img2_guidance_static_b_prompt:
             assert args.image_condition_joint_img2_guidance, (
                 "--image_condition_joint_img2_guidance_static_b_prompt "
                 "requires --image_condition_joint_img2_guidance.")
+        if args.image_condition_joint_img2_guidance_suffix_anchor_transfer:
+            assert args.image_condition_joint_img2_guidance_shifted_anchor, (
+                "Suffix anchor transfer requires shifted-anchor guidance.")
+            assert (args.image_condition_joint_img2_guidance_rope_compression
+                    or args.image_condition_joint_img2_guidance_no_rope_compression
+                    or args.image_condition_joint_img2_guidance_anchor_rope_offset is not None
+                    or args.image_condition_joint_img2_guidance_backward_pair_rope_compression), (
+                "Suffix anchor transfer requires a joint RoPE routing option.")
+            ratio = args.image_condition_joint_img2_guidance_suffix_anchor_transfer_ratio
+            cap = args.image_condition_joint_img2_guidance_suffix_anchor_transfer_max_delta
+            assert 0 <= ratio < float('inf'), "Transfer ratio must be finite and nonnegative."
+            assert 0 <= cap <= 1, "Transfer cap must be in [0, 1]."
         if args.image_condition_joint_img2_guidance_persistent_b:
             assert args.image_condition_joint_img2_guidance_shifted_anchor, (
                 "--image_condition_joint_img2_guidance_persistent_b "
@@ -174,7 +200,8 @@ def _validate_args(args):
             assert (args.image_condition_joint_img2_guidance_rope_compression
                     or args.image_condition_joint_img2_guidance_no_rope_compression
                     or args.image_condition_joint_img2_guidance_anchor_rope_offset
-                    is not None), (
+                    is not None
+                    or args.image_condition_joint_img2_guidance_backward_pair_rope_compression), (
                 "Adaptive pair attention requires a joint Img2-guidance RoPE "
                 "mode: rope_compression, no_rope_compression, or anchor_rope_offset.")
             assert (args.image_condition_joint_img2_guidance_adaptive_pair_end_step
@@ -703,7 +730,15 @@ def _parse_args():
         help=("Legacy-named velocity-only guidance mode: B is rebuilt from "
               "J[anchor:] every step, so B0 shares J's anchor noisy state "
               "and supplies its final velocity in both CFG branches. No "
-              "layerwise B-output injection or independent B scheduler."))
+              "layerwise B-output injection. With align_b1, B1 supplies the "
+              "velocity instead and only B0 has an independent scheduler."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_align_b1",
+        action="store_true",
+        help=("Align B1 with J's anchor instead of B0. B0 has independent "
+              "initial noise and its own scheduler; B1 onward are rebuilt "
+              "from J[anchor:] each step. B1 replaces only J's anchor velocity "
+              "in both CFG branches. Requires shifted-anchor mode."))
     parser.add_argument(
         "--image_condition_joint_img2_guidance_single_frame_anchor",
         action="store_true",
@@ -763,6 +798,29 @@ def _parse_args():
               "J10's own query reads itself/future at ordinary uncompressed "
               "offsets. Overrides either other joint RoPE option. Requires "
               "shifted-anchor guidance; handoff and velocity stay unchanged."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_backward_pair_rope_compression",
+        action="store_true",
+        help=("Query-dependent backward-pair RoPE ablation. Prefix queries "
+              "see the frame before the anchor and the anchor at one shared "
+              "coordinate. The anchor reads all J and sees the two preceding "
+              "frames at one shared coordinate. Suffix queries use ordinary "
+              "RoPE. Values and softmax mass are unchanged."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_suffix_anchor_transfer",
+        action="store_true",
+        help=("Only for queries in the first frame after Img2's anchor, "
+              "transfer bounded attention probability from the entire prefix "
+              "to the anchor. Keeps all suffix probabilities unchanged. "
+              "Applied per query/head/layer in both CFG branches."))
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_suffix_anchor_transfer_ratio",
+        type=float, default=1.0,
+        help="Target anchor-to-total-prefix attention ratio (default: 1).")
+    parser.add_argument(
+        "--image_condition_joint_img2_guidance_suffix_anchor_transfer_max_delta",
+        type=float, default=0.05,
+        help="Maximum transferred probability per query/head (0.05 = 5 percentage points).")
     parser.add_argument(
         "--image_condition_joint_img2_guidance_static_b_prompt",
         action="store_true",
@@ -1399,6 +1457,8 @@ def generate(args):
                 args.image_condition_joint_img2_guidance_weight),
             image_condition_joint_img2_guidance_shifted_anchor=(
                 args.image_condition_joint_img2_guidance_shifted_anchor),
+            image_condition_joint_img2_guidance_align_b1=(
+                args.image_condition_joint_img2_guidance_align_b1),
             image_condition_joint_img2_guidance_single_frame_anchor=(
                 args.image_condition_joint_img2_guidance_single_frame_anchor),
             image_condition_joint_img2_guidance_single_frame_anchor_history=(
@@ -1413,8 +1473,16 @@ def generate(args):
                 args.image_condition_joint_img2_guidance_no_rope_compression),
             image_condition_joint_img2_guidance_anchor_rope_offset=(
                 args.image_condition_joint_img2_guidance_anchor_rope_offset),
+            image_condition_joint_img2_guidance_backward_pair_rope_compression=(
+                args.image_condition_joint_img2_guidance_backward_pair_rope_compression),
             image_condition_joint_img2_guidance_static_b_prompt=(
                 args.image_condition_joint_img2_guidance_static_b_prompt),
+            image_condition_joint_img2_guidance_suffix_anchor_transfer=(
+                args.image_condition_joint_img2_guidance_suffix_anchor_transfer),
+            image_condition_joint_img2_guidance_suffix_anchor_transfer_ratio=(
+                args.image_condition_joint_img2_guidance_suffix_anchor_transfer_ratio),
+            image_condition_joint_img2_guidance_suffix_anchor_transfer_max_delta=(
+                args.image_condition_joint_img2_guidance_suffix_anchor_transfer_max_delta),
             image_condition_joint_img2_guidance_persistent_b=(
                 args.image_condition_joint_img2_guidance_persistent_b),
             return_persistent_b_video=(

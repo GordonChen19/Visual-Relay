@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import copy
 import gc
 import logging
 import math
@@ -33,7 +34,7 @@ from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
 def _replace_joint_anchor_velocity(joint_prediction, b_prediction, anchor_index):
-    """Use B0's velocity at the same noisy state as the canonical J anchor."""
+    """Use the first supplied B velocity at the canonical J anchor."""
     result = joint_prediction.clone()
     result[:, anchor_index:anchor_index + 1].copy_(b_prediction[:, :1])
     return result
@@ -270,6 +271,7 @@ class WanI2V:
                  image_condition_joint_img2_guidance=False,
                  image_condition_joint_img2_guidance_weight=0.25,
                  image_condition_joint_img2_guidance_shifted_anchor=False,
+                 image_condition_joint_img2_guidance_align_b1=False,
                  image_condition_joint_img2_guidance_single_frame_anchor=False,
                  image_condition_joint_img2_guidance_single_frame_anchor_history=False,
                  image_condition_joint_img2_guidance_single_frame_anchor_four_history=False,
@@ -277,7 +279,11 @@ class WanI2V:
                  image_condition_joint_img2_guidance_rope_compression=False,
                  image_condition_joint_img2_guidance_no_rope_compression=False,
                  image_condition_joint_img2_guidance_anchor_rope_offset=None,
+                 image_condition_joint_img2_guidance_backward_pair_rope_compression=False,
                  image_condition_joint_img2_guidance_static_b_prompt=False,
+                 image_condition_joint_img2_guidance_suffix_anchor_transfer=False,
+                 image_condition_joint_img2_guidance_suffix_anchor_transfer_ratio=1.0,
+                 image_condition_joint_img2_guidance_suffix_anchor_transfer_max_delta=0.05,
                  image_condition_joint_img2_guidance_persistent_b=False,
                  return_persistent_b_video=False,
                  image_condition_joint_img2_guidance_attention_diagnostics=False,
@@ -377,6 +383,10 @@ class WanI2V:
                 Legacy name for velocity-only B0 guidance: rebuild B from
                 J's anchor onward, replace its final velocity with B0 in
                 both CFG branches, and schedule only J.
+            image_condition_joint_img2_guidance_align_b1 (`bool`, *optional*):
+                Prepend an independently scheduled Img2-first B0. Rebuild
+                B1 onward from J's anchor/suffix and replace the J anchor
+                velocity with B1 in both CFG branches.
             image_condition_cross_tail_bridge (`bool`, *optional*):
                 Run overlapping Img1 and Img2-first views of one canonical
                 full-video latent state with crossed K/V memory. M begins at
@@ -536,10 +546,36 @@ class WanI2V:
                     "fractional anchor RoPE requires shifted-anchor guidance")
             if not 0.0 <= image_condition_joint_img2_guidance_anchor_rope_offset <= 1.0:
                 raise ValueError("fractional anchor RoPE offset must be in [0, 1]")
+        if image_condition_joint_img2_guidance_backward_pair_rope_compression:
+            if not image_condition_joint_img2_guidance_shifted_anchor:
+                raise ValueError("backward-pair RoPE requires shifted-anchor guidance")
+            if (image_condition_joint_img2_guidance_rope_compression
+                    or image_condition_joint_img2_guidance_no_rope_compression
+                    or image_condition_joint_img2_guidance_anchor_rope_offset is not None):
+                raise ValueError("backward-pair RoPE is exclusive with other RoPE modes")
+            if int(image_latent_indices[1]) < 2:
+                raise ValueError("backward-pair RoPE requires two frames before the anchor")
         if (image_condition_joint_img2_guidance_static_b_prompt
                 and not image_condition_joint_img2_guidance):
             raise ValueError(
                 "static B prompt requires joint Img2 guidance")
+        if image_condition_joint_img2_guidance_suffix_anchor_transfer:
+            if not (image_condition_joint_img2_guidance
+                    and image_condition_joint_img2_guidance_shifted_anchor):
+                raise ValueError("suffix anchor transfer requires shifted joint guidance")
+            if not (image_condition_joint_img2_guidance_rope_compression
+                    or image_condition_joint_img2_guidance_no_rope_compression
+                    or image_condition_joint_img2_guidance_anchor_rope_offset is not None
+                    or image_condition_joint_img2_guidance_backward_pair_rope_compression):
+                raise ValueError("suffix anchor transfer requires a joint RoPE routing option")
+            if not (0 <= image_condition_joint_img2_guidance_suffix_anchor_transfer_ratio
+                    < float('inf')):
+                raise ValueError("suffix anchor transfer ratio must be finite and nonnegative")
+            if not 0 <= image_condition_joint_img2_guidance_suffix_anchor_transfer_max_delta <= 1:
+                raise ValueError("suffix anchor transfer cap must be in [0, 1]")
+        if (image_condition_joint_img2_guidance_align_b1
+                and not image_condition_joint_img2_guidance_shifted_anchor):
+            raise ValueError("B1 alignment requires shifted-anchor guidance")
         if (image_condition_joint_img2_guidance_persistent_b
                 and not image_condition_joint_img2_guidance_shifted_anchor):
             raise ValueError(
@@ -557,7 +593,8 @@ class WanI2V:
             if not (image_condition_joint_img2_guidance_rope_compression
                     or image_condition_joint_img2_guidance_no_rope_compression
                     or image_condition_joint_img2_guidance_anchor_rope_offset
-                    is not None):
+                    is not None
+                    or image_condition_joint_img2_guidance_backward_pair_rope_compression):
                 raise ValueError(
                     "adaptive pair attention requires a joint RoPE mode")
             if not (1 <=
@@ -844,7 +881,28 @@ class WanI2V:
             device=self.device)
         one_way_b_latent = None
         joint_guidance_b_snapshot = None
-        if image_condition_joint_img2_guidance_shifted_anchor:
+        joint_b0_latent = None
+        joint_b_anchor_index = int(image_condition_joint_img2_guidance_align_b1)
+        if image_condition_joint_img2_guidance_suffix_anchor_transfer:
+            logging.info(
+                "Suffix anchor transfer: only QJ%d shifts probability from "
+                "J0:J%d to J%d, targeting anchor/prefix=%.3f with cap=%.3f. "
+                "All suffix probabilities are preserved; both CFG branches "
+                "use this rule. Attention diagnostics report corrected shares.",
+                anchor_index + 1, anchor_index - 1, anchor_index,
+                image_condition_joint_img2_guidance_suffix_anchor_transfer_ratio,
+                image_condition_joint_img2_guidance_suffix_anchor_transfer_max_delta)
+        if image_condition_joint_img2_guidance_align_b1:
+            joint_b0_latent = torch.randn(
+                16, 1, lat_h, lat_w, dtype=torch.float32,
+                generator=seed_g, device=self.device)
+            logging.info(
+                "B1 alignment enabled: B=[persistent independent B0, J%d:J-end]. "
+                "B1 shares J%d's noisy state and replaces its velocity in both "
+                "CFG branches. Only B0 uses a separate scheduler with identical "
+                "timesteps; B1 onward are rebuilt from J each step.",
+                anchor_index, anchor_index)
+        elif image_condition_joint_img2_guidance_shifted_anchor:
             logging.info(
                 "State-aligned B0 guidance: B is rebuilt from J%d:J-end "
                 "at every guided step, so B0 and J%d share the exact noisy "
@@ -1121,7 +1179,8 @@ class WanI2V:
                 anchor_index, anchor_index - 1,
                 cross_tail_b_frame_num - 1)
         elif image_condition_joint_img2_guidance:
-            suffix_latent_frame_num = latent_frame_num - anchor_index
+            suffix_latent_frame_num = (
+                latent_frame_num - anchor_index + joint_b_anchor_index)
             suffix_frame_num = (1 + self.vae_stride[0]
                                 * (suffix_latent_frame_num - 1))
             joint_encode_inputs = [
@@ -1202,7 +1261,8 @@ class WanI2V:
                     joint_y[:, anchor_index + 1:]
                 ], dim=1)
             del encoded, joint_mask
-            if image_condition_joint_img2_guidance_shifted_anchor:
+            if (image_condition_joint_img2_guidance_shifted_anchor
+                    and not image_condition_joint_img2_guidance_align_b1):
                 logging.info(
                     "Shifted joint Img2 guidance: native %d-latent J is "
                     "jointly VAE-conditioned with Img1 at the beginning and "
@@ -1228,7 +1288,14 @@ class WanI2V:
                            else "four repeated pixel frames in the interior anchor interval")),
                     suffix_latent_frame_num,
                     anchor_index, anchor_index,
-                    ("fractional J anchor key at position %d-1+%.3f for "
+                    ("backward-pair J RoPE (prefix queries colocate J%d/J%d; "
+                     "the anchor query reads all J and colocates J%d/J%d; "
+                     "suffix queries use ordinary RoPE)" %
+                     (anchor_index - 1, anchor_index,
+                      anchor_index - 2, anchor_index - 1)
+                     if image_condition_joint_img2_guidance_backward_pair_rope_compression
+                     else
+                     "fractional J anchor key at position %d-1+%.3f for "
                      "prefix/suffix queries; suffix begins at %d and the "
                      "anchor's own self/future query uses ordinary offsets; "
                      "B uses ordinary RoPE" %
@@ -1260,10 +1327,11 @@ class WanI2V:
                      if (image_condition_joint_img2_guidance_rope_compression
                          or image_condition_joint_img2_guidance_no_rope_compression
                          or image_condition_joint_img2_guidance_anchor_rope_offset
-                         is not None)
+                         is not None
+                         or image_condition_joint_img2_guidance_backward_pair_rope_compression)
                      else ""),
                     "global prompt plus local prompt 2.")
-            else:
+            elif not image_condition_joint_img2_guidance_align_b1:
                 logging.info(
                 "Joint Img2-guidance ablation: native %d-latent J is VAE "
                 "conditioned jointly by Img1 at frame 0 and %s at latent "
@@ -1617,6 +1685,11 @@ class WanI2V:
             else:
                 raise NotImplementedError("Unsupported solver.")
 
+            # Copy before either scheduler has accumulated multistep history.
+            # Only the independent B0 state is advanced by this scheduler.
+            if joint_b0_latent is not None:
+                joint_b0_scheduler = copy.deepcopy(sample_scheduler)
+
             anchor_prior_schedule_end_step = (
                 sampling_steps - 1
                 if image_condition_self_attention_guidance_anchor_prior_end_step
@@ -1675,7 +1748,8 @@ class WanI2V:
                     (image_condition_joint_img2_guidance_rope_compression
                      or image_condition_joint_img2_guidance_no_rope_compression
                      or image_condition_joint_img2_guidance_anchor_rope_offset
-                     is not None),
+                     is not None
+                     or image_condition_joint_img2_guidance_backward_pair_rope_compression),
                     'joint_img2_guidance_adaptive_pair_attention':
                     image_condition_joint_img2_guidance_adaptive_pair_attention,
                     'joint_img2_guidance_adaptive_pair_margin':
@@ -1688,9 +1762,15 @@ class WanI2V:
                                 is None)
                         else 1.0),
                     'joint_img2_guidance_anchor_rope_offset':
-                    image_condition_joint_img2_guidance_anchor_rope_offset,
+                    (-1.0
+                     if image_condition_joint_img2_guidance_backward_pair_rope_compression
+                     else image_condition_joint_img2_guidance_anchor_rope_offset),
                     'joint_img2_guidance_velocity_only':
                     image_condition_joint_img2_guidance_shifted_anchor,
+                    'joint_img2_guidance_suffix_anchor_transfer': (
+                        (image_condition_joint_img2_guidance_suffix_anchor_transfer_ratio,
+                         image_condition_joint_img2_guidance_suffix_anchor_transfer_max_delta)
+                        if image_condition_joint_img2_guidance_suffix_anchor_transfer else None),
                     'temporal_prompt_relay': temporal_prompt_relay,
                 }
                 arg_null = {
@@ -1704,7 +1784,8 @@ class WanI2V:
                     (image_condition_joint_img2_guidance_rope_compression
                      or image_condition_joint_img2_guidance_no_rope_compression
                      or image_condition_joint_img2_guidance_anchor_rope_offset
-                     is not None),
+                     is not None
+                     or image_condition_joint_img2_guidance_backward_pair_rope_compression),
                     'joint_img2_guidance_adaptive_pair_attention':
                     image_condition_joint_img2_guidance_adaptive_pair_attention,
                     'joint_img2_guidance_adaptive_pair_margin':
@@ -1717,9 +1798,15 @@ class WanI2V:
                                 is None)
                         else 1.0),
                     'joint_img2_guidance_anchor_rope_offset':
-                    image_condition_joint_img2_guidance_anchor_rope_offset,
+                    (-1.0
+                     if image_condition_joint_img2_guidance_backward_pair_rope_compression
+                     else image_condition_joint_img2_guidance_anchor_rope_offset),
                     'joint_img2_guidance_velocity_only':
                     image_condition_joint_img2_guidance_shifted_anchor,
+                    'joint_img2_guidance_suffix_anchor_transfer': (
+                        (image_condition_joint_img2_guidance_suffix_anchor_transfer_ratio,
+                         image_condition_joint_img2_guidance_suffix_anchor_transfer_max_delta)
+                        if image_condition_joint_img2_guidance_suffix_anchor_transfer else None),
                 }
                 if image_condition_joint_img2_guidance_adaptive_pair_attention:
                     joint_handoff_arg_c = {
@@ -1958,11 +2045,14 @@ class WanI2V:
                         and sampling_step >=
                         image_condition_joint_img2_guidance_adaptive_pair_end_step)
                     if joint_guidance_active:
-                        # B is an evaluation view, not an independent state.
-                        # Its native first frame B0 is exactly J's anchor.
+                        b_input = current_latent[:, anchor_index:]
+                        if image_condition_joint_img2_guidance_align_b1:
+                            b_input = torch.cat([
+                                joint_b0_latent.to(self.device), b_input
+                            ], dim=1)
                         latent_model_input = [
                             current_latent,
-                            current_latent[:, anchor_index:],
+                            b_input,
                         ]
                         timestep = [t, t]
                     else:
@@ -2235,8 +2325,11 @@ class WanI2V:
                             "joint Img2-guidance conditional predictions "
                             "have incorrect lengths")
                     noise_pred_cond = predictions_cond[0]
+                    if image_condition_joint_img2_guidance_align_b1:
+                        joint_b0_pred_cond = predictions_cond[1][:, :1]
                     noise_pred_cond = _replace_joint_anchor_velocity(
-                        noise_pred_cond, predictions_cond[1], anchor_index)
+                        noise_pred_cond,
+                        predictions_cond[1][:, joint_b_anchor_index:], anchor_index)
                     del predictions_cond
                 elif image_condition_one_way_prompt_guidance:
                     if len(predictions_cond) != 2:
@@ -2336,8 +2429,11 @@ class WanI2V:
                             "joint Img2-guidance unconditional predictions "
                             "have incorrect lengths")
                     noise_pred_uncond = predictions_uncond[0]
+                    if image_condition_joint_img2_guidance_align_b1:
+                        joint_b0_pred_uncond = predictions_uncond[1][:, :1]
                     noise_pred_uncond = _replace_joint_anchor_velocity(
-                        noise_pred_uncond, predictions_uncond[1], anchor_index)
+                        noise_pred_uncond,
+                        predictions_uncond[1][:, joint_b_anchor_index:], anchor_index)
                     del predictions_uncond
                 elif image_condition_one_way_prompt_guidance:
                     if len(predictions_uncond) != 1:
@@ -2445,10 +2541,23 @@ class WanI2V:
                 del noise_pred_cond, noise_pred_uncond, noise_pred
                 latent = temp_x0.squeeze(0)
                 del temp_x0
+                if (joint_guidance_active
+                        and image_condition_joint_img2_guidance_align_b1):
+                    joint_b0_prediction = joint_b0_pred_uncond + sample_guide_scale * (
+                        joint_b0_pred_cond - joint_b0_pred_uncond)
+                    joint_b0_latent = joint_b0_scheduler.step(
+                        joint_b0_prediction.unsqueeze(0), t,
+                        joint_b0_latent.unsqueeze(0), return_dict=False,
+                        generator=seed_g)[0].squeeze(0)
+                    del joint_b0_prediction, joint_b0_pred_cond, joint_b0_pred_uncond
                 if (return_persistent_b_video and joint_guidance_active):
                     # Optional diagnostic snapshot of the canonical B view,
                     # not a separately scheduled video trajectory.
                     joint_guidance_b_snapshot = latent[:, anchor_index:].clone()
+                    if image_condition_joint_img2_guidance_align_b1:
+                        joint_guidance_b_snapshot = torch.cat([
+                            joint_b0_latent, joint_guidance_b_snapshot
+                        ], dim=1)
                 if image_condition_cross_tail_bridge:
                     d_temp_x0 = cross_tail_d_scheduler.step(
                         cross_tail_d_noise_pred.unsqueeze(0),
@@ -2498,7 +2607,8 @@ class WanI2V:
                           and (image_condition_joint_img2_guidance_rope_compression
                                or image_condition_joint_img2_guidance_no_rope_compression
                                or image_condition_joint_img2_guidance_anchor_rope_offset
-                               is not None))):
+                               is not None
+                               or image_condition_joint_img2_guidance_backward_pair_rope_compression))):
                     retained_x0 = torch.cat([
                         x0[0][:, :anchor_index],
                         x0[0][:, anchor_index + 1:]
@@ -2524,6 +2634,8 @@ class WanI2V:
             del one_way_b_latent, one_way_b_scheduler
         if joint_guidance_b_snapshot is not None:
             del joint_guidance_b_snapshot
+        if joint_b0_latent is not None:
+            del joint_b0_latent, joint_b0_scheduler
         if cross_tail_d_latent is not None:
             del cross_tail_d_latent, cross_tail_d_scheduler
         if offload_model:
