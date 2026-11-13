@@ -51,7 +51,10 @@ class B0StateTests(unittest.TestCase):
         cls.tree = ast.parse((cls.root / 'wan/image2video.py').read_text())
         helpers = [node for node in cls.tree.body
                    if isinstance(node, ast.FunctionDef)
-                   and node.name == '_replace_joint_anchor_velocity']
+                   and node.name in {
+                       '_replace_joint_anchor_velocity',
+                       '_flush_multistep_solver_history',
+                   }]
         cls.scope = {}
         exec(compile(ast.Module(body=helpers, type_ignores=[]),
                      '<actual anchor replacement>', 'exec'), cls.scope)
@@ -71,8 +74,18 @@ class B0StateTests(unittest.TestCase):
             anchor_index=2, current_latent=Frames([0, 1, 2, 3, 4]), t=999,
             joint_guidance_active=True,
             image_condition_joint_img2_guidance_align_b1=False,
+            image_condition_joint_img2_guidance_velocity_blend_weights=None,
+            current_arg_c={}, current_arg_null={},
+            image_condition_joint_img2_guidance_handoff_img1_only=False,
             joint_handoff_arg_c={'conditioning': 'retained joint'},
             joint_handoff_arg_null={'conditioning': 'retained joint negative'},
+            sample_scheduler=types.SimpleNamespace(
+                model_outputs=['old-1', 'old-2'],
+                timestep_list=[999, 900], lower_order_nums=2,
+                last_sample='old-sample', _step_index=15,
+                timesteps=[999, 900, 800]),
+            _flush_multistep_solver_history=(
+                self.scope['_flush_multistep_solver_history']),
             sampling_step=15,
             image_condition_joint_img2_guidance_adaptive_pair_end_step=15,
             logging=types.SimpleNamespace(info=lambda *args: None))
@@ -89,6 +102,71 @@ class B0StateTests(unittest.TestCase):
         exec(self.guided_block(), env)
         self.assertEqual(env['latent_model_input'][1].values, [12, 13, 14])
 
+    def test_joint_input_is_not_overwritten_by_standard_i2v_input(self):
+        branch = next(
+            node for node in ast.walk(self.tree)
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) ==
+            'image_condition_joint_img2_guidance'
+            and any(
+                isinstance(child, ast.Assign)
+                and ast.unparse(child.targets[0]) ==
+                'joint_guidance_active'
+                for child in node.body))
+        self.assertTrue(branch.orelse)
+        self.assertTrue(any(
+            isinstance(child, ast.Assign)
+            and ast.unparse(child.targets[0]) == 'latent_model_input'
+            and ast.unparse(child.value) == '[latent.to(self.device)]'
+            for child in branch.orelse))
+        self.assertFalse(any(
+            isinstance(child, ast.Assign)
+            and ast.unparse(child.targets[0]) == 'latent_model_input'
+            and ast.unparse(child.value) == '[latent.to(self.device)]'
+            for child in branch.body))
+
+    def test_joint_cfg_arguments_are_not_overwritten_by_standard_arguments(self):
+        branch = next(
+            node for node in ast.walk(self.tree)
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) ==
+            'image_condition_joint_img2_guidance'
+            and any(
+                isinstance(child, ast.Assign)
+                and ast.unparse(child.targets[0]) == 'arg_c'
+                and 'joint_img2_guidance_anchor_index' in ast.unparse(child)
+                for child in node.body))
+        self.assertTrue(branch.orelse)
+        self.assertTrue(any(
+            isinstance(child, ast.Assign)
+            and ast.unparse(child.targets[0]) == 'arg_c'
+            and 'joint_img2_guidance_anchor_index' not in ast.unparse(child)
+            for child in branch.orelse))
+        self.assertFalse(any(
+            isinstance(child, ast.Assign)
+            and ast.unparse(child.targets[0]) == 'arg_c'
+            and 'joint_img2_guidance_anchor_index' not in ast.unparse(child)
+            for child in branch.body))
+
+    def test_final_latent_is_retained_for_decode(self):
+        assignments = [
+            node for node in ast.walk(self.tree)
+            if isinstance(node, ast.Assign)
+            and ast.unparse(node.targets[0]) == 'x0'
+            and ast.unparse(node.value) == '[latent]'
+        ]
+        self.assertEqual(len(assignments), 1)
+
+    def test_standard_path_initializes_joint_activity_to_false(self):
+        assignments = [
+            node for node in ast.walk(self.tree)
+            if isinstance(node, ast.Assign)
+            and ast.unparse(node.targets[0]) == 'joint_guidance_active'
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is False
+        ]
+        self.assertEqual(len(assignments), 1)
+
     def test_b0_velocity_replaces_only_anchor_in_both_cfg_branches(self):
         assignments = [node for node in ast.walk(self.tree)
                        if isinstance(node, ast.Assign)
@@ -98,6 +176,7 @@ class B0StateTests(unittest.TestCase):
         self.assertEqual({ast.unparse(n.targets[0]) for n in assignments},
                          {'noise_pred_cond', 'noise_pred_uncond'})
         env = dict(self.scope, anchor_index=2,
+                   image_condition_joint_img2_guidance_velocity_blend_weights=None,
                    noise_pred_cond=Frames([10, 11, 12, 13, 14]),
                    noise_pred_uncond=Frames([1, 2, 3, 4, 5]),
                    predictions_cond=[None, Frames([100, 200, 300])],
@@ -113,6 +192,26 @@ class B0StateTests(unittest.TestCase):
         guided = [u + scale * (c - u) for c, u in zip(
             env['noise_pred_cond'].values, env['noise_pred_uncond'].values)]
         self.assertEqual(guided[2], 7 + scale * (100 - 7))
+
+    def test_conditional_prediction_falls_back_to_the_standard_stream(self):
+        """The non-joint/post-handoff path must not reuse a deleted list."""
+        branch = next(
+            node for node in ast.walk(self.tree)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.Assign)
+                and isinstance(child.value, ast.Call)
+                and ast.unparse(child.value.func) ==
+                '_replace_joint_anchor_velocity'
+                and ast.unparse(child.targets[0]) == 'noise_pred_cond'
+                for child in ast.walk(ast.Module(body=node.body,
+                                                  type_ignores=[]))))
+        self.assertTrue(branch.orelse)
+        self.assertTrue(any(
+            isinstance(child, ast.Assign)
+            and ast.unparse(child.targets[0]) == 'noise_pred_cond'
+            and ast.unparse(child.value) == 'predictions_cond[0]'
+            for child in branch.orelse))
 
     def test_joint_b_has_no_independent_state_or_scheduler(self):
         identifiers = {node.id for node in ast.walk(self.tree)
@@ -144,6 +243,7 @@ class B0StateTests(unittest.TestCase):
                        and isinstance(node.value, ast.Call)
                        and ast.unparse(node.value.func) == '_replace_joint_anchor_velocity']
         env = dict(self.scope, anchor_index=2, joint_b_anchor_index=1,
+                   image_condition_joint_img2_guidance_velocity_blend_weights=None,
                    noise_pred_cond=Frames([10, 11, 12, 13, 14]),
                    noise_pred_uncond=Frames([1, 2, 3, 4, 5]),
                    predictions_cond=[None, Frames([100, 200, 300, 400])],
@@ -152,6 +252,19 @@ class B0StateTests(unittest.TestCase):
                      '<actual B1 replacements>', 'exec'), env)
         self.assertEqual(env['noise_pred_cond'].values, [10, 11, 200, 13, 14])
         self.assertEqual(env['noise_pred_uncond'].values, [1, 2, 8, 4, 5])
+
+    @unittest.skipIf(torch is None, 'PyTorch is unavailable')
+    def test_velocity_blend_weights_affect_only_requested_aligned_frames(self):
+        joint = torch.tensor([[[[[10.0]]], [[[20.0]]], [[[30.0]]],
+                               [[[40.0]]], [[[50.0]]]]])
+        aligned_b = torch.tensor([[[[[100.0]]], [[[200.0]]],
+                                   [[[300.0]]], [[[400.0]]]]])
+        result = self.scope['_replace_joint_anchor_velocity'](
+            joint, aligned_b, 1, (1.0, 0.5, 0.0, 0.25))
+        expected = torch.tensor([10.0, 100.0, 115.0, 40.0, 137.5])
+        self.assertTrue(torch.equal(result.flatten(), expected))
+        self.assertTrue(torch.equal(joint.flatten(),
+                                    torch.tensor([10., 20., 30., 40., 50.])))
 
     def test_b0_scheduler_uses_own_state_and_cfg_and_stops_at_handoff(self):
         class Scalar(float):
@@ -242,6 +355,23 @@ class B0StateTests(unittest.TestCase):
         self.assertEqual(env['latent_model_input'][0].values, [0, 1, 3, 4])
         self.assertIs(env['current_arg_c'], env['joint_handoff_arg_c'])
         self.assertIs(env['current_arg_null'], env['joint_handoff_arg_null'])
+        scheduler = env['sample_scheduler']
+        self.assertEqual(scheduler.model_outputs, [None, None])
+        self.assertEqual(scheduler.timestep_list, [None, None])
+        self.assertEqual(scheduler.lower_order_nums, 0)
+        self.assertIsNone(scheduler.last_sample)
+        self.assertEqual(scheduler._step_index, 15)
+        self.assertEqual(scheduler.timesteps, [999, 900, 800])
+
+    def test_solver_history_flush_occurs_only_on_handoff_step(self):
+        env = self.environment()
+        env.update(joint_guidance_active=False, sampling_step=16)
+        exec(self.guided_block(), env)
+        scheduler = env['sample_scheduler']
+        self.assertEqual(scheduler.model_outputs, ['old-1', 'old-2'])
+        self.assertEqual(scheduler.timestep_list, [999, 900])
+        self.assertEqual(scheduler.lower_order_nums, 2)
+        self.assertEqual(scheduler.last_sample, 'old-sample')
 
     def test_ordinary_rope_still_discards_anchor_before_decoding(self):
         branch = next(node for node in ast.walk(self.tree)
@@ -271,7 +401,8 @@ class B0StateTests(unittest.TestCase):
             matches = [node for node in ast.walk(self.tree)
                        if isinstance(node, ast.Assign)
                        and ast.unparse(node.targets[0]) == name
-                       and isinstance(node.value, (ast.Call, ast.Dict))]
+                       and isinstance(node.value, (ast.Call, ast.Dict,
+                                                   ast.IfExp))]
             self.assertEqual(len(matches), 1)
             return compile(ast.Module(body=matches, type_ignores=[]),
                            '<actual conditioning handoff>', 'exec')
@@ -281,9 +412,18 @@ class B0StateTests(unittest.TestCase):
                 values = [(i == 0 or i == anchor, 100 + i, 200 + i)
                           for i in range(21)]
                 env = self.environment()
+                handoff_relay = {
+                    'stream_index': 0,
+                    'segments': [{'midpoint': anchor}],
+                }
                 env.update(anchor_index=anchor, joint_y=Frames(values),
-                           context=['J', 'B', 'global'],
-                           context_null=['negative'] * 3, max_seq_len=21)
+                           image_condition_joint_img2_guidance_handoff_img1_only=False,
+                           context=['global + local 1 + local 2',
+                                    'global + local 2'],
+                           context_null=['negative'] * 2,
+                           handoff_temporal_prompt_relay=handoff_relay,
+                           max_seq_len=21)
+                exec(assignment('joint_handoff_source_y'), env)
                 exec(assignment('joint_handoff_y'), env)
                 exec(assignment('joint_handoff_arg_c'), env)
                 exec(assignment('joint_handoff_arg_null'), env)
@@ -292,7 +432,43 @@ class B0StateTests(unittest.TestCase):
                 for name in ('joint_handoff_arg_c', 'joint_handoff_arg_null'):
                     self.assertIs(env[name]['y'][0], env['joint_handoff_y'])
                     self.assertEqual(env[name]['y'][0].values, expected)
+                self.assertEqual(
+                    env['joint_handoff_arg_c']['context'],
+                    ['global + local 1 + local 2'])
+                self.assertIs(
+                    env['joint_handoff_arg_c']['temporal_prompt_relay'],
+                    handoff_relay)
+                self.assertEqual(env['joint_handoff_arg_null']['context'],
+                                 ['negative'])
+                self.assertNotIn('temporal_prompt_relay',
+                                 env['joint_handoff_arg_null'])
                 self.assertEqual(env['joint_y'].values, values)
+
+    def test_handoff_prompt_relay_keeps_original_frame_intervals(self):
+        calls = [
+            node for node in ast.walk(self.tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == 'build_prompt_relay'
+        ]
+        self.assertEqual(len(calls), 2)
+        expected = '((0, anchor_index), (anchor_index, latent_frame_num))'
+        self.assertEqual([ast.unparse(call.args[0]) for call in calls],
+                         [expected, expected])
+
+    def test_img1_only_handoff_selects_separate_standard_encode(self):
+        assignment = next(
+            node for node in ast.walk(self.tree)
+            if isinstance(node, ast.Assign)
+            and ast.unparse(node.targets[0]) == 'joint_handoff_source_y')
+        self.assertIsInstance(assignment.value, ast.IfExp)
+        self.assertEqual(
+            ast.unparse(assignment.value.test),
+            'image_condition_joint_img2_guidance_handoff_img1_only')
+        self.assertIn(
+            'encoded[handoff_img1_encode_index]',
+            ast.unparse(assignment.value.body))
+        self.assertEqual(ast.unparse(assignment.value.orelse), 'joint_y')
 
 
 class TemporalRows:

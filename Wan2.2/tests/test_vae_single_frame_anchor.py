@@ -92,33 +92,25 @@ class ChunkAndCacheTests(unittest.TestCase):
                 assert dimension == 1
                 return self.frames
 
-        for enabled, history, four_history, three, b_index in (
-                (False, False, False, False, 0),
-                (True, False, False, False, 0),
-                (True, True, False, False, 0),
-                (True, False, True, False, 0),
-                (False, False, False, True, 0),
-                (True, False, True, False, 1)):
-            with self.subTest(single_frame_anchor=enabled, history=history,
-                              four_history=four_history,
-                              three_frame_anchor=three):
+        for enabled, four_history, b_index in (
+                (False, False, 0),
+                (True, False, 0),
+                (True, True, 0),
+                (True, True, 1)):
+            with self.subTest(single_frame_anchor=enabled,
+                              four_history=four_history):
                 calls = []
 
                 def encode(videos, single_frame_indices=None,
-                           single_frame_history=False, three_frame_indices=None,
                            single_frame_four_history=False):
                     calls.append(([v.frames for v in videos], single_frame_indices,
-                                  single_frame_history, three_frame_indices,
                                   single_frame_four_history))
-                    return [Video(len(chunk_plan(v.frames, single_frame_indices,
-                                                 three_frame_indices)))
+                    return [Video(len(chunk_plan(v.frames, single_frame_indices)))
                             for v in videos]
 
                 def joint_builder(first, anchor, frames, index,
-                                  single_frame_anchor=False,
-                                  three_frame_anchor=False):
-                    return Video(frames - (3 if single_frame_anchor else
-                                           1 if three_frame_anchor else 0))
+                                  single_frame_anchor=False):
+                    return Video(frames - (3 if single_frame_anchor else 0))
 
                 env = dict(
                     self=types.SimpleNamespace(
@@ -129,10 +121,8 @@ class ChunkAndCacheTests(unittest.TestCase):
                     suffix_frame_num=41, latent_frame_num=21,
                     joint_b_anchor_index=b_index,
                     image_condition_joint_img2_guidance_single_frame_anchor=enabled,
-                    image_condition_joint_img2_guidance_single_frame_anchor_history=history,
                     image_condition_joint_img2_guidance_single_frame_anchor_four_history=(
                         four_history),
-                    image_condition_joint_img2_guidance_three_frame_anchor=three,
                     logging=types.SimpleNamespace(info=lambda *args: None))
                 exec(code, env)
                 b_pixels = 41 + 4 * b_index
@@ -141,14 +131,11 @@ class ChunkAndCacheTests(unittest.TestCase):
                 self.assertEqual([v.frames for v in env['encoded']], [21, 11 + b_index])
                 if enabled:
                     self.assertEqual(
-                        calls, [([78], (10,), history, None, four_history),
-                                ([b_pixels], None, False, None, False)])
-                elif three:
-                    self.assertEqual(calls, [([80], None, False, (10,), False),
-                                             ([41], None, False, None, False)])
+                        calls, [([78], (10,), four_history),
+                                ([b_pixels], None, False)])
                 else:
                     self.assertEqual(
-                        calls, [([81, 41], None, False, None, False)])
+                        calls, [([81, 41], None, False)])
 
     def test_default_chunks(self):
         plan = chunk_plan(81)
@@ -168,13 +155,6 @@ class ChunkAndCacheTests(unittest.TestCase):
                 self.assertEqual(sum(end - start for start, end, _ in plan), 78)
                 for left, right in zip(plan, plan[1:]):
                     self.assertEqual(left[1], right[0])
-
-    def test_three_frame_anchor_and_suffix_chunk_alignment(self):
-        plan = chunk_plan(80, three_frame_indices=(10,))
-        self.assertEqual(len(plan), 21)
-        self.assertEqual(plan[10], (37, 40, 3))
-        self.assertEqual(plan[11], (40, 44, False))
-        self.assertEqual(plan[-1][1], 80)
 
     def test_multiple_boundaries(self):
         plan = chunk_plan(75, (5, 10))
@@ -226,70 +206,6 @@ class ChunkAndCacheTests(unittest.TestCase):
         return types.SimpleNamespace(mode='downsample3d',
                                      resample=lambda x: x, time_conv=temporal_conv), calls
 
-    def test_history_anchor_runs_kernel_and_continuation_uses_anchor(self):
-        layer, calls = self.history_layer()
-        forward = resample_scope['forward']
-        unrelated_cache = object()
-        cache = [unrelated_cache, Pixels([10, 20])]
-        result = forward(layer, Pixels([7]), cache, [1],
-                         single_frame_boundary=True, single_frame_history=True)
-        self.assertEqual(calls, [[10, 20, 7]])
-        self.assertEqual(result.values, [37])
-        self.assertEqual(cache[1].values, [20, 7])
-        self.assertIs(cache[0], unrelated_cache)
-        result = forward(layer, Pixels([1, 2, 3, 4]), cache, [1],
-                         single_frame_history=True)
-        self.assertEqual(calls[-1], [7, 1, 2, 3, 4])
-        self.assertEqual(result.values, [10, 9])
-        self.assertEqual(cache[1].values, [3, 4])
-
-    def test_two_cached_slices_do_not_change_ordinary_chunk_filtering(self):
-        layer, calls = self.history_layer()
-        forward = resample_scope['forward']
-        cache = [Pixels([99, 100])]
-        result = forward(layer, Pixels([1, 2, 3, 4]), cache, [0],
-                         single_frame_history=True)
-        self.assertEqual(calls, [[100, 1, 2, 3, 4]])
-        self.assertEqual(result.values, [103, 9])
-        self.assertEqual(cache[0].values, [3, 4])
-
-    def test_history_at_both_temporal_scales_produces_one_anchor(self):
-        first, first_calls = self.history_layer()
-        second, second_calls = self.history_layer()
-        cache = [Pixels([10, 20]), Pixels([100, 200])]
-        cursor = [0]
-        out = resample_scope['forward'](
-            first, Pixels([7]), cache, cursor,
-            single_frame_boundary=True, single_frame_history=True)
-        out = resample_scope['forward'](
-            second, out, cache, cursor,
-            single_frame_boundary=True, single_frame_history=True)
-        self.assertEqual(first_calls, [[10, 20, 7]])
-        self.assertEqual(second_calls, [[100, 200, 37]])
-        self.assertEqual(out.size(2), 1)
-        self.assertEqual(out.values, [337])
-        self.assertEqual(cursor, [2])
-
-    def test_three_frame_anchor_uses_two_then_one_cached_features(self):
-        first, first_calls = self.history_layer()
-        second, second_calls = self.history_layer()
-        cache = [Pixels([10, 20]), Pixels([100])]
-        cursor = [0]
-        out = resample_scope['forward'](
-            first, Pixels([1, 2, 3]), cache, cursor,
-            three_frame_boundary=True, three_frame_history=True,
-            temporal_stage=0)
-        out = resample_scope['forward'](
-            second, out, cache, cursor,
-            three_frame_boundary=True, three_frame_history=True,
-            temporal_stage=1)
-        self.assertEqual(first_calls, [[10, 20, 1, 2, 3]])
-        self.assertEqual(second_calls, [[100, 31, 6]])
-        self.assertEqual(out.size(2), 1)
-        self.assertEqual(cache[0].values, [2, 3])
-        self.assertEqual(cache[1].values, [6])
-        self.assertEqual(cursor, [2])
-
     def test_single_frame_anchor_uses_four_then_one_cached_features(self):
         first, first_calls = self.history_layer()
         second, second_calls = self.history_layer()
@@ -309,25 +225,6 @@ class ChunkAndCacheTests(unittest.TestCase):
         self.assertEqual(cache[0].values, [20, 30, 40, 7])
         self.assertEqual(cache[1].values, [77])
         self.assertEqual(cursor, [2])
-
-    def test_near_start_anchor_pads_only_missing_older_feature(self):
-        layer, calls = self.history_layer()
-        cache = [Pixels([6])]
-        result = resample_scope['forward'](
-            layer, Pixels([7]), cache, [0],
-            single_frame_boundary=True, single_frame_history=True)
-        self.assertEqual(calls, [[0, 6, 7]])
-        self.assertEqual(result.values, [13])
-        self.assertEqual(cache[0].values, [6, 7])
-
-    def test_actual_first_frame_still_bypasses_even_in_history_mode(self):
-        layer, calls = self.history_layer()
-        cache = [None]
-        result = resample_scope['forward'](
-            layer, Pixels([7]), cache, [0], single_frame_history=True)
-        self.assertEqual(calls, [])
-        self.assertEqual(result.values, [7])
-        self.assertEqual(cache[0].values, [7])
 
 
 try:
@@ -381,79 +278,6 @@ class TinyEncoderTests(unittest.TestCase):
             repeat = model.encode(ordinary, (0.0, 1.0))
             torch.testing.assert_close(repeat, baseline)
 
-    def test_real_history_filters_shapes_and_prefix_at_different_boundaries(self):
-        torch.manual_seed(28)
-        model = self.vae.WanVAE_(
-            dim=4, z_dim=2, dim_mult=[1, 2, 2, 2], num_res_blocks=1,
-            temperal_downsample=[True, True, False]).eval()
-        ordinary = torch.randn(1, 3, 17, 16, 16)
-        with torch.no_grad():
-            baseline = model.encode(ordinary, (0.0, 1.0))
-            for anchor in (1, 2, 4):
-                with self.subTest(anchor=anchor):
-                    start = 1 + 4 * (anchor - 1)
-                    compact = torch.cat([
-                        ordinary[:, :, :start + 1], ordinary[:, :, start + 4:]
-                    ], dim=2)
-                    layers = [layer for layer in model.encoder.downsamples
-                              if isinstance(layer, self.vae.Resample)
-                              and layer.mode == 'downsample3d']
-                    calls = [[] for _ in layers]
-                    handles = [layer.time_conv.register_forward_hook(
-                        lambda module, inputs, output, i=i:
-                        calls[i].append((inputs[0].shape[2], output.shape[2])))
-                        for i, layer in enumerate(layers)]
-                    try:
-                        result = model.encode(
-                            compact, (0.0, 1.0), single_frame_indices=(anchor,),
-                            single_frame_history=True)
-                    finally:
-                        for handle in handles:
-                            handle.remove()
-                    self.assertEqual(result.shape, baseline.shape)
-                    torch.testing.assert_close(result[:, :, :anchor],
-                                               baseline[:, :, :anchor])
-                    self.assertEqual([len(values) for values in calls], [4, 4])
-                    # The first true video frame bypasses; the interior anchor
-                    # is call anchor-1 at both scales and uses one 3-slice window.
-                    self.assertEqual(calls[0][anchor - 1], (3, 1))
-                    self.assertEqual(calls[1][anchor - 1], (3, 1))
-                    self.assertTrue(torch.isfinite(result).all())
-                    self.assertTrue(all(x is None for x in model._enc_feat_map))
-            repeat = model.encode(ordinary, (0.0, 1.0))
-            torch.testing.assert_close(repeat, baseline)
-
-    def test_real_three_frame_anchor_uses_two_first_stage_outputs(self):
-        torch.manual_seed(29)
-        model = self.vae.WanVAE_(
-            dim=4, z_dim=2, dim_mult=[1, 2, 2, 2], num_res_blocks=1,
-            temperal_downsample=[True, True, False]).eval()
-        ordinary = torch.randn(1, 3, 17, 16, 16)
-        anchor = 2
-        compact = torch.cat([ordinary[:, :, :8], ordinary[:, :, 9:]], dim=2)
-        with torch.no_grad():
-            baseline = model.encode(ordinary, (0.0, 1.0))
-        layers = [layer for layer in model.encoder.downsamples
-                  if isinstance(layer, self.vae.Resample)
-                  and layer.mode == 'downsample3d']
-        calls = [[] for _ in layers]
-        handles = [layer.time_conv.register_forward_hook(
-            lambda module, inputs, output, i=i:
-            calls[i].append((inputs[0].shape[2], output.shape[2])))
-            for i, layer in enumerate(layers)]
-        try:
-            with torch.no_grad():
-                result = model.encode(
-                    compact, (0.0, 1.0), three_frame_indices=(anchor,))
-        finally:
-            for handle in handles:
-                handle.remove()
-        self.assertEqual(result.shape, baseline.shape)
-        torch.testing.assert_close(result[:, :, :anchor], baseline[:, :, :anchor])
-        self.assertEqual(calls[0][anchor - 1], (5, 2))
-        self.assertEqual(calls[1][anchor - 1], (3, 1))
-        self.assertTrue(torch.isfinite(result).all())
-
     def test_real_single_frame_four_history_uses_two_first_stage_outputs(self):
         torch.manual_seed(30)
         model = self.vae.WanVAE_(
@@ -489,13 +313,13 @@ class TinyEncoderTests(unittest.TestCase):
         self.assertEqual(calls[1][anchor - 1], (3, 1))
         self.assertTrue(torch.isfinite(result).all())
 
-    def test_history_option_requires_a_boundary(self):
+    def test_four_history_option_requires_a_boundary(self):
         model = self.vae.WanVAE_(
             dim=4, z_dim=2, dim_mult=[1, 2, 2, 2], num_res_blocks=1,
             temperal_downsample=[True, True, False]).eval()
         with self.assertRaises(ValueError):
             model.encode(torch.zeros(1, 3, 17, 16, 16), (0.0, 1.0),
-                         single_frame_history=True)
+                         single_frame_four_history=True)
 
 
 if __name__ == '__main__':
